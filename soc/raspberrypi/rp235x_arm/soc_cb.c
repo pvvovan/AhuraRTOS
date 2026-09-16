@@ -538,6 +538,37 @@ void soc_ipi_arm(void)
 }
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
 
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Called right before a suppressed idle window, with interrupts masked.
+ *
+ * Left empty: whatever the window costs in clocks is this package's business, handled in
+ * os_arch_soc_sleep_cb() - light sleep leaves everything running, and the deep path parks the peer
+ * core and restores the clocks itself. Nothing the kernel needs is saved or restored here.
+ *
+ * Weak, and the only definition a build of this package has, so an application that must quiesce
+ * something of its own - a UART with bytes still in its FIFO, a sensor mid-conversion - replaces
+ * this one hook and leaves the rest of the package alone. Under DEEP it is also the place to stop
+ * anything that would refuse the sleep (see soc_deep_sleep_allowed_cb).
+ *
+ * @return None.
+ */
+OS_WEAK void os_tickless_pre_sleep_cb(void)
+{
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Called right after the window closes, still masked and before the sleep is announced.
+ *
+ * @return None.
+ */
+OS_WEAK void os_tickless_post_sleep_cb(void)
+{
+}
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
+
 /*
  * ***********************************************************************************************************
  * Private function implementations

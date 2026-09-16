@@ -295,6 +295,36 @@ uint32_t os_arch_tick_resume_cb(void)
 }
 #endif /* OS_CONFIG_TICKLESS_ENABLE */
 
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Called right before a suppressed idle window, with interrupts masked.
+ *
+ * Left empty, which selects a plain WFI: the core stalls and every clock keeps running, so nothing
+ * needs saving here and the post-sleep hook has nothing to restore. That is also what keeps the
+ * window measurable, since the microsecond TIMER this package arms counts straight through it.
+ *
+ * Weak, and the only definition a build of this package has, so an application that must quiesce
+ * something of its own - a UART with bytes still in its FIFO, a sensor mid-conversion - replaces
+ * this one hook and leaves the rest of the package alone.
+ *
+ * @return None.
+ */
+OS_WEAK void os_tickless_pre_sleep_cb(void)
+{
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Called right after the window closes, still masked and before the sleep is announced.
+ *
+ * @return None.
+ */
+OS_WEAK void os_tickless_post_sleep_cb(void)
+{
+}
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
+
 /*
  * ***********************************************************************************************************
  * Private function implementations

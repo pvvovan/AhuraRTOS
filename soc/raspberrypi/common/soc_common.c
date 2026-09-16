@@ -511,29 +511,6 @@ OS_WEAK void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock)
 }
 #endif /* OS_ARCH_SPINLOCK_USE_CB */
 
-#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Called right before the idle sleep.
- *
- * Left empty, which selects a plain SLEEP: the CPU clock stops and every peripheral clock keeps
- * running, so nothing needs saving here and the post-sleep hook has nothing to restore. The
- * deeper modes on these chips (DORMANT, or gating clk_sys) stop SysTick itself, which the kernel
- * cannot yet measure a sleep against - see the tickless section of doc/porting.md.
- */
-OS_WEAK void os_tickless_pre_sleep_cb(void)
-{
-}
-
-/******************************************************************************************************/
-/**
- * @brief Called right after wakeup.
- */
-OS_WEAK void os_tickless_post_sleep_cb(void)
-{
-}
-#endif /* OS_CONFIG_TICKLESS_ENABLE */
-
 #if (SOC_CONFIG_FAULT_REPORT != 0U)
 /******************************************************************************************************/
 /**

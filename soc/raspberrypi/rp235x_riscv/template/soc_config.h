@@ -62,6 +62,19 @@ extern "C"
  */
 #define SOC_CONFIG_HANDLER_STACK_SIZE       1024U
 
+/**
+ * Whether a fatal trap reports itself before parking (1) or keeps the SDK's breakpoint (0).
+ *
+ * crt0_riscv.S points the machine-exception vector at a breakpoint, which is right with a debugger
+ * attached and useless without one: the board stops with no output, and on a dual-core build a hart
+ * that trapped looks exactly like one that never started.
+ *
+ * At 1 the package takes that vector, records mcause/mepc/mtval and a slice of the stack, prints
+ * them straight at the UART when hart 0 is the one that trapped, and parks. Costs a few hundred
+ * bytes of flash and one static buffer; buys the reason the board died.
+ */
+#define SOC_CONFIG_FAULT_REPORT             1U
+
 #ifdef __cplusplus
 }
 #endif

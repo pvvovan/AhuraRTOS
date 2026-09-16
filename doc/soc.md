@@ -137,6 +137,10 @@ Hence:
 - The hooks an application is meant to replace - `os_tickless_pre_sleep_cb()`,
   `os_tickless_post_sleep_cb()`, and `soc_deep_sleep_allowed_cb()` on the RP2350
   - are `OS_WEAK`, so a normal definition in the application's own sources wins.
+  Each belongs in the chip's own `soc_cb.c`, never in `../common`: only one chip
+  package is ever compiled, so the build holds exactly one weak definition and
+  the application's is the only other one the linker can see. Two weak copies -
+  one shared, one per-chip - would leave the choice to link order.
 - A package's sources are compiled into `ahura_kernel` rather than into an
   archive of their own, which is what keeps the guarantee above simple.
 

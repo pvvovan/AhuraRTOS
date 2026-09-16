@@ -70,6 +70,7 @@ set(AHURA_SOC_LINK_LIBRARIES
 	hardware_powman
 	hardware_riscv_platform_timer
 	hardware_sync
+	hardware_uart
 	pico_multicore
 	pico_platform
 )

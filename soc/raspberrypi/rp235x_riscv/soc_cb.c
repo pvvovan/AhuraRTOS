@@ -46,6 +46,13 @@
 #include "pico/multicore.h"
 #include "pico/time.h"
 
+#if (SOC_CONFIG_FAULT_REPORT != 0U)
+/* Only the fault path needs these: the UART it writes to without stdio, and the RAM bounds it
+ * checks a stack pointer against before trusting it. */
+#include "hardware/regs/addressmap.h"
+#include "hardware/uart.h"
+#endif
+
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U)
 #if (OS_CONFIG_TICKLESS_DEEP_ENABLE == 1U)
 /* Only the deep path needs these: the POWMAN wake source, and the walk that checks nothing else
@@ -55,6 +62,10 @@
 #include "soc_sleep.h"
 #endif
 #endif /* OS_CONFIG_TICKLESS_ENABLE */
+
+#if !defined(SOC_CONFIG_FAULT_REPORT)
+#error "soc_config.h is incomplete: SOC_CONFIG_FAULT_REPORT is required by the raspberrypi/rp235x_riscv package. Copy the option from soc/raspberrypi/rp235x_riscv/template/soc_config.h - 1U to report a fatal trap, 0U to leave the SDK's breakpoint in place."
+#endif
 
 /*
  * ***********************************************************************************************************
@@ -83,6 +94,35 @@
 #define SOC_SLEEP_SWI_POLLS         64U
 #endif /* OS_CONFIG_TICKLESS_DEEP_ENABLE */
 #endif /* OS_CONFIG_TICKLESS_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Types
+ * ***********************************************************************************************************
+*/
+
+#if (SOC_CONFIG_FAULT_REPORT != 0U)
+/* What a trapping hart managed to record before parking. Captured rather than printed for the
+ * reason the Arm package gives at length: the other core is usually mid-printf and holds the
+ * transport's mutex, so printing from the dead core interleaves into garbage. */
+typedef struct
+{
+    uint32_t taken;    /**< 0 none, 1 registers only, 2 with the stack slice. Written first. */
+    uint32_t core;     /**< Which hart trapped - the whole point on a dual-core build. */
+    uint32_t mcause;   /**< Trap cause: WHICH fault it was. */
+    uint32_t mepc;     /**< Instruction that trapped. */
+    uint32_t mtval;    /**< Address or instruction word the cause refers to, where the hart
+                        *   provides one; the privileged spec lets it read 0 instead. */
+    uint32_t mstatus;  /**< Machine status, including the interrupt state at the trap. */
+    uint32_t sp;       /**< Stack pointer at the trap, so the words below can be located. */
+    uint32_t ra;       /**< Return address register: the caller, where it survived. */
+
+    /* A slice of the trapping stack. On RISC-V nothing is stacked by the trap itself, so these are
+     * whatever the interrupted code had there - return addresses included. */
+    uint32_t stack[8];
+
+} soc_fault_t;
+#endif /* SOC_CONFIG_FAULT_REPORT */
 
 /*
  * ***********************************************************************************************************
@@ -127,6 +167,18 @@ static __IO uint8_t soc_core_reached = 0xFFU;
 static uint8_t soc_handler_stack[OS_CONFIG_CORE_COUNT - 1U][SOC_CONFIG_HANDLER_STACK_SIZE]
     __attribute__((aligned(16)));
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+#if (SOC_CONFIG_FAULT_REPORT != 0U)
+/* Filled by the trapping hart, read afterwards by os_arch_soc_diagnose_cb() on a healthy one. */
+static __IO soc_fault_t soc_fault;
+
+/* The report's own stack, and the one real difference from the Arm package. Cortex-M hands a fault
+ * handler the MSP while the bad frame sits on the PSP, so the handler already runs on a stack it
+ * can trust. RISC-V has ONE stack pointer, and the fault most worth reporting is the one that
+ * ruined it - so the vector switches here before calling any C. One is enough: two harts trapping
+ * at the same instant cost one report, not the board. */
+static uint8_t soc_fault_stack[512] __attribute__((aligned(16), used));
+#endif /* SOC_CONFIG_FAULT_REPORT */
 
 /* Counts of mtime per kernel tick, computed once when the tick is programmed. */
 static uint32_t soc_tick_interval;
@@ -259,6 +311,20 @@ static void soc_sleep_peer_park(void);
  */
 static void soc_core1_entry(void);
 #endif
+
+#if (SOC_CONFIG_FAULT_REPORT != 0U)
+/******************************************************************************************************/
+/**
+ * @brief Write a string straight at the UART, with no stdio and no locks.
+ */
+static void soc_panic_puts(const char *text);
+
+/******************************************************************************************************/
+/**
+ * @brief Write one 32-bit value as eight hex digits, through soc_panic_puts().
+ */
+static void soc_panic_hex(uint32_t value);
+#endif /* SOC_CONFIG_FAULT_REPORT */
 
 /*
  * ***********************************************************************************************************
@@ -923,6 +989,41 @@ void os_arch_soc_idle_cb(void)
  */
 void os_arch_soc_diagnose_cb(void)
 {
+#if (SOC_CONFIG_FAULT_REPORT != 0U)
+    /* The trap first, because it explains everything else when it is there. */
+    if (soc_fault.taken != 0U)
+    {
+        printf("         [soc] *** hart %lu TRAPPED and is parked ***\r\n",
+               (unsigned long)soc_fault.core);
+        printf("               mcause=0x%08lX  mepc=0x%08lX  mtval=0x%08lX\r\n",
+               (unsigned long)soc_fault.mcause, (unsigned long)soc_fault.mepc,
+               (unsigned long)soc_fault.mtval);
+        printf("               mstatus=0x%08lX  sp=0x%08lX  ra=0x%08lX\r\n",
+               (unsigned long)soc_fault.mstatus, (unsigned long)soc_fault.sp,
+               (unsigned long)soc_fault.ra);
+
+        if (soc_fault.taken == 2U)
+        {
+            uint32_t index;
+
+            printf("               stack:");
+
+            for (index = 0U; index < 8U; index++)
+            {
+                printf(" 0x%08lX", (unsigned long)soc_fault.stack[index]);
+            }
+
+            printf("\r\n");
+        }
+        else
+        {
+            printf("               (stack unreadable - the stack pointer is itself the fault)\r\n");
+        }
+
+        (void)fflush(stdout);
+    }
+#endif /* SOC_CONFIG_FAULT_REPORT */
+
 #if (OS_CONFIG_CORE_COUNT > 1U)
     if (soc_core_reached == 0xFFU)
     {
@@ -995,6 +1096,126 @@ uint64_t os_arch_reference_clock_get_cb(void)
 {
     return time_us_64();
 }
+
+#if (SOC_CONFIG_FAULT_REPORT != 0U)
+/******************************************************************************************************/
+/**
+ * @brief Record a fatal trap and park, instead of the SDK's silent breakpoint.
+ *
+ * crt0_riscv.S points the machine-exception vector at a breakpoint. With a debugger attached that
+ * is exactly right; with none, the board stops dead - no output, no address, and on a dual-core
+ * build no indication of WHICH hart died.
+ *
+ * The ORDER below is load-bearing. Everything readable without touching memory goes down first and
+ * taken is set before the stack is dereferenced at all, because the trap worth reporting most is
+ * the one whose cause is a ruined stack pointer: reading through it then traps again, and a record
+ * written afterwards would never exist.
+ *
+ * @param[in] sp  Stack pointer as it stood at the trap, from the vector below.
+ * @param[in] ra  Return-address register at the trap.
+ * @return None.
+ */
+void soc_fault_report(uint32_t sp, uint32_t ra)
+{
+    const uint32_t *frame = (const uint32_t *)(uintptr_t)sp;
+    uint32_t        index;
+
+    /* CSRs are registers: reading them cannot fault however bad memory is, and mcause and mtval are
+     * the two that say what happened and to what. */
+    soc_fault.core    = OS_ARCH_CSR_READ(mhartid);
+    soc_fault.mcause  = OS_ARCH_CSR_READ(mcause);
+    soc_fault.mepc    = OS_ARCH_CSR_READ(mepc);
+    soc_fault.mtval   = OS_ARCH_CSR_READ(mtval);
+    soc_fault.mstatus = OS_ARCH_CSR_READ(mstatus);
+    soc_fault.sp      = sp;
+    soc_fault.ra      = ra;
+    soc_fault.taken   = 1U;
+
+    /* The words the interrupted code had on its stack. Skipped rather than risked when sp does not
+     * point into RAM - which is itself the most likely reason this ran. */
+    if ((sp >= (uint32_t)SRAM_BASE) && (sp <= ((uint32_t)SRAM_END - 32U)) && ((sp & 3U) == 0U))
+    {
+        for (index = 0U; index < 8U; index++)
+        {
+            soc_fault.stack[index] = frame[index];
+        }
+
+        soc_fault.taken = 2U;
+    }
+
+    /* Hart 0 prints; a secondary hart only records. When core 1 traps, core 0 is usually mid-printf
+     * and holds the transport's mutex. But when core 0 traps there is nobody left to report on its
+     * behalf, and recording silently would hang the board with no output at all - which is worse
+     * than the breakpoint this replaces. soc_panic_puts, not printf, for the same reason: stdio
+     * takes a lock this hart may already hold. */
+    if (soc_fault.core == 0U)
+    {
+        soc_panic_puts("\r\n*** TRAP on hart 0x");
+        soc_panic_hex(soc_fault.core);
+        soc_panic_puts((soc_fault.taken == 1U)
+                       ? " *** (stack unreadable - bad stack pointer)\r\n    mcause=0x"
+                       : " ***\r\n    mcause=0x");
+        soc_panic_hex(soc_fault.mcause);
+        soc_panic_puts(" mepc=0x");
+        soc_panic_hex(soc_fault.mepc);
+        soc_panic_puts(" mtval=0x");
+        soc_panic_hex(soc_fault.mtval);
+        soc_panic_puts("\r\n    mstatus=0x");
+        soc_panic_hex(soc_fault.mstatus);
+        soc_panic_puts(" sp=0x");
+        soc_panic_hex(soc_fault.sp);
+        soc_panic_puts(" ra=0x");
+        soc_panic_hex(soc_fault.ra);
+
+        if (soc_fault.taken == 2U)
+        {
+            soc_panic_puts("\r\n    stack:");
+
+            for (index = 0U; index < 8U; index++)
+            {
+                soc_panic_puts(" 0x");
+                soc_panic_hex(soc_fault.stack[index]);
+            }
+        }
+
+        soc_panic_puts("\r\n");
+    }
+
+    while (1)
+    {
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Machine-exception vector: hand the trap to soc_fault_report() on a stack of its own.
+ *
+ * STRONG, and that is the point: both crt0_riscv.S and hardware_exception declare this symbol weak,
+ * so between their two defaults the linker keeps whichever it reaches first. A strong definition
+ * beats both.
+ *
+ * Naked, because there is nothing to preserve - this never returns - and because a prologue would
+ * write to the very stack the trap may have ruined. The switch to soc_fault_stack happens before
+ * any C runs for the same reason.
+ *
+ * In RAM, and that is not a performance choice. The vector table lives in .data, and each of its
+ * entries is a `j` - reach +/-1 MiB. A handler left in flash is 256 MiB away and the link fails
+ * outright. The onward call is `tail` rather than `j` for the mirror image of the same reason:
+ * soc_fault_report stays in flash, which only auipc+jalr can reach.
+ *
+ * @return None.
+ */
+__attribute__((naked, section(".time_critical.soc_fault_vector")))
+void isr_riscv_machine_exception(void)
+{
+    __asm volatile (
+        "mv   a0, sp                    \n"   /* the stack as it stood at the trap */
+        "mv   a1, ra                    \n"
+        "la   sp, soc_fault_stack + 512 \n"   /* a stack this trap cannot already have ruined */
+        "tail soc_fault_report          \n"
+    );
+}
+#endif /* SOC_CONFIG_FAULT_REPORT */
 
 /*
  * ***********************************************************************************************************
@@ -1272,3 +1493,71 @@ static void soc_core1_entry(void)
     os_core_start();
 }
 #endif
+
+#if (SOC_CONFIG_FAULT_REPORT != 0U)
+/******************************************************************************************************/
+/**
+ * @brief Write a string straight at the UART, with no stdio and no locks.
+ *
+ * Polling the TX FIFO needs no lock and no buffered state, so it works from trap context by
+ * construction - which printf does not: a trap can land inside stdio with its mutex held, and the
+ * report would then block on a lock this hart itself holds.
+ *
+ * Silently does nothing on a board with no default UART. The diagnostic is a courtesy; the record
+ * in soc_fault is the part that must not depend on a transport.
+ *
+ * @param[in] text  Text to print.
+ * @return None.
+ */
+static void soc_panic_puts(const char *text)
+{
+#ifdef PICO_DEFAULT_UART
+    uart_hw_t *hw = uart_get_hw(uart_default);
+
+    /* Nothing to print - and finding that out by dereferencing it is the fault this avoids, on a
+     * path that only ever runs while the system is already panicking. */
+    const char *cursor = text;
+
+    if (cursor != NULL)
+    {
+        while (*cursor != '\0')
+        {
+            while ((hw->fr & UART_UARTFR_TXFF_BITS) != 0U)
+            {
+            }
+
+            hw->dr = (uint32_t)(uint8_t)*cursor;
+            cursor++;
+        }
+    }
+#else
+    (void)text;
+#endif
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Write one 32-bit value as eight hex digits, through soc_panic_puts().
+ *
+ * @param[in] value  Value to print.
+ * @return None.
+ */
+static void soc_panic_hex(uint32_t value)
+{
+    static const char digits[] = "0123456789ABCDEF";
+
+    char     text[9];
+    uint32_t remaining = value;
+    uint32_t index;
+
+    for (index = 0U; index < 8U; index++)
+    {
+        text[7U - index] = digits[remaining & 0xFU];
+        remaining >>= 4U;
+    }
+
+    text[8] = '\0';
+
+    soc_panic_puts(text);
+}
+#endif /* SOC_CONFIG_FAULT_REPORT */
