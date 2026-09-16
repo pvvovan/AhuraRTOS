@@ -24,22 +24,13 @@
 
 #include "os_internal.h"
 
-#if (OS_CONFIG_TIMER_ENABLE == 1U)
-
-/* Checked here rather than with #if: a priority may be given as an os_task_priority_t name, and an
- * enum constant is not a macro - the preprocessor would read it as 0 and reject a valid setting.
- * OS_TASK_PRIO_IDLE belongs to the idle task, which the timer task must outrank to be dispatched
- * at all. */
-OS_STATIC_ASSERT((OS_CONFIG_TIMER_PRIORITY >= OS_TASK_PRIO_1_LOWEST) &&
-                 (OS_CONFIG_TIMER_PRIORITY <= OS_TASK_PRIO_MAX),
-                 "OS_CONFIG_TIMER_PRIORITY must be OS_TASK_PRIO_1_LOWEST..OS_TASK_PRIO_MAX");
-
 /*
  * ***********************************************************************************************************
  * Macros
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
 /*
  * The gate every public call in this file passes through first. It rules out three things:
  *
@@ -67,8 +58,8 @@ OS_STATIC_ASSERT((OS_CONFIG_TIMER_PRIORITY >= OS_TASK_PRIO_1_LOWEST) &&
      ((timer)->mode != OS_TIMER_MODE_SUBMIT))
 
 /* The same question for a pool, answered the same way. */
-#define OS_TIMER_POOL_VALID(pool)                                                                 \
-    (((pool) != NULL) && ((pool)->self == (void *)(pool)) &&                                      \
+#define OS_TIMER_POOL_VALID(pool)                                                                  \
+    (((pool) != NULL) && ((pool)->self == (void *)(pool)) &&                                       \
      ((pool)->entries != NULL) && ((pool)->count != 0U) && ((pool)->callback != NULL) &&           \
      ((pool)->delay_ticks != OS_WAIT_FOREVER))
 
@@ -80,6 +71,23 @@ OS_STATIC_ASSERT((OS_CONFIG_TIMER_PRIORITY >= OS_TASK_PRIO_1_LOWEST) &&
 /* Timer back-references from its embedded list nodes. */
 #define OS_TIMER_FROM_READY_NODE(node)     ((os_timer_t *)(void *)((uint8_t *)(node) - offsetof(os_timer_t, ready_node)))
 #define OS_TIMER_FROM_RUNNING_NODE(node)   ((os_timer_t *)(void *)((uint8_t *)(node) - offsetof(os_timer_t, running_node)))
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Constants
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/* Checked here rather than with #if: a priority may be given as an os_task_priority_t name, and an
+ * enum constant is not a macro - the preprocessor would read it as 0 and reject a valid setting.
+ * OS_TASK_PRIO_IDLE belongs to the idle task, which the timer task must outrank to be dispatched
+ * at all. */
+OS_STATIC_ASSERT((OS_CONFIG_TIMER_PRIORITY >= OS_TASK_PRIO_1_LOWEST) &&
+                 (OS_CONFIG_TIMER_PRIORITY <= OS_TASK_PRIO_MAX),
+                 "OS_CONFIG_TIMER_PRIORITY must be OS_TASK_PRIO_1_LOWEST..OS_TASK_PRIO_MAX");
+#endif /* OS_CONFIG_TIMER_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -87,6 +95,7 @@ OS_STATIC_ASSERT((OS_CONFIG_TIMER_PRIORITY >= OS_TASK_PRIO_1_LOWEST) &&
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
 OS_TASK_DEFINE(tsk_timer, OS_CONFIG_TIMER_STACK_SIZE);
 
 /* Resolved once in os_timer_system_init: the timer task is never deleted, so
@@ -112,6 +121,7 @@ static os_list_t            os_timer_running_list;
  * is set, so the flag and this list are two views of one fact. Both directions of that invariant
  * are what lets os_timer_stop detach an object by looking only at the flag. */
 static os_list_t            os_timer_ready_list;
+#endif /* OS_CONFIG_TIMER_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -119,16 +129,69 @@ static os_list_t            os_timer_ready_list;
  * ***********************************************************************************************************
 */
 
-static void        os_timer_task_entry(void *context);
-static bool        os_timer_expired_fetch(os_timer_callback_t *callback_out, void **context_out, uint32_t *value_out);
-static os_err_t   os_timer_arm(os_timer_t *timer, bool reload, void *context, uint32_t value);
-static void        os_timer_detach_locked(os_timer_t *timer);
-static bool        os_timer_is_running_linked(const os_timer_t *timer);
-static void        os_timer_running_insert(os_timer_t *timer);
-static uint32_t    os_timer_running_remove(os_timer_t *timer);
-static bool        os_timer_member_locked(const os_list_t *list, const os_list_node_t *node);
-static bool        os_timer_unlink_locked(os_list_t *list, os_list_node_t *node);
-static void        os_timer_pool_prepare_locked(os_timer_pool_t *pool);
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Thread a pool's entries onto its free list, once. Caller holds the critical section.
+ */
+static void os_timer_pool_prepare_locked(os_timer_pool_t *pool);
+
+/******************************************************************************************************/
+/**
+ * @brief Timer task body: run queued callbacks in order, sleep until woken otherwise.
+ */
+static void os_timer_task_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Take the oldest queued expiry, returning what to call.
+ */
+static bool os_timer_expired_fetch(os_timer_callback_t *callback_out, void **context_out,
+                                   uint32_t *value_out);
+
+/******************************************************************************************************/
+/**
+ * @brief Put a timer on the registry and set it counting; the body of os_timer_start/_restart.
+ */
+static os_err_t os_timer_arm(os_timer_t *timer, bool reload, void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Take a timer out of the registry and out of the delivery queue. Caller holds the
+ *        critical section.
+ */
+static void os_timer_detach_locked(os_timer_t *timer);
+
+/******************************************************************************************************/
+/**
+ * @brief Whether a timer is currently linked into the running list.
+ */
+static bool os_timer_is_running_linked(const os_timer_t *timer);
+
+/******************************************************************************************************/
+/**
+ * @brief Whether a node is really a member of a list. Caller holds the critical section.
+ */
+static bool os_timer_member_locked(const os_list_t *list, const os_list_node_t *node);
+
+/******************************************************************************************************/
+/**
+ * @brief Put a timer in the running list, keyed by how far away its expiry is.
+ */
+static void os_timer_running_insert(os_timer_t *timer);
+
+/******************************************************************************************************/
+/**
+ * @brief Take a timer out of the running list, restoring remaining_ticks to ticks-from-now.
+ */
+static uint32_t os_timer_running_remove(os_timer_t *timer);
+
+/******************************************************************************************************/
+/**
+ * @brief Unlink a node from a list, trusting only the list. Caller holds the critical section.
+ */
+static bool os_timer_unlink_locked(os_list_t *list, os_list_node_t *node);
+#endif /* OS_CONFIG_TIMER_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -136,6 +199,7 @@ static void        os_timer_pool_prepare_locked(os_timer_pool_t *pool);
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Start a software timer, or resume one that os_timer_pause halted.
@@ -444,50 +508,6 @@ os_err_t os_timer_submit(os_timer_pool_t *pool, void *context, uint32_t value)
 
 /******************************************************************************************************/
 /**
- * @brief Thread a pool's entries onto its free list, once. Caller holds the critical section.
- *
- * Each entry is made into a valid one-shot timer carrying OS_TIMER_MODE_SUBMIT, which is what lets
- * delivery find its way back to this pool. The entries link through their timer's ready_node: an
- * entry waiting to be handed out is by definition not waiting to be delivered, so those two uses of
- * the node can never overlap.
- *
- * @param[in,out] pool  Pool object, already validated by the caller.
- * @return None.
- */
-static void os_timer_pool_prepare_locked(os_timer_pool_t *pool)
-{
-    uint32_t index;
-
-    /* Prepared once; a second call has nothing to do. */
-    if (!pool->ready)
-    {
-        os_list_init(&pool->free_list);
-
-        for (index = 0U; index < pool->count; index++)
-        {
-            os_timer_entry_t *entry = &pool->entries[index];
-
-            entry->pool           = pool;
-            entry->timer.self     = &entry->timer;
-            entry->timer.mode     = OS_TIMER_MODE_SUBMIT;
-            entry->timer.callback = pool->callback;
-            entry->timer.active   = false;
-            entry->timer.paused   = false;
-            entry->timer.queued   = false;
-
-            /* period_ticks is what makes an object count as armable, so a pool with no delay still
-             * gets a nonzero period its entries will never actually count down. */
-            entry->timer.period_ticks = (pool->delay_ticks == 0U) ? 1U : pool->delay_ticks;
-
-            os_list_push_back(&pool->free_list, &entry->timer.ready_node);
-        }
-
-        pool->ready = true;
-    }
-}
-
-/******************************************************************************************************/
-/**
  * @brief Create and start the kernel timer service task. Called from os_init.
  *
  * @return os_err_t  Status code.
@@ -671,12 +691,58 @@ uint32_t os_timer_next_expiry_ticks_get(void)
     os_critical_exit();
     return minimum;
 }
+#endif /* OS_CONFIG_TIMER_ENABLE */
 
 /*
  * ***********************************************************************************************************
  * Private function implementations
  * ***********************************************************************************************************
 */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Thread a pool's entries onto its free list, once. Caller holds the critical section.
+ *
+ * Each entry is made into a valid one-shot timer carrying OS_TIMER_MODE_SUBMIT, which is what lets
+ * delivery find its way back to this pool. The entries link through their timer's ready_node: an
+ * entry waiting to be handed out is by definition not waiting to be delivered, so those two uses of
+ * the node can never overlap.
+ *
+ * @param[in,out] pool  Pool object, already validated by the caller.
+ * @return None.
+ */
+static void os_timer_pool_prepare_locked(os_timer_pool_t *pool)
+{
+    uint32_t index;
+
+    /* Prepared once; a second call has nothing to do. */
+    if (!pool->ready)
+    {
+        os_list_init(&pool->free_list);
+
+        for (index = 0U; index < pool->count; index++)
+        {
+            os_timer_entry_t *entry = &pool->entries[index];
+
+            entry->pool           = pool;
+            entry->timer.self     = &entry->timer;
+            entry->timer.mode     = OS_TIMER_MODE_SUBMIT;
+            entry->timer.callback = pool->callback;
+            entry->timer.active   = false;
+            entry->timer.paused   = false;
+            entry->timer.queued   = false;
+
+            /* period_ticks is what makes an object count as armable, so a pool with no delay still
+             * gets a nonzero period its entries will never actually count down. */
+            entry->timer.period_ticks = (pool->delay_ticks == 0U) ? 1U : pool->delay_ticks;
+
+            os_list_push_back(&pool->free_list, &entry->timer.ready_node);
+        }
+
+        pool->ready = true;
+    }
+}
 
 /******************************************************************************************************/
 /**
@@ -735,7 +801,8 @@ static void os_timer_task_entry(void *context)
  * @param[out] value_out     Value to pass it, written only when true is returned.
  * @return bool  true when an expiry was taken.
  */
-static bool os_timer_expired_fetch(os_timer_callback_t *callback_out, void **context_out, uint32_t *value_out)
+static bool os_timer_expired_fetch(os_timer_callback_t *callback_out, void **context_out,
+                                   uint32_t *value_out)
 {
     bool            found = false;
     os_list_node_t *node;
@@ -830,9 +897,9 @@ static os_err_t os_timer_arm(os_timer_t *timer, bool reload, void *context, uint
         timer->context = context;
         timer->value   = value;
 
-        /* Resuming keeps remaining_ticks; everything else counts a whole period. A paused timer is the
-         * only one whose remaining_ticks means anything, which is why the flag rather than the caller
-         * decides what a plain start does.
+        /* Resuming keeps remaining_ticks; everything else counts a whole period. A paused timer is
+         * the only one whose remaining_ticks means anything, which is why the flag rather than the
+         * caller decides what a plain start does.
          *
          * An expiry the tick already queued but the timer task has not delivered yet belongs to the
          * period being discarded here, so it goes with it. Without this, restarting a timer whose
@@ -942,22 +1009,6 @@ static bool os_timer_member_locked(const os_list_t *list, const os_list_node_t *
 
 /******************************************************************************************************/
 /**
- * @brief Unlink a node from a list, trusting only the list. Caller holds the critical section.
- *
- * The unlink is the one operation here that can write through a pointer it did not choose:
- * os_list_remove stores through node->prev, so a node holding garbage sends a write to an
- * address nobody picked. Everything else only reads the object or overwrites its fields.
- *
- * So membership is PROVED first. A node the list does not contain is simply not found, and
- * once found its neighbours are known to be the list's own - which is what makes the remove
- * safe, with no marker to match by luck.
- *
- * @param[in,out] list  List to remove from.
- * @param[in,out] node  Node to remove.
- * @return bool  true when the node was a member and has been unlinked.
- */
-/******************************************************************************************************/
-/**
  * @brief Put a timer in the running list, keyed by how far away its expiry is.
  *
  * The list is a DELTA list: kept in expiry order, with each entry holding the ticks it waits AFTER
@@ -1053,6 +1104,21 @@ static uint32_t os_timer_running_remove(os_timer_t *timer)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Unlink a node from a list, trusting only the list. Caller holds the critical section.
+ *
+ * The unlink is the one operation here that can write through a pointer it did not choose:
+ * os_list_remove stores through node->prev, so a node holding garbage sends a write to an
+ * address nobody picked. Everything else only reads the object or overwrites its fields.
+ *
+ * So membership is PROVED first. A node the list does not contain is simply not found, and
+ * once found its neighbours are known to be the list's own - which is what makes the remove
+ * safe, with no marker to match by luck.
+ *
+ * @param[in,out] list  List to remove from.
+ * @param[in,out] node  Node to remove.
+ * @return bool  true when the node was a member and has been unlinked.
+ */
 static bool os_timer_unlink_locked(os_list_t *list, os_list_node_t *node)
 {
     bool found = os_timer_member_locked(list, node);
@@ -1064,5 +1130,4 @@ static bool os_timer_unlink_locked(os_list_t *list, os_list_node_t *node)
 
     return found;
 }
-
 #endif /* OS_CONFIG_TIMER_ENABLE */

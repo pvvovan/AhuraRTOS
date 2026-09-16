@@ -14,16 +14,15 @@
  *            See LICENSE in the project root for the full license text.
  */
 
-#ifndef OS_ARCH_PORT_TRANSLATION_UNIT
-#error "os_arch_port_v6m.c is a textual include, not a translation unit. Compile arch/<family>/<core>/os_arch_port.c instead - it defines OS_ARCH_PORT_TRANSLATION_UNIT and includes this. See doc/installation.md."
-#endif
-
-
 /*
  * ***********************************************************************************************************
  * Includes
  * ***********************************************************************************************************
 */
+
+#ifndef OS_ARCH_PORT_TRANSLATION_UNIT
+#error "os_arch_port_v6m.c is a textual include, not a translation unit. Compile arch/<family>/<core>/os_arch_port.c instead - it defines OS_ARCH_PORT_TRANSLATION_UNIT and includes this. See doc/installation.md."
+#endif
 
 #include "os_arch_port_common.h"
 
@@ -40,7 +39,6 @@
  * is why ARMv8-M baseline lands on the critical-section one here. Textual
  * include as well. */
 #include "os_arch_atomic.c"
-#include "os_arch_tickless.c"
 
 /*
  * ***********************************************************************************************************
@@ -83,8 +81,41 @@ static uint32_t os_arch_planned_idle_ticks = 0U;
 
 /*
  * ***********************************************************************************************************
- * Context switch handler (PendSV does everything)
+ * Private function prototypes
  * ***********************************************************************************************************
+*/
+
+/* Declared through the configured name so the boot-time vector check compares
+ * against exactly the symbol the vector table is expected to reference. */
+/******************************************************************************************************/
+extern void OS_CONFIG_ARCH_PENDSV_HANDLER(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Terminate the calling task; used when a task entry function returns.
+ */
+extern void     os_task_exit(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Get the id of the current task, 0 when idle/none/pre-scheduler.
+ */
+extern uint32_t os_task_current_id_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Landing point when a task entry function returns; deletes the task.
+ */
+static void os_arch_task_exit_trap(void);
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/* Context switch handler (PendSV does everything).
  *
  * Software-saved frame layout on a task stack (low address first):
  *   r4-r11, EXC_RETURN
@@ -100,8 +131,7 @@ static uint32_t os_arch_planned_idle_ticks = 0U;
  * installs the first task (the "first start" path below). Every later entry
  * finds a real PSP and performs an ordinary switch. See os_arch_port_v7m.c's
  * equivalent block for why SVC is deliberately left to the application.
-*/
-
+ */
 __asm(
 ".syntax unified\n"
 ".thumb\n"
@@ -182,27 +212,6 @@ OS_ARCH_STRINGIFY(OS_CONFIG_ARCH_PENDSV_HANDLER) ":\n"
 "    isb\n"
 "    bx      lr\n"
 );
-
-/* Declared through the configured name so the boot-time vector check compares
- * against exactly the symbol the vector table is expected to reference. */
-extern void OS_CONFIG_ARCH_PENDSV_HANDLER(void);
-
-/*
- * ***********************************************************************************************************
- * Private function prototypes
- * ***********************************************************************************************************
-*/
-
-extern void     os_task_exit(void);
-extern uint32_t os_task_current_id_get(void);
-
-static void     os_arch_task_exit_trap(void);
-
-/*
- * ***********************************************************************************************************
- * Public function implementations
- * ***********************************************************************************************************
-*/
 
 /******************************************************************************************************/
 /**
@@ -308,18 +317,18 @@ void os_arch_tick_init(void)
      * nothing sane to program, so the whole body is skipped rather than each bailing out. */
     if ((clock_hz != 0U) && (OS_CONFIG_TICK_HZ != 0U))
     {
-    reload_value = (clock_hz / OS_CONFIG_TICK_HZ);
+        reload_value = (clock_hz / OS_CONFIG_TICK_HZ);
 
-    if ((reload_value != 0U) && (reload_value <= (OS_ARCH_SYST_RVR_RELOAD_MSK + 1UL)))
-    {
+        if ((reload_value != 0U) && (reload_value <= (OS_ARCH_SYST_RVR_RELOAD_MSK + 1UL)))
+        {
 
-    OS_ARCH_REG_SYST_CSR = 0U;
-    OS_ARCH_REG_SYST_RVR = reload_value - 1UL;
-    OS_ARCH_REG_SYST_CVR = 0U;
-    OS_ARCH_REG_SYST_CSR = OS_ARCH_SYST_CSR_CLKSOURCE_MSK |
-                           OS_ARCH_SYST_CSR_TICKINT_MSK |
-                           OS_ARCH_SYST_CSR_ENABLE_MSK;
-    }
+            OS_ARCH_REG_SYST_CSR = 0U;
+            OS_ARCH_REG_SYST_RVR = reload_value - 1UL;
+            OS_ARCH_REG_SYST_CVR = 0U;
+            OS_ARCH_REG_SYST_CSR = OS_ARCH_SYST_CSR_CLKSOURCE_MSK |
+                                   OS_ARCH_SYST_CSR_TICKINT_MSK |
+                                   OS_ARCH_SYST_CSR_ENABLE_MSK;
+        }
     }
 #endif
 }
@@ -334,36 +343,37 @@ void os_arch_tick_init(void)
  * @param[in] context      Task argument passed in R0.
  * @return uint32_t*       Initial process stack pointer for first restore, NULL on bad arguments.
  */
-uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes, void (*entry)(void *context), void *context)
+uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes,
+                                        void (*entry)(void *context), void *context)
 {
     uint32_t *stack_top = NULL;
 
     if ((stack_base != NULL) && (entry != (void (*)(void *))0) &&
         (stack_bytes >= OS_CONFIG_MIN_STACK_SIZE))
     {
-    /* The hardware exception frame must sit on an 8-byte aligned address. */
-    stack_top = (uint32_t *)((uintptr_t)(stack_base + stack_bytes) & ~(uintptr_t)0x7U);
+        /* The hardware exception frame must sit on an 8-byte aligned address. */
+        stack_top = (uint32_t *)((uintptr_t)(stack_base + stack_bytes) & ~(uintptr_t)0x7U);
 
-    /* Hardware frame restored by exception return. */
-    *(--stack_top) = OS_ARCH_XPSR_THUMB;                    /* xPSR */
-    *(--stack_top) = (uint32_t)(uintptr_t)entry;            /* PC   */
-    *(--stack_top) = (uint32_t)(uintptr_t)os_arch_task_exit_trap; /* LR */
-    *(--stack_top) = 0U;                                    /* R12  */
-    *(--stack_top) = 0U;                                    /* R3   */
-    *(--stack_top) = 0U;                                    /* R2   */
-    *(--stack_top) = 0U;                                    /* R1   */
-    *(--stack_top) = (uint32_t)(uintptr_t)context;          /* R0   */
+        /* Hardware frame restored by exception return. */
+        *(--stack_top) = OS_ARCH_XPSR_THUMB;                    /* xPSR */
+        *(--stack_top) = (uint32_t)(uintptr_t)entry;            /* PC   */
+        *(--stack_top) = (uint32_t)(uintptr_t)os_arch_task_exit_trap; /* LR */
+        *(--stack_top) = 0U;                                    /* R12  */
+        *(--stack_top) = 0U;                                    /* R3   */
+        *(--stack_top) = 0U;                                    /* R2   */
+        *(--stack_top) = 0U;                                    /* R1   */
+        *(--stack_top) = (uint32_t)(uintptr_t)context;          /* R0   */
 
-    /* Software frame restored by the context-switch code. */
-    *(--stack_top) = OS_ARCH_EXC_RETURN_THREAD_PSP;         /* EXC_RETURN */
-    *(--stack_top) = 0U;                                    /* R11  */
-    *(--stack_top) = 0U;                                    /* R10  */
-    *(--stack_top) = 0U;                                    /* R9   */
-    *(--stack_top) = 0U;                                    /* R8   */
-    *(--stack_top) = 0U;                                    /* R7   */
-    *(--stack_top) = 0U;                                    /* R6   */
-    *(--stack_top) = 0U;                                    /* R5   */
-    *(--stack_top) = 0U;                                    /* R4   */
+        /* Software frame restored by the context-switch code. */
+        *(--stack_top) = OS_ARCH_EXC_RETURN_THREAD_PSP;         /* EXC_RETURN */
+        *(--stack_top) = 0U;                                    /* R11  */
+        *(--stack_top) = 0U;                                    /* R10  */
+        *(--stack_top) = 0U;                                    /* R9   */
+        *(--stack_top) = 0U;                                    /* R8   */
+        *(--stack_top) = 0U;                                    /* R7   */
+        *(--stack_top) = 0U;                                    /* R6   */
+        *(--stack_top) = 0U;                                    /* R5   */
+        *(--stack_top) = 0U;                                    /* R4   */
     }
 
     return stack_top;
@@ -383,13 +393,6 @@ uint32_t os_arch_cycle_count_get(void)
 {
     return os_arch_cycle_systick_get();
 }
-
-
-/*
- * ***********************************************************************************************************
- * TrustZone context-switch glue
- * ***********************************************************************************************************
-*/
 
 #if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
 /******************************************************************************************************/
@@ -416,6 +419,50 @@ void os_arch_tz_context_restore(void)
 }
 #endif /* OS_CONFIG_TRUSTZONE_NON_SECURE */
 
+/******************************************************************************************************/
+/**
+ * @brief Rate of the busy-wait counter, in Hz: the SoC reference clock, 0 where there is none.
+ *
+ * @return Rate of the busy-wait counter, in Hz; 0 where there is none.
+ */
+uint32_t os_arch_delay_counter_hz_get(void)
+{
+    return os_arch_reference_clock_hz_cb();
+}
+
+/******************************************************************************************************/
+/**
+ * @brief The busy-wait counter itself: the SoC reference clock, low 32 bits.
+ *
+ * @return The busy-wait counter, low 32 bits.
+ */
+uint32_t os_arch_delay_counter_get(void)
+{
+    return (uint32_t)os_arch_reference_clock_get_cb();
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Weak default: no SoC reference clock, so 0 - a nonzero busy-wait then faults.
+ *
+ * @return Rate of the SoC reference clock, in Hz; 0 where there is none.
+ */
+OS_WEAK uint32_t os_arch_reference_clock_hz_cb(void)
+{
+    return 0U;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Weak default: no SoC reference clock, so 0.
+ *
+ * @return The SoC reference clock count.
+ */
+OS_WEAK uint64_t os_arch_reference_clock_get_cb(void)
+{
+    return 0ULL;
+}
+
 /*
  * ***********************************************************************************************************
  * Private function implementations
@@ -439,23 +486,5 @@ static void os_arch_task_exit_trap(void)
     }
 }
 
-
-uint32_t os_arch_delay_counter_hz_get(void)
-{
-    return os_arch_reference_clock_hz_cb();
-}
-
-uint32_t os_arch_delay_counter_get(void)
-{
-    return (uint32_t)os_arch_reference_clock_get_cb();
-}
-
-OS_WEAK uint32_t os_arch_reference_clock_hz_cb(void)
-{
-    return 0U;
-}
-
-OS_WEAK uint64_t os_arch_reference_clock_get_cb(void)
-{
-    return 0ULL;
-}
+/* Last on purpose: the tickless half builds on the cycle counter and the port functions above. */
+#include "os_arch_tickless.c"

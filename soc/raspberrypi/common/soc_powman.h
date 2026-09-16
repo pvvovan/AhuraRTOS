@@ -33,8 +33,15 @@
 #include "hardware/powman.h"
 
 #ifdef __cplusplus
-extern "C" {
+extern "C"
+{
 #endif
+
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
 
 /* Milliseconds of POWMAN timer in one kernel tick. The timer is driven from a 1 kHz tick source,
  * so a millisecond IS a count - and at the default 1 kHz kernel tick that is one count per tick,
@@ -45,6 +52,12 @@ extern "C" {
 #error "OS_CONFIG_TICK_HZ is above 1000, so one kernel tick is less than one millisecond and the \
 POWMAN timer cannot express a window. Use a slower tick, or light sleep."
 #endif
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
 
 /** Timer reading when the open window started, in milliseconds. */
 static uint64_t soc_powman_entry_ms = 0U;
@@ -66,6 +79,54 @@ static uint64_t soc_powman_accum_ms_hz = 0U;
 
 /** Raised once the timer is running and its vector is taken. */
 static bool     soc_powman_ready    = false;
+
+/*
+ * ***********************************************************************************************************
+ * Private function prototypes
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief The POWMAN alarm vector: the wake is the whole product, so this only clears the alarm.
+ */
+static void soc_powman_isr(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Start the always-on timer and take its vector, once.
+ */
+static bool soc_powman_ready_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief How many ticks one window may skip.
+ */
+static uint32_t soc_powman_ceiling_ticks(void);
+
+/******************************************************************************************************/
+/**
+ * @brief The shortest window worth sleeping through.
+ */
+static uint32_t soc_powman_floor_ticks(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Open a window of `ticks` tick periods.
+ */
+static void soc_powman_window_open(uint32_t ticks);
+
+/******************************************************************************************************/
+/**
+ * @brief Close the window and report the whole tick periods that really elapsed.
+ */
+static uint32_t soc_powman_window_close(void);
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
 
 /******************************************************************************************************/
 /**
@@ -105,14 +166,14 @@ static bool soc_powman_ready_get(void)
              * PLLs do not, which is the entire reason this timer is the deep-sleep wake source.
              *
              * MEASURED rather than assumed, and that is not defensive - it was measured wrong
-             * first. LPOSC is an untrimmed RC oscillator, and powman_timer_set_1khz_tick_source_lposc()
-             * trims it only from an OTP calibration row; where that row is blank the SDK's
-             * powman_timer_get_lposc_calib_freq() returns 0, and _with_hz(0) then quietly skips the
-             * frequency write and leaves the nominal 32.768 kHz in place. On this board the real
-             * oscillator is about 9% away from that, which came out as every window running 9%
-             * long: the kernel clock fell 13 ticks behind over 20 windows and the cycle counter
-             * disagreed with the tick by 9%. Both were caught by the self-test rather than by a
-             * battery.
+             * first. LPOSC is an untrimmed RC oscillator, and
+             * powman_timer_set_1khz_tick_source_lposc() trims it only from an OTP calibration row;
+             * where that row is blank the SDK's powman_timer_get_lposc_calib_freq() returns 0, and
+             * _with_hz(0) then quietly skips the frequency write and leaves the nominal 32.768 kHz
+             * in place. On this board the real oscillator is about 9% away from that, which came
+             * out as every window running 9% long: the kernel clock fell 13 ticks behind over 20
+             * windows and the cycle counter disagreed with the tick by 9%. Both were caught by the
+             * self-test rather than by a battery.
              *
              * The frequency counter reads it against the crystal, which is accurate and is still
              * running here at start-up, so one measurement at init costs a few milliseconds once
@@ -139,6 +200,7 @@ static bool soc_powman_ready_get(void)
 
     return soc_powman_ready;
 }
+
 /******************************************************************************************************/
 /**
  * @brief How many ticks one window may skip.
@@ -188,12 +250,12 @@ static void soc_powman_window_open(uint32_t ticks)
          *
          * soc_powman_accum_ms_hz is deliberately NOT subtracted here, and getting that wrong is
          * worth a note because it looks like the symmetric thing to do and it is not. The
-         * accumulator holds time that has already ELAPSED and merely has not been announced yet - it
-         * sits behind the reference this window is about to take. The kernel's deadline is `ticks`
-         * from NOW. Netting the accumulator off makes the window end that much before the deadline,
-         * while the close adds the same amount back into `elapsed` - so the kernel is told a full
-         * window passed when it did not, the clock runs fast, and the next window is planned shorter
-         * still. On an STM32 that showed up as a 50-tick sleep measuring 5. */
+         * accumulator holds time that has already ELAPSED and merely has not been announced yet -
+         * it sits behind the reference this window is about to take. The kernel's deadline is
+         * `ticks` from NOW. Netting the accumulator off makes the window end that much before the
+         * deadline, while the close adds the same amount back into `elapsed` - so the kernel is
+         * told a full window passed when it did not, the clock runs fast, and the next window is
+         * planned shorter still. On an STM32 that showed up as a 50-tick sleep measuring 5. */
         uint64_t wanted_ms = (((uint64_t)ticks * 1000ULL) + (uint64_t)OS_CONFIG_TICK_HZ - 1ULL) /
                              (uint64_t)OS_CONFIG_TICK_HZ;
 

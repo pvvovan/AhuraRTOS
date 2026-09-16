@@ -2,6 +2,10 @@
  * @file os_arch_port.h
  * @brief Architecture port interface for the Hazard3 RISC-V core (RV32IMAC, RP2350).
  *
+ * Two core facts, then the shared RV32 header that reads them. The include stays last on purpose:
+ * that header branches on these facts, and one defined after it would silently take the generic
+ * path instead.
+ *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: GPL-3.0-or-later
  *            See LICENSE in the project root for the full license text.
@@ -9,6 +13,12 @@
 
 #ifndef OS_ARCH_PORT_H
 #define OS_ARCH_PORT_H
+
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
 
 /*
  * Hazard3 implements Xh3irq, its custom interrupt-controller extension, and that is a property of

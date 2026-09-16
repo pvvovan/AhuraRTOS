@@ -14,16 +14,15 @@
  *            See LICENSE in the project root for the full license text.
  */
 
-#ifndef OS_ARCH_PORT_TRANSLATION_UNIT
-#error "os_arch_port_v7m.c is a textual include, not a translation unit. Compile arch/<family>/<core>/os_arch_port.c instead - it defines OS_ARCH_PORT_TRANSLATION_UNIT and includes this. See doc/installation.md."
-#endif
-
-
 /*
  * ***********************************************************************************************************
  * Includes
  * ***********************************************************************************************************
 */
+
+#ifndef OS_ARCH_PORT_TRANSLATION_UNIT
+#error "os_arch_port_v7m.c is a textual include, not a translation unit. Compile arch/<family>/<core>/os_arch_port.c instead - it defines OS_ARCH_PORT_TRANSLATION_UNIT and includes this. See doc/installation.md."
+#endif
 
 #include "os_arch_port_common.h"
 
@@ -39,23 +38,6 @@
  * instruction set (OS_ARCH_ATOMIC_LOCK_FREE), not the v6m/v7m/v8m split. Textual
  * include as well. */
 #include "os_arch_atomic.c"
-
-/* Tickless idle, in the form that never touches SysTick's reload: the interrupt alone is masked and
- * a timer the SoC package owns ends the window. Same include, and for the same reason, as in
- * os_arch_port_v6m.c.
- *
- * NOT the v8m arrangement, which reprograms the reload. On this port DWT is optional (see
- * os_arch_dwt_enable below), and where it is missing os_arch_cycle_count_get falls back to the
- * counter os_arch_cycle_systick.c synthesizes from SysTick's own periods - measured against the
- * reload it reads live. Moving that reload would strand os_delay_us() and the busy-wait half of
- * os_delay_ms() on every such part, which is exactly the trade the ceiling in
- * os_arch_max_suppressed_ticks_get() exists to refuse.
- *
- * Before this include the port answered a hard 0 to every tickless query and never called the SoC
- * suppress callbacks at all, so a package that supplied a wake source got nothing from it - and
- * OS_ARCH_SLEEP() still ran os_arch_soc_sleep_cb(), which on an STM32 under
- * OS_CONFIG_TICKLESS_DEEP_ENABLE entered Stop mode with no window armed and no way to measure it. */
-#include "os_arch_tickless.c"
 
 /*
  * ***********************************************************************************************************
@@ -105,8 +87,41 @@ static bool     os_arch_dwt_available      = false;
 
 /*
  * ***********************************************************************************************************
- * Context switch handler (PendSV does everything)
+ * Private function prototypes
  * ***********************************************************************************************************
+*/
+
+/* Declared through the configured name so the boot-time vector check compares
+ * against exactly the symbol the vector table is expected to reference. */
+/******************************************************************************************************/
+extern void OS_CONFIG_ARCH_PENDSV_HANDLER(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Terminate the calling task; used when a task entry function returns.
+ */
+extern void     os_task_exit(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Enable DWT CYCCNT and report whether it is genuinely usable on this device.
+ */
+static bool os_arch_dwt_enable(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Landing point when a task entry function returns; deletes the task.
+ */
+static void os_arch_task_exit_trap(void);
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/* Context switch handler (PendSV does everything).
  *
  * Software-saved frame layout on a task stack (low address first):
  *   [ s16-s31 ]  only when the task was using the FPU (EXC_RETURN bit 4 clear)
@@ -130,8 +145,7 @@ static bool     os_arch_dwt_available      = false;
  * and a handler that decodes no immediate can share it with none of them.
  * Folding the boot path into PendSV leaves SVC entirely to the application.
  * See doc/design.md.
-*/
-
+ */
 __asm(
 ".syntax unified\n"
 ".thumb\n"
@@ -187,27 +201,6 @@ OS_ARCH_STRINGIFY(OS_CONFIG_ARCH_PENDSV_HANDLER) ":\n"
 "    isb\n"
 "    bx      lr\n"
 );
-
-/* Declared through the configured name so the boot-time vector check compares
- * against exactly the symbol the vector table is expected to reference. */
-extern void OS_CONFIG_ARCH_PENDSV_HANDLER(void);
-
-/*
- * ***********************************************************************************************************
- * Private function prototypes
- * ***********************************************************************************************************
-*/
-
-extern void     os_task_exit(void);
-
-static bool     os_arch_dwt_enable(void);
-static void     os_arch_task_exit_trap(void);
-
-/*
- * ***********************************************************************************************************
- * Public function implementations
- * ***********************************************************************************************************
-*/
 
 /******************************************************************************************************/
 /**
@@ -359,18 +352,18 @@ void os_arch_tick_init(void)
      * nothing sane to program, so the whole body is skipped rather than each bailing out. */
     if ((clock_hz != 0U) && (OS_CONFIG_TICK_HZ != 0U))
     {
-    reload_value = (clock_hz / OS_CONFIG_TICK_HZ);
+        reload_value = (clock_hz / OS_CONFIG_TICK_HZ);
 
-    if ((reload_value != 0U) && (reload_value <= (OS_ARCH_SYST_RVR_RELOAD_MSK + 1UL)))
-    {
+        if ((reload_value != 0U) && (reload_value <= (OS_ARCH_SYST_RVR_RELOAD_MSK + 1UL)))
+        {
 
-    OS_ARCH_REG_SYST_CSR = 0U;
-    OS_ARCH_REG_SYST_RVR = reload_value - 1UL;
-    OS_ARCH_REG_SYST_CVR = 0U;
-    OS_ARCH_REG_SYST_CSR = OS_ARCH_SYST_CSR_CLKSOURCE_MSK |
-                           OS_ARCH_SYST_CSR_TICKINT_MSK |
-                           OS_ARCH_SYST_CSR_ENABLE_MSK;
-    }
+            OS_ARCH_REG_SYST_CSR = 0U;
+            OS_ARCH_REG_SYST_RVR = reload_value - 1UL;
+            OS_ARCH_REG_SYST_CVR = 0U;
+            OS_ARCH_REG_SYST_CSR = OS_ARCH_SYST_CSR_CLKSOURCE_MSK |
+                                   OS_ARCH_SYST_CSR_TICKINT_MSK |
+                                   OS_ARCH_SYST_CSR_ENABLE_MSK;
+        }
     }
 #endif
 }
@@ -385,36 +378,37 @@ void os_arch_tick_init(void)
  * @param[in] context      Task argument passed in R0.
  * @return uint32_t*       Initial process stack pointer for first restore, NULL on bad arguments.
  */
-uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes, void (*entry)(void *context), void *context)
+uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes,
+                                        void (*entry)(void *context), void *context)
 {
     uint32_t *stack_top = NULL;
 
     if ((stack_base != NULL) && (entry != (void (*)(void *))0) &&
         (stack_bytes >= OS_CONFIG_MIN_STACK_SIZE))
     {
-    /* The hardware exception frame must sit on an 8-byte aligned address. */
-    stack_top = (uint32_t *)((uintptr_t)(stack_base + stack_bytes) & ~(uintptr_t)0x7U);
+        /* The hardware exception frame must sit on an 8-byte aligned address. */
+        stack_top = (uint32_t *)((uintptr_t)(stack_base + stack_bytes) & ~(uintptr_t)0x7U);
 
-    /* Hardware frame restored by exception return. */
-    *(--stack_top) = OS_ARCH_XPSR_THUMB;                    /* xPSR */
-    *(--stack_top) = (uint32_t)(uintptr_t)entry;            /* PC   */
-    *(--stack_top) = (uint32_t)(uintptr_t)os_arch_task_exit_trap; /* LR */
-    *(--stack_top) = 0U;                                    /* R12  */
-    *(--stack_top) = 0U;                                    /* R3   */
-    *(--stack_top) = 0U;                                    /* R2   */
-    *(--stack_top) = 0U;                                    /* R1   */
-    *(--stack_top) = (uint32_t)(uintptr_t)context;          /* R0   */
+        /* Hardware frame restored by exception return. */
+        *(--stack_top) = OS_ARCH_XPSR_THUMB;                    /* xPSR */
+        *(--stack_top) = (uint32_t)(uintptr_t)entry;            /* PC   */
+        *(--stack_top) = (uint32_t)(uintptr_t)os_arch_task_exit_trap; /* LR */
+        *(--stack_top) = 0U;                                    /* R12  */
+        *(--stack_top) = 0U;                                    /* R3   */
+        *(--stack_top) = 0U;                                    /* R2   */
+        *(--stack_top) = 0U;                                    /* R1   */
+        *(--stack_top) = (uint32_t)(uintptr_t)context;          /* R0   */
 
-    /* Software frame restored by the context-switch code. */
-    *(--stack_top) = OS_ARCH_EXC_RETURN_THREAD_PSP;         /* EXC_RETURN */
-    *(--stack_top) = 0U;                                    /* R11  */
-    *(--stack_top) = 0U;                                    /* R10  */
-    *(--stack_top) = 0U;                                    /* R9   */
-    *(--stack_top) = 0U;                                    /* R8   */
-    *(--stack_top) = 0U;                                    /* R7   */
-    *(--stack_top) = 0U;                                    /* R6   */
-    *(--stack_top) = 0U;                                    /* R5   */
-    *(--stack_top) = 0U;                                    /* R4   */
+        /* Software frame restored by the context-switch code. */
+        *(--stack_top) = OS_ARCH_EXC_RETURN_THREAD_PSP;         /* EXC_RETURN */
+        *(--stack_top) = 0U;                                    /* R11  */
+        *(--stack_top) = 0U;                                    /* R10  */
+        *(--stack_top) = 0U;                                    /* R9   */
+        *(--stack_top) = 0U;                                    /* R8   */
+        *(--stack_top) = 0U;                                    /* R7   */
+        *(--stack_top) = 0U;                                    /* R6   */
+        *(--stack_top) = 0U;                                    /* R5   */
+        *(--stack_top) = 0U;                                    /* R4   */
     }
 
     return stack_top;
@@ -435,6 +429,59 @@ uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes,
 uint32_t os_arch_cycle_count_get(void)
 {
     return os_arch_dwt_available ? OS_ARCH_REG_DWT_CYCCNT : os_arch_cycle_systick_get();
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Rate of the busy-wait counter, in Hz: the SoC reference clock, 0 where there is none.
+ *
+ * @return Rate of the busy-wait counter, in Hz; 0 where there is none.
+ */
+uint32_t os_arch_delay_counter_hz_get(void)
+{
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    /* Tasks may migrate between reads; a per-core DWT epoch is not shared. */
+    return os_arch_reference_clock_hz_cb();
+#else
+    return os_arch_dwt_available ? os_arch_clock_hz_get() : os_arch_reference_clock_hz_cb();
+#endif
+}
+
+/******************************************************************************************************/
+/**
+ * @brief The busy-wait counter itself: the SoC reference clock, low 32 bits.
+ *
+ * @return The busy-wait counter, low 32 bits.
+ */
+uint32_t os_arch_delay_counter_get(void)
+{
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    return (uint32_t)os_arch_reference_clock_get_cb();
+#else
+    return os_arch_dwt_available ? OS_ARCH_REG_DWT_CYCCNT : (uint32_t)os_arch_reference_clock_get_cb();
+#endif
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Weak default: no SoC reference clock, so 0 - a nonzero busy-wait then faults.
+ *
+ * @return Rate of the SoC reference clock, in Hz; 0 where there is none.
+ */
+OS_WEAK uint32_t os_arch_reference_clock_hz_cb(void)
+{
+    return 0U;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Weak default: no SoC reference clock, so 0.
+ *
+ * @return The SoC reference clock count.
+ */
+OS_WEAK uint64_t os_arch_reference_clock_get_cb(void)
+{
+    return 0ULL;
 }
 
 /*
@@ -511,32 +558,20 @@ static void os_arch_task_exit_trap(void)
     }
 }
 
-
-uint32_t os_arch_delay_counter_hz_get(void)
-{
-#if (OS_CONFIG_CORE_COUNT > 1U)
-    /* Tasks may migrate between reads; a per-core DWT epoch is not shared. */
-    return os_arch_reference_clock_hz_cb();
-#else
-    return os_arch_dwt_available ? os_arch_clock_hz_get() : os_arch_reference_clock_hz_cb();
-#endif
-}
-
-uint32_t os_arch_delay_counter_get(void)
-{
-#if (OS_CONFIG_CORE_COUNT > 1U)
-    return (uint32_t)os_arch_reference_clock_get_cb();
-#else
-    return os_arch_dwt_available ? OS_ARCH_REG_DWT_CYCCNT : (uint32_t)os_arch_reference_clock_get_cb();
-#endif
-}
-
-OS_WEAK uint32_t os_arch_reference_clock_hz_cb(void)
-{
-    return 0U;
-}
-
-OS_WEAK uint64_t os_arch_reference_clock_get_cb(void)
-{
-    return 0ULL;
-}
+/* Tickless idle, in the form that never touches SysTick's reload: the interrupt alone is masked and
+ * a timer the SoC package owns ends the window. Same include, and for the same reason, as in
+ * os_arch_port_v6m.c.
+ *
+ * NOT the v8m arrangement, which reprograms the reload. On this port DWT is optional (see
+ * os_arch_dwt_enable below), and where it is missing os_arch_cycle_count_get falls back to the
+ * counter os_arch_cycle_systick.c synthesizes from SysTick's own periods - measured against the
+ * reload it reads live. Moving that reload would strand os_delay_us() and the busy-wait half of
+ * os_delay_ms() on every such part, which is exactly the trade the ceiling in
+ * os_arch_max_suppressed_ticks_get() exists to refuse.
+ *
+ * Before this include the port answered a hard 0 to every tickless query and never called the SoC
+ * suppress callbacks at all, so a package that supplied a wake source got nothing from it - and
+ * OS_ARCH_SLEEP() still ran os_arch_soc_sleep_cb(), which on an STM32 under
+ * OS_CONFIG_TICKLESS_DEEP_ENABLE entered Stop mode with no window armed and no way to measure it.
+ */
+#include "os_arch_tickless.c"

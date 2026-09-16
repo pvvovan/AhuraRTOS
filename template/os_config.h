@@ -27,20 +27,22 @@
 #ifndef OS_CONFIG_H
 #define OS_CONFIG_H
 
-/*
- * ***********************************************************************************************************
- * PART 1 - CORE
- * ***********************************************************************************************************
-*/
+#ifdef __cplusplus
+extern "C"
+{
+#endif
 
 /*
  * ***********************************************************************************************************
- * Tick rate
+ * Macros
  * ***********************************************************************************************************
+*/
+
+/* Tick rate.
  *
  * The CPU clock is NOT configured here: the kernel reads the live CMSIS SystemCoreClock, which the
  * device's own startup sets and SystemCoreClockUpdate() refreshes. See doc/porting.md.
-*/
+ */
 
 /* Tick rate: every delay, timeout, timer and round-robin slice is counted in
  * these ticks, so this one number is the resolution of all of them.
@@ -59,12 +61,6 @@
  * peer takes over. A higher-priority task preempts immediately regardless.
  * Values: ticks; 1 = rotate every tick, 0 = no rotation at all. */
 #define OS_CONFIG_TIME_SLICE_TICKS          1U
-
-/*
- * ***********************************************************************************************************
- * Task table and stacks
- * ***********************************************************************************************************
-*/
 
 /* How many tasks the APPLICATION may have. The kernel's service tasks get
  * their slots on top of this, so enabling the timer or the log costs none of
@@ -92,10 +88,7 @@
  * Values: 1 = check, 0 = skip. */
 #define OS_CONFIG_STACK_CHECK_ENABLE        1U
 
-/*
- * ***********************************************************************************************************
- * Default application task
- * ***********************************************************************************************************
+/* Default application task.
  *
  * os_init() always creates a task running os_main(), which the application defines in its own
  * os_main.c - the kernel ships no stub, so a missing one is a link error. Not created when
@@ -103,19 +96,13 @@
  *
  * Both values below fail SILENTLY if wrong: os_init() discards the creation status, so the board
  * builds, boots and schedules, and os_main() simply never runs.
-*/
+ */
 
 /* Values: bytes; at least OS_CONFIG_MIN_STACK_SIZE. */
 #define OS_CONFIG_MAIN_TASK_STACK_SIZE      1024U
 
 /* Values: OS_TASK_PRIO_1 .. OS_TASK_PRIO_30. */
 #define OS_CONFIG_MAIN_TASK_PRIORITY        OS_TASK_PRIO_1
-
-/*
- * ***********************************************************************************************************
- * Kernel interrupt mask
- * ***********************************************************************************************************
-*/
 
 /* Highest interrupt priority the kernel masks inside a critical section.
  *
@@ -128,29 +115,11 @@
  * Values: 0, or a shifted NVIC priority byte. */
 #define OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY  0U
 
-/*
- * ***********************************************************************************************************
- * PART 2 - OPTIONAL FEATURES
- * ***********************************************************************************************************
-*/
-
-/*
- * ***********************************************************************************************************
- * Mutex
- * ***********************************************************************************************************
-*/
-
 /* Mutexes (os_mutex_*), always with single-level priority inheritance: a
  * lower-priority owner is boosted to the highest waiter's priority until it
  * unlocks. Chained inheritance across several mutexes is not implemented.
  * Values: 1 = on, 0 = compiled out. */
 #define OS_CONFIG_MUTEX_ENABLE              1U
-
-/*
- * ***********************************************************************************************************
- * Semaphore, queue, message buffer, event
- * ***********************************************************************************************************
-*/
 
 /* Counting semaphores (os_sem_*): a token count tasks take from and give
  * back to - for signalling, and for capping concurrent access.
@@ -174,14 +143,11 @@
  * Values: 1 = on, 0 = compiled out. */
 #define OS_CONFIG_EVENT_ENABLE              1U
 
-/*
- * ***********************************************************************************************************
- * Software timers
- * ***********************************************************************************************************
+/* Software timers.
  *
  * Software timers and deferred calls (os_timer_*). Callbacks run on the kernel timer task
  * tsk_timer, which takes a kernel-reserved slot - not one of OS_CONFIG_MAX_USER_TASKS.
-*/
+ */
 
 /* Values: 1 = on, 0 = compiled out. */
 #define OS_CONFIG_TIMER_ENABLE              1U
@@ -200,26 +166,17 @@
  * Values: OS_TASK_CORE(n), or OS_TASK_CORE_ANY to follow the work. */
 #define OS_CONFIG_TIMER_CORE_AFFINITY       OS_TASK_CORE(0)
 
-/*
- * ***********************************************************************************************************
- * Task notifications
- * ***********************************************************************************************************
-*/
-
 /* Direct-to-task notifications (os_notify_*): a one-word mailbox built into
  * every task's own control block, so one task or an ISR can signal a specific
  * task without a separate semaphore or queue object.
  * Values: 1 = on, 0 = compiled out. */
 #define OS_CONFIG_NOTIFY_ENABLE             1U
 
-/*
- * ***********************************************************************************************************
- * Kernel heap
- * ***********************************************************************************************************
+/* Kernel heap.
  *
  * os_mem_alloc / os_mem_free: a first-fit allocator with coalescing over one static array. Also
  * what os_queue_init_dynamic() allocates from.
-*/
+ */
 
 /* Values: 1 = on, 0 = compiled out. */
 #define OS_CONFIG_ALLOC_ENABLE              1U
@@ -227,24 +184,12 @@
 /* Values: bytes of static heap. */
 #define OS_CONFIG_HEAP_SIZE                 4096U
 
-/*
- * ***********************************************************************************************************
- * Atomics
- * ***********************************************************************************************************
-*/
-
 /* Atomic single-word operations (os_atomic_*): add, bitwise and
  * compare-and-swap updates no task, ISR or core can observe half-finished.
  * Lock-free where the ISA has LDREX/STREX, otherwise by briefly masking
  * interrupts. Costs no RAM and no kernel task.
  * Values: 1 = on, 0 = compiled out. */
 #define OS_CONFIG_ATOMIC_ENABLE             1U
-
-/*
- * ***********************************************************************************************************
- * Diagnostics
- * ***********************************************************************************************************
-*/
 
 /* Fill task stacks with a pattern at creation so os_task_stack_watermark_get()
  * can report worst-case usage. A measurement you poll, not a detector - that
@@ -257,12 +202,6 @@
  * Costs two counter updates per tick.
  * Values: 1 = on, 0 = compiled out. */
 #define OS_CONFIG_CPU_USAGE_ENABLE          1U
-
-/*
- * ***********************************************************************************************************
- * Assertions
- * ***********************************************************************************************************
-*/
 
 /* OS_ASSERT(): catch programming errors - a NULL handle, a blocking call from
  * an ISR, an unbalanced critical section - at the point they happen. A failure
@@ -279,10 +218,7 @@
  * Values: 1 = on, 0 = compiled out. */
 #define OS_CONFIG_ASSERT_ENABLE             1U
 
-/*
- * ***********************************************************************************************************
- * Buffered logging
- * ***********************************************************************************************************
+/* Buffered logging.
  *
  * OS_LOG_ERROR / WARN / INFO / DEBUG: printf-style calls format into a ring buffer and return
  * immediately, and the kernel task tsk_log hands finished bytes to os_log_output_cb() for the
@@ -295,7 +231,7 @@
  * logs at least 1 KB, more for %f. Not theoretical - os_log_emit_dropped() hand-formats its own
  * message because vsnprintf overflowed the log task's stack, and application tasks get no such
  * special case. Hard to debug, too: the line that would report it is the one that overflowed.
-*/
+ */
 
 /* Values: 1 = on, 0 = compiled out. */
 #define OS_CONFIG_LOG_ENABLE                1U
@@ -330,16 +266,13 @@
  * Values: OS_TASK_CORE(n), or OS_TASK_CORE_ANY to follow the work. */
 #define OS_CONFIG_LOG_CORE_AFFINITY         OS_TASK_CORE(0)
 
-/*
- * ***********************************************************************************************************
- * Self-test suite
- * ***********************************************************************************************************
+/* Self-test suite.
  *
  * At 1, os_init() runs os_test() instead of creating the default application task, and the
  * AhuraRTOS/test library must be linked - nothing in the kernel defines os_test(), so forgetting
  * it is a link error rather than a build that silently tests nothing. Off by default: opt in per
  * project. See doc/testing.md "Self-test suite".
-*/
+ */
 
 /* Values: 1 = run the suite, 0 = run os_main(). */
 #define OS_CONFIG_TEST_ENABLE               0U
@@ -368,22 +301,13 @@
 /* Values: OS_TASK_PRIO_1 .. OS_TASK_PRIO_30. */
 #define OS_CONFIG_TEST_PRIORITY             OS_TASK_PRIO_2
 
-/*
- * ***********************************************************************************************************
- * PART 3 - PLATFORM
- * ***********************************************************************************************************
-*/
-
-/*
- * ***********************************************************************************************************
- * Exception vector the kernel owns
- * ***********************************************************************************************************
+/* Exception vector the kernel owns.
  *
  * The NAME of that vector is not here - it is a fact about the target's startup code, so the SoC
  * package sets it (OS_CONFIG_ARCH_PENDSV_HANDLER, see doc/soc.md). It defaults to the CMSIS-Pack
  * name PendSV_Handler. Defining it here as well would override the package silently, because this
  * file is read after the build system's -D.
-*/
+ */
 
 /* Check at boot that the live vector table really routes that vector to the
  * kernel. Without it the failure is silent and expensive: the build succeeds
@@ -392,12 +316,6 @@
  * os_init() runs. OPTIONAL: leaving it out enables the check.
  * Values: 1 = check, 0 = skip. */
 #define OS_CONFIG_ARCH_VECTOR_CHECK         1U
-
-/*
- * ***********************************************************************************************************
- * TrustZone security state (ARMv8-M cores only)
- * ***********************************************************************************************************
-*/
 
 /* Which ARMv8-M security state the kernel runs in; the value macros are
  * kernel-owned. DISABLED on any core without the Security Extension, and on
@@ -408,12 +326,6 @@
  * secure-side; compile with -mcmse. See doc/porting.md "TrustZone".
  * Values: OS_CONFIG_TRUSTZONE_DISABLED, _NON_SECURE, _SECURE. */
 #define OS_CONFIG_TRUSTZONE                 OS_CONFIG_TRUSTZONE_DISABLED
-
-/*
- * ***********************************************************************************************************
- * Multi-core (experimental scaffold)
- * ***********************************************************************************************************
-*/
 
 /* Cores that schedule tasks. Each runs its own idle task and pulls from the
  * shared ready lists honoring core_affinity; core 0 owns the time base, and
@@ -429,10 +341,7 @@
  * Values: 1..31. */
 #define OS_CONFIG_CORE_COUNT                1U
 
-/*
- * ***********************************************************************************************************
- * Tickless idle
- * ***********************************************************************************************************
+/* Tickless idle.
  *
  * Instead of waking the CPU OS_CONFIG_TICK_HZ times a second with nothing to do, the idle path
  * suppresses the tick for the whole planned sleep and puts the clock right afterwards from what
@@ -447,7 +356,7 @@
  * To wake sooner than the hardware would, arm a periodic timer - the kernel already stops the
  * window at the nearest deadline.
  * See doc/porting.md "Tickless idle".
-*/
+ */
 
 /* Values: 1 = allow suppression, 0 = plain WFI. */
 #define OS_CONFIG_TICKLESS_ENABLE           0U
@@ -473,5 +382,9 @@
  * finer than the tick means "the smallest window there is" rather than "no floor".
  * Values: milliseconds. */
 #define OS_CONFIG_TICKLESS_MIN_IDLE_MS      2U
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* OS_CONFIG_H */

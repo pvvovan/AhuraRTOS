@@ -70,7 +70,7 @@ extern "C"
  *
  * SOC_CONFIG_IPI_DOORBELL is not checked here: doorbells are RP2350-only hardware, so that option
  * belongs to the chip package that has them and is checked there. */
-#if !defined(SOC_CONFIG_SPINLOCK_ID) || !defined(SOC_CONFIG_SYSTICK_VECTOR) ||                        \
+#if !defined(SOC_CONFIG_SPINLOCK_ID) || !defined(SOC_CONFIG_SYSTICK_VECTOR) ||  \
     !defined(SOC_CONFIG_CLOCK_AUTO_UPDATE) || !defined(SOC_CONFIG_FAULT_REPORT)
 #error "soc_config.h is incomplete: it must define every option listed in this package's template/soc_config.h."
 #endif
@@ -95,7 +95,6 @@ extern "C"
 */
 
 #if (OS_CONFIG_CORE_COUNT > 1U)
-
 /******************************************************************************************************/
 /**
  * @brief Enable the inter-core interrupt on the calling core. Implemented by the CHIP package,
@@ -107,7 +106,6 @@ extern "C"
  * nothing above this line has to know which happened.
  */
 void soc_ipi_arm(void);
-
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 #ifdef __cplusplus

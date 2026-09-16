@@ -12,7 +12,7 @@ AhuraRTOS/
 ├── kernel/          <- the portable core, mapped below
 ├── arch/            <- the port layer, <family>/<core>: arm/ and riscv/
 ├── soc/             <- optional per-silicon packages, <vendor>/<family>
-├── template/        <- os_config.h, os_cb.c, os_main.c, soc_cb.c - copied into a project
+├── template/        <- os_config.h, os_cb.c, os_main.c copied into a project; soc_cb.c for a part with no SoC package
 ├── test/            <- the self-test suite, built as its own os_test library
 ├── examples/        <- one runnable os_main.c per feature
 ├── doc/             <- every documentation page, this one included

@@ -9,6 +9,7 @@
  *            SPDX-License-Identifier: GPL-3.0-or-later
  *            See LICENSE in the project root for the full license text.
  */
+
 /*
  * ***********************************************************************************************************
  * Includes
@@ -17,45 +18,11 @@
 
 #include "../../soc/raspberrypi/rp235x_arm/soc_cb.c"
 
-volatile uint32_t audit_idle = 1U;
-volatile uint32_t audit_time_us;
-volatile uint32_t audit_board_allowed = 1U;
-
 /*
  * ***********************************************************************************************************
- * Function implementations
+ * Constants
  * ***********************************************************************************************************
 */
-
-bool os_task_current_is_idle(void)
-{
-    return audit_idle != 0U;
-}
-uint64_t time_us_64(void)
-{
-    return audit_time_us++;
-}
-
-uint32_t audit_prepare(void)
-{
-    return os_arch_soc_sleep_prepare_cb() ? 1U : 0U;
-}
-void audit_finish(void)
-{
-    os_arch_soc_sleep_finish_cb();
-}
-void audit_peer(void)
-{
-    soc_sleep_peer_park();
-}
-void audit_sleep(void)
-{
-    os_arch_soc_sleep_cb();
-}
-uint32_t audit_eligible(void)
-{
-    return soc_deep_peripherals_ready() ? 1U : 0U;
-}
 
 /* Values come from the installed SDK headers used by the firmware build. */
 const uint32_t audit_registers[] = {
@@ -111,3 +78,91 @@ const uint32_t audit_constants[] = {
         (CLOCKS_CLK_GPOUT0_CTRL_AUXSRC_VALUE_CLK_SYS << CLOCKS_CLK_GPOUT0_CTRL_AUXSRC_LSB),
     USB_MAIN_CTRL_CONTROLLER_EN_BITS
 };
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
+__IO uint32_t audit_idle = 1U;
+__IO uint32_t audit_time_us;
+__IO uint32_t audit_board_allowed = 1U;
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_current_is_idle: what this harness needs of it, with no kernel behind
+ *        it.
+ *
+ * @return What this stand-in reports.
+ */
+bool os_task_current_is_idle(void)
+{
+    return audit_idle != 0U;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Modeled microsecond clock this harness advances itself.
+ *
+ * @return What this stand-in reports.
+ */
+uint64_t time_us_64(void)
+{
+    return audit_time_us++;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Arrange the state this case starts from.
+ *
+ * @return What the case observed.
+ */
+uint32_t audit_prepare(void)
+{
+    return os_arch_soc_sleep_prepare_cb() ? 1U : 0U;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Tear the case down and report what it observed.
+ */
+void audit_finish(void)
+{
+    os_arch_soc_sleep_finish_cb();
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Drive the other core's half of the handshake.
+ */
+void audit_peer(void)
+{
+    soc_sleep_peer_park();
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Run one modeled tickless window of the requested length.
+ */
+void audit_sleep(void)
+{
+    os_arch_soc_sleep_cb();
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Whether this core may currently open the window.
+ *
+ * @return What the case observed.
+ */
+uint32_t audit_eligible(void)
+{
+    return soc_deep_peripherals_ready() ? 1U : 0U;
+}

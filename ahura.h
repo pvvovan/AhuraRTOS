@@ -13,12 +13,42 @@
 #ifndef AHURA_H
 #define AHURA_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+
 /* os_arch_port.h includes and validates the application's os_config.h
  * (copy template/os_config.h, see doc/integration.md "Configuration"). */
 #include "os_arch_port.h"
+
+/* Always available. os_types.h comes first: the others use its status codes and
+ * OS_STATIC_ASSERT. */
+#include "kernel/os_types.h"
+#include "kernel/os_list.h"
+#include "kernel/os_kernel.h"
+#include "kernel/os_task.h"
+#include "kernel/os_critical.h"
+#include "kernel/os_tick.h"
+#include "kernel/os_delay.h"
+
+/* Configurable: each header compiles away with its OS_CONFIG_ option, in os_config.h's order. */
+
+#include "kernel/os_mutex.h"
+#include "kernel/os_sem.h"
+#include "kernel/os_queue.h"
+#include "kernel/os_msg.h"
+#include "kernel/os_event.h"
+#include "kernel/os_timer.h"
+#include "kernel/os_notify.h"
+#include "kernel/os_mem.h"
+#include "kernel/os_atomic.h"
+#include "kernel/os_log.h"
 
 #ifdef __cplusplus
 extern "C"
@@ -27,30 +57,15 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Portability
- * ***********************************************************************************************************
-*/
-
-/* The compile-time assertion, spelled the way the language in use spells it: _Static_assert in
- * C11, static_assert in C++, which does not declare the C spelling at all. The extern "C" block
- * fixes the linkage, not the syntax. Both forms take the same two arguments. */
-#ifdef __cplusplus
-#define OS_STATIC_ASSERT(condition, message)    static_assert(condition, message)
-#else
-#define OS_STATIC_ASSERT(condition, message)    _Static_assert(condition, message)
-#endif
-
-/*
- * ***********************************************************************************************************
- * Kernel version
+ * Macros
  * ***********************************************************************************************************
 */
 
 /* MAJOR.MINOR.PATCH, semantic versioning: MAJOR for a breaking API change, MINOR for additions that
  * keep existing code compiling, PATCH for fixes that change no interface.
  *
- * Plain ints, deliberately: no U suffix, because OS_VERSION_STRING stringifies these very tokens and
- * a suffix would come out literally as "0U.0U.0U". They are only ever compared against small
+ * Plain ints, deliberately: no U suffix, because OS_VERSION_STRING stringifies these very tokens
+ * and a suffix would come out literally as "0U.0U.0U". They are only ever compared against small
  * constants, so nothing here needs the unsigned type. */
 #define OS_VERSION_MAJOR                0
 #define OS_VERSION_MINOR                0
@@ -78,71 +93,13 @@ extern "C"
                                                         OS_VERSION_MINOR, \
                                                         OS_VERSION_PATCH)
 
-
 /*
  * ***********************************************************************************************************
- * PART 1 - ALWAYS AVAILABLE (no configuration option removes any of this)
- * ***********************************************************************************************************
-*/
-
-
-#include "kernel/os_types.h"
-#include "kernel/os_list.h"
-#include "kernel/os_kernel.h"
-#include "kernel/os_task.h"
-#include "kernel/os_critical.h"
-#include "kernel/os_tick.h"
-#include "kernel/os_delay.h"
-
-/*
- * ***********************************************************************************************************
- * PART 2 - CONFIGURABLE (each group compiles away with its OS_CONFIG_ option)
- * ***********************************************************************************************************
- *
- * Same order as the option list in os_config.h, one guard per group.
-*/
-
-
-#include "kernel/os_mutex.h"
-#include "kernel/os_sem.h"
-#include "kernel/os_queue.h"
-#include "kernel/os_msg.h"
-#include "kernel/os_event.h"
-#include "kernel/os_timer.h"
-#include "kernel/os_notify.h"
-#include "kernel/os_mem.h"
-#include "kernel/os_atomic.h"
-#include "kernel/os_log.h"
-
-/*
- * ***********************************************************************************************************
- * Self-test          - OS_CONFIG_TEST_ENABLE
+ * Global variables
  * ***********************************************************************************************************
 */
 
 #if (OS_CONFIG_TEST_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Kernel self-test suite entry point (see OS_CONFIG_TEST_* in os_config.h). os_init()
- *        creates and starts a task that calls this automatically, so link the AhuraRTOS/test
- *        library (CMake target "os_test") to supply it (see doc/testing.md "Self-test suite"). The
- *        kernel ships no stub, which is what lets a plain static-library link pull the suite in
- *        and turns "forgot to link it" into a link error. Not a "_cb" hook, same reasoning as
- *        os_main().
- */
-void os_test(void);
-
-/******************************************************************************************************/
-/**
- * @brief The self-test suite body that has to run in INTERRUPT context, so the ISR-safe APIs are
- *        exercised from a real ISR rather than from a task pretending to be one.
- *
- * Call this from the SVC handler when the application owns that vector and the suite therefore does
- * not (OS_CONFIG_TEST_SVC_VECTOR set to 0). With the default of 1 the suite installs its own vector
- * and nothing here needs calling. See the option in test/os_test.c for why both routes exist.
- */
-void os_test_isr_entry(void);
-
 /**
  * @brief Entries into os_tick_handler() on the core that owns the time base, counted so the suite
  *        can prove a tickless window really SUPPRESSED the tick rather than merely arriving at the
@@ -173,10 +130,38 @@ extern __IO uint32_t os_test_tick_isr_entries;
 extern __IO uint32_t os_test_deep_sleep_entries;
 #endif /* OS_CONFIG_TEST_ENABLE */
 
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TEST_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Kernel self-test suite entry point (see OS_CONFIG_TEST_* in os_config.h). os_init()
+ *        creates and starts a task that calls this automatically, so link the AhuraRTOS/test
+ *        library (CMake target "os_test") to supply it (see doc/testing.md "Self-test suite"). The
+ *        kernel ships no stub, which is what lets a plain static-library link pull the suite in
+ *        and turns "forgot to link it" into a link error. Not a "_cb" hook, same reasoning as
+ *        os_main().
+ */
+void os_test(void);
+
+/******************************************************************************************************/
+/**
+ * @brief The self-test suite body that has to run in INTERRUPT context, so the ISR-safe APIs are
+ *        exercised from a real ISR rather than from a task pretending to be one.
+ *
+ * Call this from the SVC handler when the application owns that vector and the suite therefore does
+ * not (OS_CONFIG_TEST_SVC_VECTOR set to 0). With the default of 1 the suite installs its own vector
+ * and nothing here needs calling. See the option in test/os_test.c for why both routes exist.
+ */
+void os_test_isr_entry(void);
+#endif /* OS_CONFIG_TEST_ENABLE */
 
 #ifdef __cplusplus
 }
-
 #endif
 
 #endif /* AHURA_H */

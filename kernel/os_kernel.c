@@ -17,24 +17,6 @@
 
 /*
  * ***********************************************************************************************************
- * Private function prototypes
- * ***********************************************************************************************************
-*/
-
-static void os_kernel_init_require(bool valid);
-
-#if (OS_CONFIG_TEST_ENABLE == 0U)
-static os_err_t os_main_system_init(void);
-static void      os_main_task_entry(void *context);
-#endif
-
-#if (OS_CONFIG_TEST_ENABLE == 1U)
-static os_err_t os_test_system_init(void);
-static void      os_test_task_entry(void *context);
-#endif
-
-/*
- * ***********************************************************************************************************
  * Global variables
  * ***********************************************************************************************************
 */
@@ -62,16 +44,52 @@ OS_TASK_DEFINE(tsk_test, OS_CONFIG_TEST_STACK_SIZE);
 
 /*
  * ***********************************************************************************************************
- * Public function implementations
+ * Private function prototypes
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
 /**
- * @brief Initialize kernel subsystems. Call once before any other kernel API.
- *
- * @return None.
+ * @brief Halt at an unusable startup configuration even when optional assertions are disabled.
  */
+static void os_kernel_init_require(bool valid);
+
+#if (OS_CONFIG_TEST_ENABLE == 0U)
+/******************************************************************************************************/
+/**
+ * @brief Create and start the default application task. Called from os_init().
+ */
+static os_err_t os_main_system_init(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Default application task entry: wraps os_main() so a return from it cleanly
+ *        exits the task instead of falling off the end of an entry function.
+ */
+static void os_main_task_entry(void *context);
+#endif /* OS_CONFIG_TEST_ENABLE == 0U */
+
+#if (OS_CONFIG_TEST_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Create and start the self-test task. Called from os_init().
+ */
+static os_err_t os_test_system_init(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Self-test task entry: wraps os_test() so a return from it cleanly exits the
+ *        task instead of falling off the end of an entry function.
+ */
+static void os_test_task_entry(void *context);
+#endif /* OS_CONFIG_TEST_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
+
 /******************************************************************************************************/
 /**
  * @brief Weak default for the SoC start-up hook: a target with no SoC package has nothing to do
@@ -116,13 +134,22 @@ OS_WEAK void os_arch_soc_idle_cb(void)
 }
 
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U)
-/******************************************************************************************************/
 /* Ports without shared-clock coordination need no preparation or release. */
+/******************************************************************************************************/
+/**
+ * @brief Weak default: no shared-clock coordination to arrange, so a window may always open.
+ *
+ * @return True when the window may open.
+ */
 OS_WEAK bool os_arch_soc_sleep_prepare_cb(void)
 {
     return true;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Weak default: nothing was taken to open the window, so nothing is released here.
+ */
 OS_WEAK void os_arch_soc_sleep_finish_cb(void)
 {
 }
@@ -144,6 +171,11 @@ OS_WEAK void os_arch_soc_sleep_cb(void)
 #endif /* OS_CONFIG_TICKLESS_ENABLE */
 
 /******************************************************************************************************/
+/**
+ * @brief Initialize kernel subsystems. Call once before any other kernel API.
+ *
+ * @return None.
+ */
 void os_init(void)
 {
     os_kernel_init_require(!os_kernel_initialized && !os_kernel_running);
@@ -260,7 +292,6 @@ void os_core_start(void)
     {
     }
 }
-
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 /******************************************************************************************************/
@@ -390,7 +421,6 @@ void os_assert_failed(const char *file, uint32_t line)
     {
     }
 }
-
 #endif /* OS_CONFIG_ASSERT_ENABLE */
 
 /*

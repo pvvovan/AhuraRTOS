@@ -13,6 +13,12 @@
 #ifndef OS_NOTIFY_H
 #define OS_NOTIFY_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "os_types.h"
 
 #ifdef __cplusplus
@@ -22,12 +28,11 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Task notifications - OS_CONFIG_NOTIFY_ENABLE
+ * Public function prototypes
  * ***********************************************************************************************************
 */
 
 #if (OS_CONFIG_NOTIFY_ENABLE == 1U)
-
 /******************************************************************************************************/
 /**
  * @brief Deliver a value to a task's notification mailbox (overwrite: last write wins), waking
@@ -42,7 +47,6 @@ os_err_t os_notify_give(os_task_t *task, uint32_t value);
  *        be NULL to take the wake-up and discard the value; it is consumed either way.
  */
 os_err_t os_notify_wait(uint32_t timeout_ms, uint32_t *value_out);
-
 #endif /* OS_CONFIG_NOTIFY_ENABLE */
 
 #ifdef __cplusplus

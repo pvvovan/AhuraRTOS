@@ -11,6 +11,12 @@
  * other by pushing a word into the inter-core FIFO and taking that FIFO's IRQ at the far end. The
  * RP2350 package does the same job with a claimed doorbell.
  *
+ * And the tickless wake source. The Arm port cannot stretch SysTick here: its reload is the only
+ * cycle counter an ARMv6-M core has, and os_delay_us() runs on it. So the port masks the tick
+ * interrupt and this package ends the window, on the always-on microsecond timer - 64 bits at a
+ * fixed 1 MHz, independent of clk_sys and of SysTick, with one of its four alarms claimed for it.
+ * Whole ticks only, both ways: announcing a partial tick would move os_tick_count off the grid.
+ *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: GPL-3.0-or-later
  *            See LICENSE in the project root for the full license text.
@@ -28,18 +34,80 @@
 #include "hardware/timer.h"
 #include "pico/multicore.h"
 
-#if (OS_CONFIG_CORE_COUNT > 1U)
-
 /*
  * ***********************************************************************************************************
  * Macros
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_CORE_COUNT > 1U)
 /* Sent through the FIFO to mean "re-evaluate scheduling". The value is never read - the receiving
  * core drains the FIFO and pends PendSV whatever arrived - but a recognisable constant is worth
  * more than a zero when it turns up in a trace. */
 #define SOC_IPI_TOKEN           0xA1U
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+#if (OS_CONFIG_TICKLESS_DEEP_ENABLE == 1U)
+/* Refused at build time rather than sleeping light in silence: DEEP gates clk_sys, the microsecond
+ * timer stops with it, and only the RTC would survive. */
+#error "OS_CONFIG_TICKLESS_DEEP_ENABLE is not implemented in this package yet: the microsecond TIMER is gated with clk_sys and cannot wake the core from it, and the RTC that could is not written yet. \
+Set it to 0U."
+#endif
+
+/** Microseconds in one kernel tick, settled once so neither callback divides at run time. */
+#define SOC_TICKLESS_US_PER_TICK    (1000000UL / OS_CONFIG_TICK_HZ)
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Constants
+ * ***********************************************************************************************************
+*/
+
+/** Referenced by nothing, and that is its entire job.
+ *
+ *  Every other symbol in this file sits behind a #if - the tickless callbacks, the multicore glue -
+ *  and each of those the kernel gives a weak default. Turn tickless off, or build single-core, and
+ *  nothing in the link names anything here: the linker never extracts this object from the archive,
+ *  and every callback it holds loses silently to a weak default. It was found on the rp235x_arm
+ *  package, where a single-core build lost its wake source and fell back to SysTick with nothing
+ *  reported.
+ *
+ *  soc.cmake names this in a -u link option, which is what forces the extraction. Unconditional on
+ *  purpose: a symbol behind the same #if as the things it rescues would disappear with them. */
+const uint32_t soc_rp2040_anchor = 0U;
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/** Alarm the window uses, claimed from the SDK on first use rather than chosen here. A hard-coded
+ *  number is what broke: pico_time's default pool already owns one, and the application may own
+ *  others. -1 until claimed. */
+static int32_t soc_tickless_alarm = -1;
+
+/** Timer reading when the window opened, so the close can measure against it. */
+static uint64_t soc_tickless_entry_us;
+
+/** Time measured but not yet announced, in microseconds x OS_CONFIG_TICK_HZ.
+ *
+ * A window's last, incomplete tick used to be dropped: elapsed was a truncating division and the
+ * next window re-read its reference from the timer, so up to one whole tick went missing EVERY time
+ * the core slept. Nothing in a single window shows it; a run that sleeps once a second loses a
+ * second every few minutes.
+ *
+ * Scaling by OS_CONFIG_TICK_HZ rather than pre-dividing also makes the conversion exact for tick
+ * rates that do not divide 1 MHz - 300 Hz, 1024 Hz - where SOC_TICKLESS_US_PER_TICK is a rounded
+ * number and every window inherited its error. What is left after the whole ticks are taken out
+ * stays here and is spent by a later window, so announced time converges on real time.
+ *
+ * Always below 1000000, by construction. */
+static uint64_t soc_tickless_accum_us_hz;
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -47,8 +115,35 @@
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_CORE_COUNT > 1U)
 /******************************************************************************************************/
+/**
+ * @brief Inter-core interrupt handler: drain the FIFO and ask for a reschedule.
+ */
 static void soc_ipi_handler(void);
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Microseconds to wait for a given number of whole kernel ticks, honouring what
+ *        soc_tickless_accum_us_hz has already banked. Rounded UP: a window must never end before
+ *        the tick it was asked for.
+ */
+static uint64_t soc_tickless_ticks_to_us(uint32_t ticks);
+
+/******************************************************************************************************/
+/**
+ * @brief Alarm handler: exists only to end the WFI.
+ */
+static void soc_tickless_alarm_isr(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Take an alarm and its vector from the SDK, once.
+ */
+static bool soc_tickless_alarm_ready(void);
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -56,14 +151,18 @@ static void soc_ipi_handler(void);
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_CORE_COUNT > 1U)
 /******************************************************************************************************/
 /**
  * @brief Interrupt another core so it re-evaluates which task should be running.
  *
  * Without this a core notices a newly ready task only at its next tick, which is correct but adds
  * up to a whole tick of latency to every cross-core wake.
+ *
+ * @param[in] core_id  Core to interrupt.
+ * @return None.
  */
-OS_WEAK void os_arch_core_ipi_request_cb(uint32_t core_id)
+void os_arch_core_ipi_request_cb(uint32_t core_id)
 {
     /* Broadcast an event first, and unconditionally. The interrupt below is what makes the
      * other core RESCHEDULE; this is what makes sure it is awake to notice. An idle core
@@ -105,183 +204,9 @@ void soc_ipi_arm(void)
     irq_set_priority(irq, PICO_LOWEST_IRQ_PRIORITY);
     irq_set_enabled(irq, true);
 }
-
-/*
- * ***********************************************************************************************************
- * Private function implementations
- * ***********************************************************************************************************
-*/
-
-/******************************************************************************************************/
-/**
- * @brief Inter-core interrupt handler: drain the FIFO and ask for a reschedule.
- *
- * The signal carries no information beyond "look again", so nothing is decoded. Pending PendSV
- * rather than switching here is what keeps the context switch in the one place able to do it.
- */
-static void soc_ipi_handler(void)
-{
-    multicore_fifo_clear_irq();
-    multicore_fifo_drain();
-
-    OS_ARCH_CONTEXT_SWITCH_REQUEST();
-}
-
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
 
-/** Referenced by nothing, and that is its entire job.
- *
- *  Every other symbol in this file sits behind a #if - the tickless callbacks, the multicore glue -
- *  and each of those the kernel gives a weak default. Turn tickless off, or build single-core, and
- *  nothing in the link names anything here: the linker never extracts this object from the archive,
- *  and every callback it holds loses silently to a weak default. It was found on the rp235x_arm
- *  package, where a single-core build lost its wake source and fell back to SysTick with nothing
- *  reported.
- *
- *  soc.cmake names this in a -u link option, which is what forces the extraction. Unconditional on
- *  purpose: a symbol behind the same #if as the things it rescues would disappear with them. */
-const uint32_t soc_rp2040_anchor = 0U;
-
-
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U)
-
-/*
- * ***********************************************************************************************************
- * Configuration rules
- * ***********************************************************************************************************
- *
- * Build failures rather than run-time zeros. Every way this can be set wrong fails SILENTLY on the
- * board - a window that never suppresses, a core that never wakes - and a silent fault here is
- * expensive to find. A refused build naming the settings that disagree costs nothing to read.
-*/
-
-/* No wake source to choose: the depth decides it. LIGHT keeps the clocks running, so the microsecond TIMER is
- * still counting and takes the window; DEEP gates them, and only the RTC would survive that.
- *
- * It used to be five flags plus the mode, with an arithmetic rule saying exactly one flag had to
- * be 1, another naming the sources this chip does not physically have, and a third refusing deep
- * sleep against a source that stops with the clocks. None of those states can be expressed any
- * more, so none of those rules exists. */
-#if (OS_CONFIG_TICKLESS_DEEP_ENABLE == 1U)
-#error "OS_CONFIG_TICKLESS_DEEP_ENABLE is not implemented in this package yet: the microsecond TIMER is gated with clk_sys and cannot wake the core from it, and the RTC that could is not written yet. \
-Set it to 0U."
-#endif
-
-/*
- * ***********************************************************************************************************
- * Tickless idle
- * ***********************************************************************************************************
- *
- * The Arm port cannot suppress its own tick here: reprogramming SysTick's reload would strand
- * os_arch_cycle_systick.c, which is the ONLY cycle counter an ARMv6-M core has and the one
- * os_delay_us() runs on. So the port masks the tick interrupt instead and asks this package to
- * wake it, which needs a timer SysTick's silence cannot affect.
- *
- * The always-on microsecond timer is that: 64 bits at a fixed 1 MHz, independent of clk_sys and of
- * anything the core does to SysTick. One of its four alarms is claimed for the window.
- *
- * Whole ticks only, both ways. The kernel counts in ticks and announcing a partial one would move
- * os_tick_count somewhere the tick grid never was.
-*/
-
-/** Microseconds in one kernel tick, settled once so neither callback divides at run time. */
-#define SOC_TICKLESS_US_PER_TICK    (1000000UL / OS_CONFIG_TICK_HZ)
-
-/** Alarm the window uses, claimed from the SDK on first use rather than chosen here. A hard-coded
- *  number is what broke: pico_time's default pool already owns one, and the application may own
- *  others. -1 until claimed. */
-static int32_t soc_tickless_alarm = -1;
-
-/** Timer reading when the window opened, so the close can measure against it. */
-static uint64_t soc_tickless_entry_us;
-
-/** Time measured but not yet announced, in microseconds x OS_CONFIG_TICK_HZ.
- *
- * A window's last, incomplete tick used to be dropped: elapsed was a truncating division and the
- * next window re-read its reference from the timer, so up to one whole tick went missing EVERY time
- * the core slept. Nothing in a single window shows it; a run that sleeps once a second loses a
- * second every few minutes.
- *
- * Scaling by OS_CONFIG_TICK_HZ rather than pre-dividing also makes the conversion exact for tick
- * rates that do not divide 1 MHz - 300 Hz, 1024 Hz - where SOC_TICKLESS_US_PER_TICK is a rounded
- * number and every window inherited its error. What is left after the whole ticks are taken out
- * stays here and is spent by a later window, so announced time converges on real time.
- *
- * Always below 1000000, by construction. */
-static uint64_t soc_tickless_accum_us_hz;
-
-/******************************************************************************************************/
-/**
- * @brief Microseconds to wait for a given number of whole kernel ticks, honouring what
- *        soc_tickless_accum_us_hz has already banked. Rounded UP: a window must never end before
- *        the tick it was asked for.
- *
- * @param[in] ticks  Kernel ticks the window should cover.
- * @return uint64_t  Microseconds to arm.
- */
-static uint64_t soc_tickless_ticks_to_us(uint32_t ticks)
-{
-    /* soc_tickless_accum_us_hz is deliberately NOT subtracted here, and getting that wrong is worth
-     * a note because it looks like the symmetric thing to do and it is not. The accumulator holds
-     * time that has already ELAPSED and merely has not been announced yet - it sits behind the
-     * reference this window is about to take. The kernel's deadline is `ticks` from NOW. Netting the
-     * accumulator off makes the window end that much before the deadline, while the close adds the
-     * same amount back into `elapsed` - so the kernel is told a full window passed when it did not,
-     * the clock runs fast, and the next window is planned shorter still. On an STM32 that showed up
-     * as a 50-tick sleep measuring 5. */
-    uint64_t wanted = (uint64_t)ticks * 1000000ULL;
-
-    return (wanted + (uint64_t)OS_CONFIG_TICK_HZ - 1ULL) / (uint64_t)OS_CONFIG_TICK_HZ;
-}
-
-/******************************************************************************************************/
-/**
- * @brief Alarm handler: exists only to end the WFI.
- *
- * Nothing is done here on purpose. The wake itself is the whole product, and the kernel measures
- * the window from the timer rather than from anything this could record - a handler that ran late,
- * or not at all because something else woke the core first, must not change the answer.
- *
- * @return None.
- */
-static void soc_tickless_alarm_isr(void)
-{
-    hw_clear_bits(&timer_hw->intr, 1UL << (uint32_t)soc_tickless_alarm);
-}
-
-/******************************************************************************************************/
-/**
- * @brief Take an alarm and its vector from the SDK, once.
- *
- * Deferred to first use rather than done at SoC init, so a build without tickless idle costs no
- * alarm at all - this part has four and the application may want them.
- *
- * The claim goes through the SDK's allocator on purpose. It is what tells pico_time and any driver
- * that asks later that this alarm is spoken for, and asking for a specific number instead is what
- * put the kernel's handler on top of pico_time's.
- *
- * @return bool  True once an alarm is owned; false when all four are already taken, which leaves
- *                the port suppressing nothing rather than fighting for one.
- */
-static bool soc_tickless_alarm_ready(void)
-{
-    if (soc_tickless_alarm < 0)
-    {
-        int32_t claimed = (int32_t)hardware_alarm_claim_unused(false);
-
-        if (claimed >= 0)
-        {
-            soc_tickless_alarm = claimed;
-
-            /* Exclusive is right here and safe now: the allocator just handed this one over, so
-             * nothing else holds its vector. */
-            irq_set_exclusive_handler((uint)(TIMER_IRQ_0 + claimed), soc_tickless_alarm_isr);
-        }
-    }
-
-    return (soc_tickless_alarm >= 0);
-}
-
 /******************************************************************************************************/
 /**
  * @brief How many ticks one window may skip.
@@ -368,5 +293,101 @@ uint32_t os_arch_tick_resume_cb(void)
 
     return elapsed_ticks;
 }
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
 
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/******************************************************************************************************/
+/**
+ * @brief Inter-core interrupt handler: drain the FIFO and ask for a reschedule.
+ *
+ * The signal carries no information beyond "look again", so nothing is decoded. Pending PendSV
+ * rather than switching here is what keeps the context switch in the one place able to do it.
+ */
+static void soc_ipi_handler(void)
+{
+    multicore_fifo_clear_irq();
+    multicore_fifo_drain();
+
+    OS_ARCH_CONTEXT_SWITCH_REQUEST();
+}
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Microseconds to wait for a given number of whole kernel ticks, honouring what
+ *        soc_tickless_accum_us_hz has already banked. Rounded UP: a window must never end before
+ *        the tick it was asked for.
+ *
+ * @param[in] ticks  Kernel ticks the window should cover.
+ * @return uint64_t  Microseconds to arm.
+ */
+static uint64_t soc_tickless_ticks_to_us(uint32_t ticks)
+{
+    /* soc_tickless_accum_us_hz is deliberately NOT subtracted here, and getting that wrong is worth
+     * a note because it looks like the symmetric thing to do and it is not. The accumulator holds
+     * time that has already ELAPSED and merely has not been announced yet - it sits behind the
+     * reference this window is about to take. The kernel's deadline is `ticks` from NOW. Netting
+     * the accumulator off makes the window end that much before the deadline, while the close adds
+     * the same amount back into `elapsed` - so the kernel is told a full window passed when it did
+     * not, the clock runs fast, and the next window is planned shorter still. On an STM32 that
+     * showed up as a 50-tick sleep measuring 5. */
+    uint64_t wanted = (uint64_t)ticks * 1000000ULL;
+
+    return (wanted + (uint64_t)OS_CONFIG_TICK_HZ - 1ULL) / (uint64_t)OS_CONFIG_TICK_HZ;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Alarm handler: exists only to end the WFI.
+ *
+ * Nothing is done here on purpose. The wake itself is the whole product, and the kernel measures
+ * the window from the timer rather than from anything this could record - a handler that ran late,
+ * or not at all because something else woke the core first, must not change the answer.
+ *
+ * @return None.
+ */
+static void soc_tickless_alarm_isr(void)
+{
+    hw_clear_bits(&timer_hw->intr, 1UL << (uint32_t)soc_tickless_alarm);
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Take an alarm and its vector from the SDK, once.
+ *
+ * Deferred to first use rather than done at SoC init, so a build without tickless idle costs no
+ * alarm at all - this part has four and the application may want them.
+ *
+ * The claim goes through the SDK's allocator on purpose. It is what tells pico_time and any driver
+ * that asks later that this alarm is spoken for, and asking for a specific number instead is what
+ * put the kernel's handler on top of pico_time's.
+ *
+ * @return bool  True once an alarm is owned; false when all four are already taken, which leaves
+ *                the port suppressing nothing rather than fighting for one.
+ */
+static bool soc_tickless_alarm_ready(void)
+{
+    if (soc_tickless_alarm < 0)
+    {
+        int32_t claimed = (int32_t)hardware_alarm_claim_unused(false);
+
+        if (claimed >= 0)
+        {
+            soc_tickless_alarm = claimed;
+
+            /* Exclusive is right here and safe now: the allocator just handed this one over, so
+             * nothing else holds its vector. */
+            irq_set_exclusive_handler((uint)(TIMER_IRQ_0 + claimed), soc_tickless_alarm_isr);
+        }
+    }
+
+    return (soc_tickless_alarm >= 0);
+}
 #endif /* OS_CONFIG_TICKLESS_ENABLE */

@@ -9,6 +9,7 @@
  *            SPDX-License-Identifier: GPL-3.0-or-later
  *            See LICENSE in the project root for the full license text.
  */
+
 /*
  * ***********************************************************************************************************
  * Includes
@@ -17,25 +18,50 @@
 
 #include "../../arch/arm/cortex_m33/os_arch_port.c"
 
-volatile uint32_t test_failure;
-uint32_t SystemCoreClock = 1000000U;
-uint32_t expected_reload;
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #define CHECK(c) do { if (!(c)) { test_failure = __LINE__; __asm volatile("bkpt #0"); } } while (0)
 
 /*
  * ***********************************************************************************************************
- * Function implementations
+ * Global variables
  * ***********************************************************************************************************
 */
 
-static void setup(void)
-{
-    os_arch_tick_reload_cycles = 1000U;
-    OS_ARCH_REG_ICSR = 0U;
-    OS_ARCH_REG_SYST_RVR = 999U;
-    OS_ARCH_REG_SYST_CSR = 7U;
-    OS_ARCH_REG_SYST_CVR = 900U;
-}
+__IO uint32_t test_failure;
+uint32_t SystemCoreClock = 1000000U;
+uint32_t expected_reload;
+
+extern uint64_t test_reference;
+
+/*
+ * ***********************************************************************************************************
+ * Private function prototypes
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Reset the modeled hardware before a case runs.
+ */
+static void setup(void);
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Case: a window opened early in a tick period.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_port_early_phase(void)
 {
     setup();
@@ -47,6 +73,13 @@ uint32_t test_port_early_phase(void)
     os_arch_tickless_self_finish();
     return test_failure;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Case: a window opened with the tick already pending.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_port_pending_open(void)
 {
     setup();
@@ -57,6 +90,13 @@ uint32_t test_port_pending_open(void)
     expected_reload = 999U;
     return test_failure;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Case: a window opened from a zero counter.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_port_zero_initial(void)
 {
     setup();
@@ -67,6 +107,13 @@ uint32_t test_port_zero_initial(void)
     os_arch_tickless_self_finish();
     return test_failure;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Case: a window that runs its whole planned length.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_port_full_window(void)
 {
     setup();
@@ -80,8 +127,12 @@ uint32_t test_port_full_window(void)
     return test_failure;
 }
 
-extern uint64_t test_reference;
-
+/******************************************************************************************************/
+/**
+ * @brief Case: light sleep cut short, repeatedly.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_port_light_partial_windows(void)
 {
     uint32_t total = 0U;
@@ -101,6 +152,12 @@ uint32_t test_port_light_partial_windows(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: light sleep ending exactly on a tick boundary.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_port_light_boundaries(void)
 {
     setup();
@@ -131,6 +188,12 @@ uint32_t test_port_light_boundaries(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: both halves reading one shared counter.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_port_shared_counter(void)
 {
     /* In SMP a present DWT must not override the common SoC epoch. Its MMIO
@@ -141,4 +204,23 @@ uint32_t test_port_shared_counter(void)
     CHECK(os_arch_delay_counter_hz_get() == 1000000U);
     CHECK(os_arch_delay_counter_get() == 12345U);
     return test_failure;
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Reset the modeled hardware before a case runs.
+ */
+static void setup(void)
+{
+    os_arch_tick_reload_cycles = 1000U;
+    OS_ARCH_REG_ICSR = 0U;
+    OS_ARCH_REG_SYST_RVR = 999U;
+    OS_ARCH_REG_SYST_CSR = 7U;
+    OS_ARCH_REG_SYST_CVR = 900U;
 }

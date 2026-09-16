@@ -13,6 +13,12 @@
 #ifndef OS_QUEUE_H
 #define OS_QUEUE_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "os_types.h"
 
 #ifdef __cplusplus
@@ -22,52 +28,11 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Queue              - OS_CONFIG_QUEUE_ENABLE
+ * Macros
  * ***********************************************************************************************************
- *
- * A queue is an object plus an item buffer. How it is declared decides where that buffer comes
- * from, and that is the only difference between the three kinds:
- *
- *   STATIC    OS_QUEUE_DEFINE(sensor_q, sizeof(sample_t), 8);
- *   ATTR      OS_QUEUE_DEFINE_ATTR(rx_q, sizeof(sample_t), 8, __attribute__((section(".dma"))));
- *   DYNAMIC   os_queue_t log_q;  then os_queue_init_dynamic(&log_q, sizeof(sample_t), capacity);
- *
- * All three take the item size the same way, as a byte count. Only the dynamic kind has an init
- * call; every call after that is the same for all three, teardown included.
 */
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
-
-/******************************************************************************************************/
-/**
- * @brief What a send does about an item when the queue is already full.
- */
-typedef enum
-{
-    OS_QUEUE_MODE_NORMAL    = 0, /**< Full means wait or refuse, exactly as timeout_ms says. */
-    OS_QUEUE_MODE_OVERWRITE = 1  /**< Full means drop the oldest item rather than lose this one. */
-
-} os_queue_mode_t;
-
-/******************************************************************************************************/
-/**
- * @brief Queue object.
- */
-typedef struct
-{
-    uint8_t         *buffer;
-    size_t          item_size;
-    size_t          capacity;
-    size_t          head;
-    size_t          tail;
-    size_t          count;
-    os_list_t       send_waiters;    /**< Tasks blocked because the queue is full.  */
-    os_list_t       receive_waiters; /**< Tasks blocked because the queue is empty. */
-    bool            buffer_owned;    /**< Buffer came from os_queue_init_dynamic: os_queue_cleanup frees it. */
-    os_queue_mode_t mode;            /**< What a send does when full; OS_QUEUE_MODE_NORMAL is the zero. */
-
-} os_queue_t;
-
 /* --- Compile-time storage: the geometry is read off the array --------------------------------- */
 
 /** Compile-time initializer binding a queue object to an item array, shared by the two macros below
@@ -111,14 +76,73 @@ typedef struct
 /** Name a queue defined in another file. Only the queue crosses; its item array stays private to
  *  the file that defined it, and the name has to match the DEFINE exactly. */
 #define OS_QUEUE_DECLARE(name)          extern os_queue_t name
+#endif /* OS_CONFIG_QUEUE_ENABLE */
 
+/*
+ * ***********************************************************************************************************
+ * Types
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+/* Queue              - OS_CONFIG_QUEUE_ENABLE.
+ *
+ * A queue is an object plus an item buffer. How it is declared decides where that buffer comes
+ * from, and that is the only difference between the three kinds:
+ *
+ *   STATIC    OS_QUEUE_DEFINE(sensor_q, sizeof(sample_t), 8);
+ *   ATTR      OS_QUEUE_DEFINE_ATTR(rx_q, sizeof(sample_t), 8, __attribute__((section(".dma"))));
+ *   DYNAMIC   os_queue_t log_q;  then os_queue_init_dynamic(&log_q, sizeof(sample_t), capacity);
+ *
+ * All three take the item size the same way, as a byte count. Only the dynamic kind has an init
+ * call; every call after that is the same for all three, teardown included.
+ */
+
+/******************************************************************************************************/
+/**
+ * @brief What a send does about an item when the queue is already full.
+ */
+typedef enum
+{
+    OS_QUEUE_MODE_NORMAL    = 0, /**< Full means wait or refuse, exactly as timeout_ms says. */
+    OS_QUEUE_MODE_OVERWRITE = 1, /**< Full means drop the oldest item rather than lose this one. */
+
+} os_queue_mode_t;
+
+/******************************************************************************************************/
+/**
+ * @brief Queue object.
+ */
+typedef struct
+{
+    uint8_t         *buffer;
+    size_t          item_size;
+    size_t          capacity;
+    size_t          head;
+    size_t          tail;
+    size_t          count;
+    os_list_t       send_waiters;    /**< Tasks blocked because the queue is full.  */
+    os_list_t       receive_waiters; /**< Tasks blocked because the queue is empty. */
+    bool            buffer_owned;    /**< Buffer came from os_queue_init_dynamic: os_queue_cleanup frees it. */
+    os_queue_mode_t mode;            /**< What a send does when full; OS_QUEUE_MODE_NORMAL is the zero. */
+
+} os_queue_t;
+#endif /* OS_CONFIG_QUEUE_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
 /* --- Dynamic storage: the item buffer comes from the kernel heap ------------------------------ */
 
 /* A dynamic queue needs no DEFINE macro: it is a plain os_queue_t, declared wherever its lifetime
  * wants, and os_queue_init_dynamic() obtains the buffer. That call expects the object zeroed,
  * which static storage gives for free and any other placement gets from a { 0 } initializer. */
 
-#if (OS_CONFIG_ALLOC_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Initialize a queue over an item buffer allocated from the kernel heap, for a geometry
@@ -178,7 +202,6 @@ size_t os_queue_free_get(const os_queue_t *queue);
  *        Refuses with OS_ERR_BUSY while tasks are blocked on the queue.
  */
 os_err_t os_queue_cleanup(os_queue_t *queue);
-
 #endif /* OS_CONFIG_QUEUE_ENABLE */
 
 #ifdef __cplusplus

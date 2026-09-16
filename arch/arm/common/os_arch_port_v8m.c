@@ -15,16 +15,15 @@
  *            See LICENSE in the project root for the full license text.
  */
 
-#ifndef OS_ARCH_PORT_TRANSLATION_UNIT
-#error "os_arch_port_v8m.c is a textual include, not a translation unit. Compile arch/<family>/<core>/os_arch_port.c instead - it defines OS_ARCH_PORT_TRANSLATION_UNIT and includes this. See doc/installation.md."
-#endif
-
-
 /*
  * ***********************************************************************************************************
  * Includes
  * ***********************************************************************************************************
 */
+
+#ifndef OS_ARCH_PORT_TRANSLATION_UNIT
+#error "os_arch_port_v8m.c is a textual include, not a translation unit. Compile arch/<family>/<core>/os_arch_port.c instead - it defines OS_ARCH_PORT_TRANSLATION_UNIT and includes this. See doc/installation.md."
+#endif
 
 #include "os_arch_port_common.h"
 
@@ -40,6 +39,25 @@
  * instruction set (OS_ARCH_ATOMIC_LOCK_FREE), not the v6m/v7m/v8m split. Textual
  * include as well. */
 #include "os_arch_atomic.c"
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U) && \
+    (OS_CONFIG_TICK_SOURCE == OS_CONFIG_TICK_SOURCE_SYSTICK)
+/* Tickless idle - the ARMv8-M half.
+ *
+ * The contract is in arch/common/os_arch_tickless.c, included at the bottom of this block.
+ * Everything above it is the one thing this port has that no other does: a SECOND way to open a
+ * window, by reprogramming SysTick's reload and reading back from CVR how far it got - no package,
+ * no second timer.
+ *
+ * Gated on os_arch_dwt_available, and that is not optional. Without CYCCNT the cycle counter is the
+ * one SYNTHESIZED from SysTick, which multiplies counted periods by the reload it reads LIVE, so
+ * moving the reload silently rescales every os_delay_us(). A package's own source wins where there
+ * is one: it is not bounded by SysTick's 24 bits and it survives a sleep that gates SysTick's
+ * clock.
+ */
+
+#include "os_arch_tick_math.h"
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -82,6 +100,12 @@
 
 #define OS_ARCH_CONTROL_FPCA_MSK             (1UL << 2)
 
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U) && \
+    (OS_CONFIG_TICK_SOURCE == OS_CONFIG_TICK_SOURCE_SYSTICK)
+/** This port has both mechanisms, so the shared file needs the five functions above. */
+#define OS_ARCH_TICKLESS_SELF_SUPPRESS  1
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
+
 /*
  * ***********************************************************************************************************
  * Global variables
@@ -100,10 +124,121 @@ static uint32_t os_arch_tick_reload_cycles      = 0U;
  * SysTick-derived counter instead. */
 static bool     os_arch_dwt_available           = false;
 
+/* Bottom of the main (handler) stack, under the two names linker scripts
+ * commonly give it (__StackLimit in CMSIS-style scripts, _sstack in several
+ * vendor-generated ones). Both are weak references, so either naming works
+ * unmodified; when neither symbol exists both resolve to address 0 and the
+ * MSPLIM guard is skipped. */
+extern uint32_t __StackLimit OS_WEAK;
+extern uint32_t _sstack      OS_WEAK;
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U) && \
+    (OS_CONFIG_TICK_SOURCE == OS_CONFIG_TICK_SOURCE_SYSTICK)
+/** The effective (possibly 24-bit-capped) window this port armed for itself, in cycles: the reload
+ *  actually programmed for (planned - 1) ticks plus the remainder of the tick already running. */
+static uint32_t os_arch_suppressed_reload_cycles = 0U;
+
+/** Cycles of the tick already running when the window opened; the first boundary falls there. */
+static uint32_t os_arch_suppressed_head_cycles  = 0U;
+
+/** The os_arch_kernel_mask_save() token taken when this port commits to reprogramming SysTick. */
+static uint32_t os_arch_sleep_mask_state        = 0U;
+
+/** Whether os_arch_sleep_mask_state actually holds a mask os_arch_sleep_finish must release. */
+static bool     os_arch_sleep_mask_held         = false;
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
+
 /*
  * ***********************************************************************************************************
- * Context switch handler (PendSV does everything)
+ * Private function prototypes
  * ***********************************************************************************************************
+*/
+
+/* Declared through the configured name so the boot-time vector check compares
+ * against exactly the symbol the vector table is expected to reference. */
+/******************************************************************************************************/
+extern void OS_CONFIG_ARCH_PENDSV_HANDLER(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Terminate the calling task; used when a task entry function returns.
+ */
+extern void     os_task_exit(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Get the id of the current task, 0 when idle/none/pre-scheduler.
+ */
+extern uint32_t os_task_current_id_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Trap if the silicon's actual security state contradicts OS_CONFIG_TRUSTZONE.
+ */
+OS_INLINE void os_arch_trustzone_state_check(void);
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U) && \
+    (OS_CONFIG_TICK_SOURCE == OS_CONFIG_TICK_SOURCE_SYSTICK)
+/******************************************************************************************************/
+/**
+ * @brief Ticks that fit in one self-armed window given the register width (24-bit SysTick
+ *        reload) and the current tick-to-cycle ratio. Shared by the arming path (the cap) and
+ *        os_arch_tickless_self_max_ticks (the query) so the two can never disagree.
+ */
+static uint64_t os_arch_max_window_ticks_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Whether this port may stretch SysTick itself on this device.
+ */
+static bool os_arch_tickless_self_available(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Ceiling on a self-armed window, in ticks - exactly what the open will honour, no +1.
+ */
+static uint32_t os_arch_tickless_self_max_ticks(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Reprogram SysTick to suppress ticking for (planned_ticks - 1) ticks and mask interrupts
+ *        until os_arch_tickless_self_close() restores normal cadence.
+ */
+static uint32_t os_arch_tickless_self_open(uint32_t planned_ticks);
+
+/******************************************************************************************************/
+/**
+ * @brief Close a window this port armed itself: how long it really was, and normal cadence back.
+ */
+static uint32_t os_arch_tickless_self_close(uint32_t planned_ticks);
+
+/******************************************************************************************************/
+/**
+ * @brief Release the interrupt mask a self-armed window took.
+ */
+static void os_arch_tickless_self_finish(void);
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
+
+/******************************************************************************************************/
+/**
+ * @brief Enable DWT CYCCNT and report whether it is genuinely usable on this device.
+ */
+static bool os_arch_dwt_enable(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Landing point when a task entry function returns; deletes the task.
+ */
+static void os_arch_task_exit_trap(void);
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/* Context switch handler (PendSV does everything).
  *
  * Software-saved frame layout on a task stack (low address first):
  *   [ s16-s31 ]  only when the task was using the FPU (EXC_RETURN bit 4 clear)
@@ -131,8 +266,7 @@ static bool     os_arch_dwt_available           = false;
  * os_arch_handler_stack_top_cb(), which the SoC layer answers per core. A
  * secondary core that reset from the table instead would park its MSP inside
  * core 0's handler stack and both cores would overwrite each other's frames.
-*/
-
+ */
 __asm(
 ".syntax unified\n"
 ".thumb\n"
@@ -204,47 +338,13 @@ OS_ARCH_STRINGIFY(OS_CONFIG_ARCH_PENDSV_HANDLER) ":\n"
 "    bx      lr\n"
 );
 
-/* Declared through the configured name so the boot-time vector check compares
- * against exactly the symbol the vector table is expected to reference. */
-extern void OS_CONFIG_ARCH_PENDSV_HANDLER(void);
-
-/*
- * ***********************************************************************************************************
- * Private function prototypes
- * ***********************************************************************************************************
-*/
-
-extern void     os_task_exit(void);
-extern uint32_t os_task_current_id_get(void);
-
-/* Bottom of the main (handler) stack, under the two names linker scripts
- * commonly give it (__StackLimit in CMSIS-style scripts, _sstack in several
- * vendor-generated ones). Both are weak references, so either naming works
- * unmodified; when neither symbol exists both resolve to address 0 and the
- * MSPLIM guard is skipped. */
-extern uint32_t __StackLimit OS_WEAK;
-extern uint32_t _sstack      OS_WEAK;
-
-static bool     os_arch_dwt_enable(void);
-static void     os_arch_task_exit_trap(void);
-
-/*
- * ***********************************************************************************************************
- * Public function implementations
- * ***********************************************************************************************************
-*/
-
-/******************************************************************************************************/
-/**
- * @brief Initialize architecture-specific low-level resources.
- *
- * @return None.
- */
 /******************************************************************************************************/
 /**
  * @brief Default: the chip cannot be asked. Overridden by a SoC package that knows where its
  *        security-enable bit lives. OS_WEAK, so a package's strong definition wins whatever order
  *        the linker sees them in - the same rule as every other SoC callback (doc/soc.md).
+ *
+ * @return The security state the silicon reports, or _UNKNOWN.
  */
 OS_WEAK uint32_t os_arch_soc_trustzone_state_cb(void)
 {
@@ -253,23 +353,10 @@ OS_WEAK uint32_t os_arch_soc_trustzone_state_cb(void)
 
 /******************************************************************************************************/
 /**
- * @brief Trap if the silicon's actual security state contradicts OS_CONFIG_TRUSTZONE.
+ * @brief Initialize architecture-specific low-level resources.
  *
- * Compiles to nothing where no package answers, which is every unpackaged part.
+ * @return None.
  */
-OS_INLINE void os_arch_trustzone_state_check(void)
-{
-    uint32_t actual = os_arch_soc_trustzone_state_cb();
-
-    if ((actual != OS_CONFIG_TRUSTZONE_UNKNOWN) && (actual != (uint32_t)OS_CONFIG_TRUSTZONE))
-    {
-        /* Stopping here is the whole point. A secure-built kernel on a device whose security
-         * extension was never armed does not fault at the mismatch - it faults later, somewhere
-         * unrelated, on the first banked operation. */
-        os_arch_config_fault_trap();
-    }
-}
-
 void os_arch_init(void)
 {
     uint32_t shpr3 = OS_ARCH_REG_SHPR3;
@@ -418,15 +505,15 @@ OS_WEAK uint32_t os_arch_handler_stack_limit_cb(uint32_t core_id)
     (void)core_id;
 #endif
     {
-    /* Two names for the same thing: __StackLimit in CMSIS-style scripts, _sstack in several
-     * vendor-generated ones. Both weak, so either naming works unmodified and neither existing
-     * resolves to 0. */
-    stack_limit = &__StackLimit;
+        /* Two names for the same thing: __StackLimit in CMSIS-style scripts, _sstack in several
+         * vendor-generated ones. Both weak, so either naming works unmodified and neither existing
+         * resolves to 0. */
+        stack_limit = &__StackLimit;
 
-    if (stack_limit == NULL)
-    {
-        stack_limit = &_sstack;
-    }
+        if (stack_limit == NULL)
+        {
+            stack_limit = &_sstack;
+        }
     }
 
     return (uint32_t)(uintptr_t)stack_limit;
@@ -490,22 +577,22 @@ void os_arch_tick_init(void)
      * nothing sane to program, so the whole body is skipped rather than each bailing out. */
     if ((clock_hz != 0U) && (OS_CONFIG_TICK_HZ != 0U))
     {
-    reload_value = (clock_hz / OS_CONFIG_TICK_HZ);
+        reload_value = (clock_hz / OS_CONFIG_TICK_HZ);
 
-    if ((reload_value != 0U) && (reload_value <= (OS_ARCH_SYST_RVR_RELOAD_MSK + 1UL)))
-    {
+        if ((reload_value != 0U) && (reload_value <= (OS_ARCH_SYST_RVR_RELOAD_MSK + 1UL)))
+        {
 
-    /* Cached for tickless idle: os_arch_elapsed_ticks_get() restores exactly
-     * this cadence after a suppressed sleep. */
-    os_arch_tick_reload_cycles = reload_value;
+            /* Cached for tickless idle: os_arch_elapsed_ticks_get() restores exactly
+             * this cadence after a suppressed sleep. */
+            os_arch_tick_reload_cycles = reload_value;
 
-    OS_ARCH_REG_SYST_CSR = 0U;
-    OS_ARCH_REG_SYST_RVR = reload_value - 1UL;
-    OS_ARCH_REG_SYST_CVR = 0U;
-    OS_ARCH_REG_SYST_CSR = OS_ARCH_SYST_CSR_CLKSOURCE_MSK |
-                           OS_ARCH_SYST_CSR_TICKINT_MSK |
-                           OS_ARCH_SYST_CSR_ENABLE_MSK;
-    }
+            OS_ARCH_REG_SYST_CSR = 0U;
+            OS_ARCH_REG_SYST_RVR = reload_value - 1UL;
+            OS_ARCH_REG_SYST_CVR = 0U;
+            OS_ARCH_REG_SYST_CSR = OS_ARCH_SYST_CSR_CLKSOURCE_MSK |
+                                   OS_ARCH_SYST_CSR_TICKINT_MSK |
+                                   OS_ARCH_SYST_CSR_ENABLE_MSK;
+        }
     }
 #endif
 }
@@ -520,40 +607,41 @@ void os_arch_tick_init(void)
  * @param[in] context      Task argument passed in R0.
  * @return uint32_t*       Initial process stack pointer for first restore, NULL on bad arguments.
  */
-uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes, void (*entry)(void *context), void *context)
+uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes,
+                                        void (*entry)(void *context), void *context)
 {
     uint32_t *stack_top = NULL;
 
     if ((stack_base != NULL) && (entry != (void (*)(void *))0) &&
         (stack_bytes >= OS_CONFIG_MIN_STACK_SIZE))
     {
-    /* The hardware exception frame must sit on an 8-byte aligned address. */
-    stack_top = (uint32_t *)((uintptr_t)(stack_base + stack_bytes) & ~(uintptr_t)0x7U);
+        /* The hardware exception frame must sit on an 8-byte aligned address. */
+        stack_top = (uint32_t *)((uintptr_t)(stack_base + stack_bytes) & ~(uintptr_t)0x7U);
 
-    /* Hardware frame restored by exception return. */
-    *(--stack_top) = OS_ARCH_XPSR_THUMB;                    /* xPSR */
-    *(--stack_top) = (uint32_t)(uintptr_t)entry;            /* PC   */
-    *(--stack_top) = (uint32_t)(uintptr_t)os_arch_task_exit_trap; /* LR */
-    *(--stack_top) = 0U;                                    /* R12  */
-    *(--stack_top) = 0U;                                    /* R3   */
-    *(--stack_top) = 0U;                                    /* R2   */
-    *(--stack_top) = 0U;                                    /* R1   */
-    *(--stack_top) = (uint32_t)(uintptr_t)context;          /* R0   */
+        /* Hardware frame restored by exception return. */
+        *(--stack_top) = OS_ARCH_XPSR_THUMB;                    /* xPSR */
+        *(--stack_top) = (uint32_t)(uintptr_t)entry;            /* PC   */
+        *(--stack_top) = (uint32_t)(uintptr_t)os_arch_task_exit_trap; /* LR */
+        *(--stack_top) = 0U;                                    /* R12  */
+        *(--stack_top) = 0U;                                    /* R3   */
+        *(--stack_top) = 0U;                                    /* R2   */
+        *(--stack_top) = 0U;                                    /* R1   */
+        *(--stack_top) = (uint32_t)(uintptr_t)context;          /* R0   */
 
-    /* Software frame restored by the context-switch code. */
-    *(--stack_top) = OS_ARCH_EXC_RETURN_THREAD_PSP;         /* EXC_RETURN */
-    *(--stack_top) = 0U;                                    /* R11  */
-    *(--stack_top) = 0U;                                    /* R10  */
-    *(--stack_top) = 0U;                                    /* R9   */
-    *(--stack_top) = 0U;                                    /* R8   */
-    *(--stack_top) = 0U;                                    /* R7   */
-    *(--stack_top) = 0U;                                    /* R6   */
-    *(--stack_top) = 0U;                                    /* R5   */
-    *(--stack_top) = 0U;                                    /* R4   */
+        /* Software frame restored by the context-switch code. */
+        *(--stack_top) = OS_ARCH_EXC_RETURN_THREAD_PSP;         /* EXC_RETURN */
+        *(--stack_top) = 0U;                                    /* R11  */
+        *(--stack_top) = 0U;                                    /* R10  */
+        *(--stack_top) = 0U;                                    /* R9   */
+        *(--stack_top) = 0U;                                    /* R8   */
+        *(--stack_top) = 0U;                                    /* R7   */
+        *(--stack_top) = 0U;                                    /* R6   */
+        *(--stack_top) = 0U;                                    /* R5   */
+        *(--stack_top) = 0U;                                    /* R4   */
 
-    /* PSPLIM ignores its low 3 bits, so round the limit up: an overflow then
-     * always faults before writing outside the caller's stack memory. */
-    *(--stack_top) = ((uint32_t)(uintptr_t)stack_base + 7U) & ~(uint32_t)0x7U; /* PSPLIM */
+        /* PSPLIM ignores its low 3 bits, so round the limit up: an overflow then
+         * always faults before writing outside the caller's stack memory. */
+        *(--stack_top) = ((uint32_t)(uintptr_t)stack_base + 7U) & ~(uint32_t)0x7U; /* PSPLIM */
     }
 
     return stack_top;
@@ -575,40 +663,111 @@ uint32_t os_arch_cycle_count_get(void)
     return os_arch_dwt_available ? OS_ARCH_REG_DWT_CYCCNT : os_arch_cycle_systick_get();
 }
 
+#if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
+/******************************************************************************************************/
+/**
+ * @brief Bank the outgoing task's secure context; called from the PendSV handler while
+ *        os_task_current still names that task.
+ *
+ * @return None.
+ */
+void os_arch_tz_context_save(void)
+{
+    os_arch_tz_context_save_cb(os_task_current_id_get());
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Restore the incoming task's secure context; called once the scheduler has selected it.
+ *
+ * @return None.
+ */
+void os_arch_tz_context_restore(void)
+{
+    os_arch_tz_context_restore_cb(os_task_current_id_get());
+}
+#endif /* OS_CONFIG_TRUSTZONE_NON_SECURE */
+
+/******************************************************************************************************/
+/**
+ * @brief Rate of the busy-wait counter, in Hz: the SoC reference clock, 0 where there is none.
+ *
+ * @return Rate of the busy-wait counter, in Hz; 0 where there is none.
+ */
+uint32_t os_arch_delay_counter_hz_get(void)
+{
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    /* Tasks may migrate between reads; a per-core DWT epoch is not shared. */
+    return os_arch_reference_clock_hz_cb();
+#else
+    return os_arch_dwt_available ? os_arch_clock_hz_get() : os_arch_reference_clock_hz_cb();
+#endif
+}
+
+/******************************************************************************************************/
+/**
+ * @brief The busy-wait counter itself: the SoC reference clock, low 32 bits.
+ *
+ * @return The busy-wait counter, low 32 bits.
+ */
+uint32_t os_arch_delay_counter_get(void)
+{
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    return (uint32_t)os_arch_reference_clock_get_cb();
+#else
+    return os_arch_dwt_available ? OS_ARCH_REG_DWT_CYCCNT : (uint32_t)os_arch_reference_clock_get_cb();
+#endif
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Weak default: no SoC reference clock, so 0 - a nonzero busy-wait then faults.
+ *
+ * @return Rate of the SoC reference clock, in Hz; 0 where there is none.
+ */
+OS_WEAK uint32_t os_arch_reference_clock_hz_cb(void)
+{
+    return 0U;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Weak default: no SoC reference clock, so 0.
+ *
+ * @return The SoC reference clock count.
+ */
+OS_WEAK uint64_t os_arch_reference_clock_get_cb(void)
+{
+    return 0ULL;
+}
+
 /*
  * ***********************************************************************************************************
- * Tickless idle - the ARMv8-M half
+ * Private function implementations
  * ***********************************************************************************************************
- *
- * The contract is in arch/common/os_arch_tickless.c, included at the bottom of this block.
- * Everything above it is the one thing this port has that no other does: a SECOND way to open a
- * window, by reprogramming SysTick's reload and reading back from CVR how far it got - no package,
- * no second timer.
- *
- * Gated on os_arch_dwt_available, and that is not optional. Without CYCCNT the cycle counter is the
- * one SYNTHESIZED from SysTick, which multiplies counted periods by the reload it reads LIVE, so
- * moving the reload silently rescales every os_delay_us(). A package's own source wins where there
- * is one: it is not bounded by SysTick's 24 bits and it survives a sleep that gates SysTick's clock.
 */
+
+/******************************************************************************************************/
+/**
+ * @brief Trap if the silicon's actual security state contradicts OS_CONFIG_TRUSTZONE.
+ *
+ * Compiles to nothing where no package answers, which is every unpackaged part.
+ */
+OS_INLINE void os_arch_trustzone_state_check(void)
+{
+    uint32_t actual = os_arch_soc_trustzone_state_cb();
+
+    if ((actual != OS_CONFIG_TRUSTZONE_UNKNOWN) && (actual != (uint32_t)OS_CONFIG_TRUSTZONE))
+    {
+        /* Stopping here is the whole point. A secure-built kernel on a device whose security
+         * extension was never armed does not fault at the mismatch - it faults later, somewhere
+         * unrelated, on the first banked operation. */
+        os_arch_config_fault_trap();
+    }
+}
 
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U) && \
     (OS_CONFIG_TICK_SOURCE == OS_CONFIG_TICK_SOURCE_SYSTICK)
-
-#include "os_arch_tick_math.h"
-
-/** The effective (possibly 24-bit-capped) window this port armed for itself, in cycles: the reload
- *  actually programmed for (planned - 1) ticks plus the remainder of the tick already running. */
-static uint32_t os_arch_suppressed_reload_cycles = 0U;
-
-/** Cycles of the tick already running when the window opened; the first boundary falls there. */
-static uint32_t os_arch_suppressed_head_cycles  = 0U;
-
-/** The os_arch_kernel_mask_save() token taken when this port commits to reprogramming SysTick. */
-static uint32_t os_arch_sleep_mask_state        = 0U;
-
-/** Whether os_arch_sleep_mask_state actually holds a mask os_arch_sleep_finish must release. */
-static bool     os_arch_sleep_mask_held         = false;
-
 /******************************************************************************************************/
 /**
  * @brief Ticks that fit in one self-armed window given the register width (24-bit SysTick
@@ -807,50 +966,7 @@ static void os_arch_tickless_self_finish(void)
         os_arch_kernel_mask_restore(os_arch_sleep_mask_state);
     }
 }
-
-/** This port has both mechanisms, so the shared file needs the five functions above. */
-#define OS_ARCH_TICKLESS_SELF_SUPPRESS  1
-
 #endif /* OS_CONFIG_TICKLESS_ENABLE */
-
-#include "os_arch_tickless.c"
-
-/*
- * ***********************************************************************************************************
- * TrustZone context-switch glue
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
-/******************************************************************************************************/
-/**
- * @brief Bank the outgoing task's secure context; called from the PendSV handler while
- *        os_task_current still names that task.
- *
- * @return None.
- */
-void os_arch_tz_context_save(void)
-{
-    os_arch_tz_context_save_cb(os_task_current_id_get());
-}
-
-/******************************************************************************************************/
-/**
- * @brief Restore the incoming task's secure context; called once the scheduler has selected it.
- *
- * @return None.
- */
-void os_arch_tz_context_restore(void)
-{
-    os_arch_tz_context_restore_cb(os_task_current_id_get());
-}
-#endif /* OS_CONFIG_TRUSTZONE_NON_SECURE */
-
-/*
- * ***********************************************************************************************************
- * Private function implementations
- * ***********************************************************************************************************
-*/
 
 /******************************************************************************************************/
 /**
@@ -920,32 +1036,5 @@ static void os_arch_task_exit_trap(void)
     }
 }
 
-
-uint32_t os_arch_delay_counter_hz_get(void)
-{
-#if (OS_CONFIG_CORE_COUNT > 1U)
-    /* Tasks may migrate between reads; a per-core DWT epoch is not shared. */
-    return os_arch_reference_clock_hz_cb();
-#else
-    return os_arch_dwt_available ? os_arch_clock_hz_get() : os_arch_reference_clock_hz_cb();
-#endif
-}
-
-uint32_t os_arch_delay_counter_get(void)
-{
-#if (OS_CONFIG_CORE_COUNT > 1U)
-    return (uint32_t)os_arch_reference_clock_get_cb();
-#else
-    return os_arch_dwt_available ? OS_ARCH_REG_DWT_CYCCNT : (uint32_t)os_arch_reference_clock_get_cb();
-#endif
-}
-
-OS_WEAK uint32_t os_arch_reference_clock_hz_cb(void)
-{
-    return 0U;
-}
-
-OS_WEAK uint64_t os_arch_reference_clock_get_cb(void)
-{
-    return 0ULL;
-}
+/* Last on purpose: the tickless half calls this port's self-suppression functions above. */
+#include "os_arch_tickless.c"

@@ -45,7 +45,37 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Private function implementations
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Whether a UART can lose clk_peri for the duration of a window.
+ */
+static inline bool soc_deep_uart_ready(const uart_hw_t *uart);
+
+/******************************************************************************************************/
+/**
+ * @brief Whether an SPI block can lose clk_peri for the duration of a window.
+ */
+static inline bool soc_deep_spi_ready(const spi_hw_t *spi);
+
+/******************************************************************************************************/
+/**
+ * @brief Whether an I2C block can lose its clock for the duration of a window.
+ */
+static inline bool soc_deep_i2c_ready(const i2c_hw_t *i2c);
+
+/******************************************************************************************************/
+/**
+ * @brief Whether the whole chip tolerates clk_sys dropping to clk_ref with PLL_SYS stopped.
+ */
+static inline bool soc_deep_peripherals_ready(void);
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
  * ***********************************************************************************************************
 */
 

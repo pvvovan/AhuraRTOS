@@ -27,18 +27,26 @@
  *            See LICENSE in the project root for the full license text.
  */
 
-#ifndef OS_ARCH_PORT_TRANSLATION_UNIT
-#error "os_arch_port_rv32.c is a textual include, not a translation unit. Compile arch/<family>/<core>/os_arch_port.c instead - it defines OS_ARCH_PORT_TRANSLATION_UNIT and includes this. See doc/installation.md."
-#endif
-
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
 
 #include "os_arch_port.h"
 #include "ahura.h"
 
 /*
  * ***********************************************************************************************************
- * The task frame
+ * Macros
  * ***********************************************************************************************************
+*/
+
+#ifndef OS_ARCH_PORT_TRANSLATION_UNIT
+#error "os_arch_port_rv32.c is a textual include, not a translation unit. Compile arch/<family>/<core>/os_arch_port.c instead - it defines OS_ARCH_PORT_TRANSLATION_UNIT and includes this. See doc/installation.md."
+#endif
+
+/* The task frame.
  *
  * Laid down by os_arch_task_stack_initialize() and consumed by the restore path below; the two must
  * agree exactly, so the offsets live here as names rather than as numbers in two places.
@@ -50,7 +58,7 @@
  * same for every task in a single-address-space kernel, so saving them per switch would cost two
  * words and two accesses to preserve a value that cannot differ. A port that ever grows per-task
  * thread-local storage would add tp here and nowhere else.
-*/
+ */
 
 #define OS_ARCH_FRAME_MSTATUS   0
 #define OS_ARCH_FRAME_MEPC      1
@@ -96,6 +104,12 @@
 #define OS_ARCH_MSTATUS_MPP_M      (3UL << 11)
 
 /*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
+/*
  * Trap nesting depth, per core. RISC-V has no IPSR to ask, so the port keeps the answer; see
  * os_arch_in_isr().
  */
@@ -105,20 +119,62 @@ __IO uint32_t os_arch_isr_nesting[OS_CONFIG_CORE_COUNT];
  * throughout this handoff; no scheduler C frame may remain on a published task stack. */
 uint32_t *os_arch_scheduler_stack_top[OS_CONFIG_CORE_COUNT];
 
-uint32_t *os_arch_scheduler_stack_get(void)
+/*
+ * ***********************************************************************************************************
+ * Private function prototypes
+ * ***********************************************************************************************************
+*/
+
+/* Declared through the configured name so the boot-time vector check compares against exactly the
+ * symbol the vector table is expected to reference. */
+/******************************************************************************************************/
+extern void OS_CONFIG_ARCH_SWI_HANDLER(void);
+
+/* Declared here rather than taken from a kernel header: it is internal to os_task.c and the port is
+ * the only thing outside it that needs the symbol - the same arrangement the ARM ports use. */
+/******************************************************************************************************/
+/**
+ * @brief Terminate the calling task; used when a task entry function returns.
+ */
+extern void os_task_exit(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Verify that mtvec really routes the software interrupt to the kernel's handler, and park
+ *        in
+ *        os_arch_config_fault_trap() if it does not.
+ */
+static void os_arch_vector_check(void (*swi_handler)(void));
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Top of this core's trap stack.
+ *
+ * @return Top of this core's trap stack.
+ */
+uint32_t* os_arch_scheduler_stack_get(void)
 {
     return os_arch_scheduler_stack_top[os_arch_core_id_get()];
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Point this core's trap stack at the given top.
+ *
+ * @param[in] stack        Stack region to prepare.
+ */
 void os_arch_scheduler_stack_set(uint32_t *stack)
 {
     os_arch_scheduler_stack_top[os_arch_core_id_get()] = stack;
 }
 
-/*
- * ***********************************************************************************************************
- * Context switch
- * ***********************************************************************************************************
+/* Context switch.
  *
  * Entered directly from mtvec slot 3 (trap cause 3, the machine software interrupt) with interrupts
  * already masked by hardware - mstatus.MIE is cleared on trap entry and the previous value banked
@@ -127,8 +183,9 @@ void os_arch_scheduler_stack_set(uint32_t *stack)
  * The trap runs on the interrupted task's own stack. That is the natural arrangement with a single
  * stack pointer, and it is why every task's stack must have room for one frame on top of whatever
  * the task itself uses - os_task.c already budgets for exactly that.
-*/
+ */
 
+/******************************************************************************************************/
 __asm(
 ".pushsection " OS_CONFIG_ARCH_SWI_SECTION ", \"ax\"\n"
 ".align 2\n"
@@ -228,14 +285,7 @@ OS_ARCH_STRINGIFY(OS_CONFIG_ARCH_SWI_HANDLER) ":\n"
 "    mret\n"".popsection\n"
 );
 
-/* Declared through the configured name so the boot-time vector check compares against exactly the
- * symbol the vector table is expected to reference. */
-extern void OS_CONFIG_ARCH_SWI_HANDLER(void);
-
-/*
- * ***********************************************************************************************************
- * First start
- * ***********************************************************************************************************
+/* First start.
  *
  * Not a trap. mret outside a trap is well defined - it sets pc from mepc and restores MIE from MPIE
  * - which is exactly the "become a task" step, so the first start is an ordinary function that
@@ -243,8 +293,9 @@ extern void OS_CONFIG_ARCH_SWI_HANDLER(void);
  *
  * The boot context (whatever stack main() was using) is abandoned here, deliberately: every core
  * that reaches this point is committing to run tasks and will never unwind back out.
-*/
+ */
 
+/******************************************************************************************************/
 __asm(
 ".pushsection " OS_CONFIG_ARCH_SWI_SECTION ", \"ax\"\n"
 ".align 2\n"
@@ -257,12 +308,6 @@ __asm(
 "    mv      sp, a0\n"
 "    j       os_arch_context_restore_asm\n"".popsection\n"
 );
-
-/*
- * ***********************************************************************************************************
- * Task frame construction
- * ***********************************************************************************************************
-*/
 
 /******************************************************************************************************/
 /**
@@ -307,16 +352,6 @@ uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes,
     return frame;
 }
 
-/*
- * ***********************************************************************************************************
- * Trap context
- * ***********************************************************************************************************
-*/
-
-/* Declared here rather than taken from a kernel header: it is internal to os_task.c and the port is
- * the only thing outside it that needs the symbol - the same arrangement the ARM ports use. */
-extern void os_task_exit(void);
-
 /******************************************************************************************************/
 /**
  * @brief Where a task lands if its entry function returns.
@@ -327,72 +362,6 @@ void os_arch_task_exit_trap(void)
 
     /* os_task_exit() does not return. If it ever did, stopping here is the only safe answer. */
     os_arch_config_fault_trap();
-}
-
-/*
- * ***********************************************************************************************************
- * Start-up
- * ***********************************************************************************************************
-*/
-
-/******************************************************************************************************/
-/**
- * @brief Verify that mtvec really routes the software interrupt to the kernel's handler, and park in
- *        os_arch_config_fault_trap() if it does not.
- *
- * The RISC-V counterpart of the ARM port's PendSV vector check, and it exists for the same reason:
- * if another definition of the configured name won at link time, the build still succeeds and the
- * symptom is a board that reaches os_start() and stops dead - no trap, no output, nothing to attach
- * a debugger to.
- *
- * mtvec in vectored mode holds the table base in bits 31:2 with MODE=1 in bits 1:0, and entry N is
- * a jump instruction at base + N*4. The check therefore reads the jump rather than a pointer: it
- * decodes the JAL immediate at the software-interrupt slot and confirms the target is the handler
- * this port assembled. In direct mode (MODE=0) there is no per-cause slot to inspect, so the check
- * cannot run and is skipped rather than guessed at.
- */
-static void os_arch_vector_check(void (*swi_handler)(void))
-{
-#if (OS_CONFIG_ARCH_VECTOR_CHECK != 0U)
-    uint32_t  mtvec = OS_ARCH_CSR_READ(mtvec);
-    uint32_t  instruction;
-    uint32_t  offset;
-    uintptr_t slot;
-    uintptr_t target;
-
-    /* Vectored mode only, and only a JAL slot this can decode. Anything else is a table
-     * shape the check cannot read, which is not a fault - it simply has nothing to say. */
-    if ((mtvec & 0x3UL) == 1UL)
-    {
-        slot        = (uintptr_t)(mtvec & ~0x3UL) + ((uintptr_t)OS_ARCH_TRAP_CAUSE_SWI * 4U);
-        instruction = *(const volatile uint32_t *)slot;
-
-        if ((instruction & 0x7FUL) == 0x6FUL)
-        {
-    /* Reassemble the JAL immediate, which the encoding scatters across the instruction word:
-     * imm[20] at bit 31, imm[10:1] at 30:21, imm[11] at 20, imm[19:12] at 19:12, and bit 0 is
-     * always zero. */
-            offset = ((instruction >> 21) & 0x3FFUL) << 1;
-            offset |= ((instruction >> 20) & 0x1UL) << 11;
-            offset |= ((instruction >> 12) & 0xFFUL) << 12;
-            offset |= ((instruction >> 31) & 0x1UL) << 20;
-
-            if ((offset & (1UL << 20)) != 0UL)
-            {
-                offset |= ~((1UL << 21) - 1UL);     /* sign-extend the 21-bit displacement */
-            }
-
-            target = slot + (uintptr_t)(int32_t)offset;
-
-            if (target != (uintptr_t)swi_handler)
-            {
-                os_arch_config_fault_trap();
-            }
-        }
-    }
-#else
-    (void)swi_handler;
-#endif
 }
 
 /******************************************************************************************************/
@@ -439,27 +408,6 @@ void os_arch_tick_init(void)
     os_arch_tick_init_cb();
 }
 
-/*
- * ***********************************************************************************************************
- * Tickless idle
- * ***********************************************************************************************************
- *
- * Nothing architecture-specific to add: every question arch/common/os_arch_tickless.c asks a port
- * takes its default here. The tick IS the SoC's mtimecmp (the privileged spec deliberately does not
- * say where it lives), so there is no tick register at this layer to mask, no second timer to
- * stretch, and mcycle is architectural so a window costs the cycle counter nothing.
- *
- * This used to be 120 lines saying that in different words, one of which was missing the clamp.
-*/
-
-#include "../../common/os_arch_tickless.c"
-
-/*
- * ***********************************************************************************************************
- * Cycle counter
- * ***********************************************************************************************************
-*/
-
 /******************************************************************************************************/
 /**
  * @brief Free-running cycle count.
@@ -467,23 +415,20 @@ void os_arch_tick_init(void)
  * mcycle is architectural - the privileged spec requires it - so unlike the ARM port there is no
  * DWT-present check and no fallback to a SysTick-derived estimate. The low half is all the kernel's
  * sampling needs; wrapping at 2^32 is handled by the unsigned subtraction at the call site.
+ *
+ * @return The cycle counter, low 32 bits.
  */
 uint32_t os_arch_cycle_count_get(void)
 {
     return OS_ARCH_CSR_READ(mcycle);
 }
 
-/*
- * ***********************************************************************************************************
- * Atomics
- * ***********************************************************************************************************
+/******************************************************************************************************/
+/**
+ * @brief Rate of the busy-wait counter: the SoC reference clock on SMP, the core clock on one hart.
  *
- * Included rather than compiled separately, matching arch/arm/common/os_arch_port_v8m.c: the build
- * adds exactly one .c per core folder, and everything else is pulled in through it.
-*/
-
-#include "os_arch_atomic.c"
-
+ * @return Rate of the busy-wait counter, in Hz; 0 where there is none.
+ */
 uint32_t os_arch_delay_counter_hz_get(void)
 {
 #if (OS_CONFIG_CORE_COUNT > 1U)
@@ -493,6 +438,12 @@ uint32_t os_arch_delay_counter_hz_get(void)
 #endif
 }
 
+/******************************************************************************************************/
+/**
+ * @brief The busy-wait counter itself: the SoC reference clock on SMP, mcycle on one hart.
+ *
+ * @return The busy-wait counter, low 32 bits.
+ */
 uint32_t os_arch_delay_counter_get(void)
 {
 #if (OS_CONFIG_CORE_COUNT > 1U)
@@ -503,12 +454,114 @@ uint32_t os_arch_delay_counter_get(void)
 #endif
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Weak default: no SoC reference clock, so 0 - a nonzero busy-wait then faults.
+ *
+ * @return Rate of the SoC reference clock, in Hz; 0 where there is none.
+ */
 OS_WEAK uint32_t os_arch_reference_clock_hz_cb(void)
 {
     return 0U;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Weak default: no SoC reference clock, so 0.
+ *
+ * @return The SoC reference clock count.
+ */
 OS_WEAK uint64_t os_arch_reference_clock_get_cb(void)
 {
     return 0ULL;
 }
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Verify that mtvec really routes the software interrupt to the kernel's handler, and park
+ *        in
+ *        os_arch_config_fault_trap() if it does not.
+ *
+ * The RISC-V counterpart of the ARM port's PendSV vector check, and it exists for the same reason:
+ * if another definition of the configured name won at link time, the build still succeeds and the
+ * symptom is a board that reaches os_start() and stops dead - no trap, no output, nothing to attach
+ * a debugger to.
+ *
+ * mtvec in vectored mode holds the table base in bits 31:2 with MODE=1 in bits 1:0, and entry N is
+ * a jump instruction at base + N*4. The check therefore reads the jump rather than a pointer: it
+ * decodes the JAL immediate at the software-interrupt slot and confirms the target is the handler
+ * this port assembled. In direct mode (MODE=0) there is no per-cause slot to inspect, so the check
+ * cannot run and is skipped rather than guessed at.
+ *
+ * @param[in] swi_handler  Handler the vector is expected to name.
+ * @return None.
+ */
+static void os_arch_vector_check(void (*swi_handler)(void))
+{
+#if (OS_CONFIG_ARCH_VECTOR_CHECK != 0U)
+    uint32_t  mtvec = OS_ARCH_CSR_READ(mtvec);
+    uint32_t  instruction;
+    uint32_t  offset;
+    uintptr_t slot;
+    uintptr_t target;
+
+    /* Vectored mode only, and only a JAL slot this can decode. Anything else is a table
+     * shape the check cannot read, which is not a fault - it simply has nothing to say. */
+    if ((mtvec & 0x3UL) == 1UL)
+    {
+        slot        = (uintptr_t)(mtvec & ~0x3UL) + ((uintptr_t)OS_ARCH_TRAP_CAUSE_SWI * 4U);
+        instruction = *(const __IO uint32_t *)slot;
+
+        if ((instruction & 0x7FUL) == 0x6FUL)
+        {
+    /* Reassemble the JAL immediate, which the encoding scatters across the instruction word:
+     * imm[20] at bit 31, imm[10:1] at 30:21, imm[11] at 20, imm[19:12] at 19:12, and bit 0 is
+     * always zero. */
+            offset = ((instruction >> 21) & 0x3FFUL) << 1;
+            offset |= ((instruction >> 20) & 0x1UL) << 11;
+            offset |= ((instruction >> 12) & 0xFFUL) << 12;
+            offset |= ((instruction >> 31) & 0x1UL) << 20;
+
+            if ((offset & (1UL << 20)) != 0UL)
+            {
+                offset |= ~((1UL << 21) - 1UL);     /* sign-extend the 21-bit displacement */
+            }
+
+            target = slot + (uintptr_t)(int32_t)offset;
+
+            if (target != (uintptr_t)swi_handler)
+            {
+                os_arch_config_fault_trap();
+            }
+        }
+    }
+#else
+    (void)swi_handler;
+#endif
+}
+
+/* Tickless idle.
+ *
+ * Nothing architecture-specific to add: every question arch/common/os_arch_tickless.c asks a port
+ * takes its default here. The tick IS the SoC's mtimecmp (the privileged spec deliberately does not
+ * say where it lives), so there is no tick register at this layer to mask, no second timer to
+ * stretch, and mcycle is architectural so a window costs the cycle counter nothing.
+ *
+ * This used to be 120 lines saying that in different words, one of which was missing the clamp.
+ */
+
+#include "../../common/os_arch_tickless.c"
+
+/* Atomics.
+ *
+ * Included rather than compiled separately, matching arch/arm/common/os_arch_port_v8m.c: the build
+ * adds exactly one .c per core folder, and everything else is pulled in through it.
+ */
+
+#include "os_arch_atomic.c"

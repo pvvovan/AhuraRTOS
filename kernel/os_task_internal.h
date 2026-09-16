@@ -50,17 +50,19 @@ extern "C"
 #else
 #define OS_TASK_NAME_OF(tcb)             ((const char *)NULL)
 #endif
+
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/* Mutex back-reference from its embedded owner_node (priority inheritance). */
+#define OS_MUTEX_FROM_OWNER_NODE(node)   ((const os_mutex_t *)(const void *)((const uint8_t *)(node) - offsetof(os_mutex_t, owner_node)))
+#endif
+
 /*
  * ***********************************************************************************************************
  * Types
  * ***********************************************************************************************************
 */
 
-/* Mutex back-reference from its embedded owner_node (priority inheritance). */
-#define OS_MUTEX_FROM_OWNER_NODE(node)   ((const os_mutex_t *)(const void *)((const uint8_t *)(node) - offsetof(os_mutex_t, owner_node)))
-#endif
-
+/******************************************************************************************************/
 typedef struct
 {
 #if (OS_CONFIG_TASK_NAME_ENABLE == 1U)
@@ -125,20 +127,50 @@ typedef struct
 
 /*
  * ***********************************************************************************************************
- * Public function prototypes
+ * Global variables
  * ***********************************************************************************************************
 */
 
 /* Defined in os_task.c, used by os_task_mutex.c. */
 extern os_task_tcb_t* __IO os_task_current[OS_CONFIG_CORE_COUNT];
 
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Find a live task by its ID.
+ */
 os_task_tcb_t* os_task_find_by_id(uint32_t id);
+
+/******************************************************************************************************/
+/**
+ * @brief Change a task's effective (scheduled) priority, moving it between ready-list buckets,
+ *        re-sorting it in any waiter list it is queued on, and requesting a reschedule wherever
+ *        needed - the only correct way to mutate tcb->priority once a task may already be
+ *        READY/RUNNING or blocked on an object. Caller holds a critical section (mutex
+ *        lock/unlock's own).
+ */
 void           os_task_effective_priority_set(os_task_tcb_t *tcb, uint32_t new_priority);
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
 /* Defined in os_task_mutex.c, called whenever a waiter leaves its queue. */
+/******************************************************************************************************/
+/**
+ * @brief Release the priority boost tcb handed a mutex owner, now that it has left the waiter
+ *        queue.
+ */
 void os_task_mutex_waiter_depart_tcb(os_task_tcb_t *tcb);
-/* Recompute effective priority and propagate through blocked mutex owners. Caller holds the lock. */
+
+/* Recompute effective priority and propagate through blocked mutex owners. Caller holds the lock.
+ */
+/******************************************************************************************************/
+/**
+ * @brief Recompute a task's inherited priority and then everyone it is transitively waiting behind.
+ */
 void os_task_mutex_priority_recompute(os_task_tcb_t *tcb);
 #endif
 

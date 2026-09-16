@@ -13,6 +13,12 @@
 #ifndef OS_LOG_H
 #define OS_LOG_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "os_types.h"
 
 #ifdef __cplusplus
@@ -22,7 +28,7 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Logging            - OS_CONFIG_LOG_ENABLE
+ * Macros
  * ***********************************************************************************************************
 */
 
@@ -41,8 +47,8 @@ extern "C"
  *  Calls above the configured level expand to nothing, arguments included, so
  *  a disabled OS_LOG_DEBUG costs neither code nor the cost of its arguments. */
 #if (OS_CONFIG_LOG_ENABLE == 1U)
-
 #if (OS_CONFIG_LOG_LEVEL >= OS_LOG_LEVEL_ERROR)
+
 #define OS_LOG_ERROR(...)       os_log_write(OS_LOG_LEVEL_ERROR, __VA_ARGS__)
 #else
 #define OS_LOG_ERROR(...)       ((void)0)
@@ -65,7 +71,20 @@ extern "C"
 #else
 #define OS_LOG_DEBUG(...)       ((void)0)
 #endif
+#else /* OS_CONFIG_LOG_ENABLE == 0U */
+#define OS_LOG_ERROR(...)       ((void)0)
+#define OS_LOG_WARN(...)        ((void)0)
+#define OS_LOG_INFO(...)        ((void)0)
+#define OS_LOG_DEBUG(...)       ((void)0)
+#endif /* OS_CONFIG_LOG_ENABLE */
 
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_LOG_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Format a log line and queue it for transmission. Prefer the OS_LOG_ERROR/WARN/INFO/
@@ -96,14 +115,6 @@ uint32_t os_log_dropped_get(void);
  * @param[in] length  Number of bytes.
  */
 void os_log_output_cb(const uint8_t *data, size_t length);
-
-#else /* OS_CONFIG_LOG_ENABLE == 0U */
-
-#define OS_LOG_ERROR(...)       ((void)0)
-#define OS_LOG_WARN(...)        ((void)0)
-#define OS_LOG_INFO(...)        ((void)0)
-#define OS_LOG_DEBUG(...)       ((void)0)
-
 #endif /* OS_CONFIG_LOG_ENABLE */
 
 #ifdef __cplusplus

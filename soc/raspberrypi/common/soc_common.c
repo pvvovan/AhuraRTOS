@@ -54,6 +54,58 @@
  * ***********************************************************************************************************
 */
 
+/* The raw console is needed by fault reporting: printf must not be called from the fault handler,
+ * which may be entered with the stdio mutex held by the very code that faulted. */
+#define SOC_PANIC_OUTPUT        (SOC_CONFIG_FAULT_REPORT != 0U)
+
+/*
+ * ***********************************************************************************************************
+ * Types
+ * ***********************************************************************************************************
+*/
+
+#if (SOC_CONFIG_FAULT_REPORT != 0U)
+/* What a faulting core managed to record before parking. Deliberately captured rather than
+ * printed: see soc_fault_report(). Written by the faulting core, read by the healthy one. */
+typedef struct
+{
+    uint32_t taken;   /**< Non-zero once every field below is valid. Written last. */
+    uint32_t core;    /**< Which core faulted - the whole point on a dual-core build. */
+    uint32_t pc;      /**< Instruction that faulted. */
+    uint32_t lr;      /**< Its caller. */
+    uint32_t psr;     /**< Program status, including the exception number if any. */
+    uint32_t cfsr;    /**< Configurable Fault Status: says WHICH fault. */
+    uint32_t hfsr;    /**< HardFault Status: usually FORCED, meaning escalated from CFSR. */
+    uint32_t sp;      /**< Stack pointer at the fault, so the words below can be located. */
+    uint32_t psp;     /**< Process stack pointer: the RUNNING TASK's stack. */
+    uint32_t msp;     /**< Main stack pointer: the handler stack of the core that faulted. */
+
+    /* A slice of the faulting stack, above the exception frame. On a jump-to-zero the stacked LR
+     * names only the innermost call, which is rarely the culprit - the return addresses further up
+     * are what identify the path that got there. Eight words is enough to cross a few frames and
+     * costs nothing to capture. */
+    uint32_t stack[8];
+
+} soc_fault_t;
+#endif
+
+/*
+ * ***********************************************************************************************************
+ * Constants
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+#if defined(OS_ARCH_CORE_ID_REG)
+/* soc.cmake publishes that address so os_arch_core_id_get() can load it instead of calling here,
+ * which makes the literal a second copy of a fact the SDK already owns. This is the only file that
+ * can see both, so this is where the two are held together: a chip that moved the register would
+ * otherwise read garbage as a core index and misbehave in ways nothing would point at. */
+OS_STATIC_ASSERT(OS_ARCH_CORE_ID_REG == (uint32_t)(uintptr_t)&sio_hw->cpuid,
+                 "OS_ARCH_CORE_ID_REG in soc.cmake no longer matches the SDK's sio_hw->cpuid");
+#endif
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
 /*
  * ***********************************************************************************************************
  * Global variables
@@ -78,29 +130,6 @@ static spin_lock_t *soc_lock = NULL;
  * written by one core and read by the other, so no lock is needed. */
 static __IO uint8_t soc_core_reached = 0xFFU;
 
-/* What a faulting core managed to record before parking. Deliberately captured rather than
- * printed: see soc_fault_report(). Written by the faulting core, read by the healthy one. */
-typedef struct
-{
-    uint32_t taken;   /**< Non-zero once every field below is valid. Written last. */
-    uint32_t core;    /**< Which core faulted - the whole point on a dual-core build. */
-    uint32_t pc;      /**< Instruction that faulted. */
-    uint32_t lr;      /**< Its caller. */
-    uint32_t psr;     /**< Program status, including the exception number if any. */
-    uint32_t cfsr;    /**< Configurable Fault Status: says WHICH fault. */
-    uint32_t hfsr;    /**< HardFault Status: usually FORCED, meaning escalated from CFSR. */
-    uint32_t sp;      /**< Stack pointer at the fault, so the words below can be located. */
-    uint32_t psp;     /**< Process stack pointer: the RUNNING TASK's stack. */
-    uint32_t msp;     /**< Main stack pointer: the handler stack of the core that faulted. */
-
-    /* A slice of the faulting stack, above the exception frame. On a jump-to-zero the stacked LR
-     * names only the innermost call, which is rarely the culprit - the return addresses further up
-     * are what identify the path that got there. Eight words is enough to cross a few frames and
-     * costs nothing to capture. */
-    uint32_t stack[8];
-
-} soc_fault_t;
-
 static __IO soc_fault_t soc_fault = { 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U };
 #endif
 
@@ -110,26 +139,27 @@ static __IO soc_fault_t soc_fault = { 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U, 0U };
  * ***********************************************************************************************************
 */
 
-/* The raw console is needed by fault reporting: printf must not be called from the fault handler,
- * which may be entered with the stdio mutex held by the very code that faulted. */
-#define SOC_PANIC_OUTPUT        (SOC_CONFIG_FAULT_REPORT != 0U)
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/******************************************************************************************************/
+/**
+ * @brief Core 1's entry point. Arms this core's IPI, then enters the scheduler and stays there.
+ */
+static void soc_core1_entry(void);
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 #if SOC_PANIC_OUTPUT
-
 /******************************************************************************************************/
+/**
+ * @brief Write a string straight at the UART, with no stdio and no locks.
+ */
 static void soc_panic_puts(const char *text);
 
 /******************************************************************************************************/
+/**
+ * @brief Write a 32-bit value as eight hex digits through soc_panic_puts.
+ */
 static void soc_panic_hex(uint32_t value);
-
 #endif /* SOC_PANIC_OUTPUT */
-
-#if (OS_CONFIG_CORE_COUNT > 1U)
-
-/******************************************************************************************************/
-static void soc_core1_entry(void);
-
-#endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 /*
  * ***********************************************************************************************************
@@ -137,6 +167,7 @@ static void soc_core1_entry(void);
  * ***********************************************************************************************************
 */
 
+#if !defined(SOC_ARCH_IDLE_OVERRIDE)
 /******************************************************************************************************/
 /**
  * @brief Wait for work on an idle core.
@@ -151,7 +182,6 @@ static void soc_core1_entry(void);
  * The "memory" clobber stops the compiler hoisting the idle loop's own reads out across this
  * call: what it is waiting for is written by an interrupt or by another core.
  */
-#if !defined(SOC_ARCH_IDLE_OVERRIDE)
 void os_arch_soc_idle_cb(void)
 {
     OS_ARCH_WFE();
@@ -177,6 +207,9 @@ void os_arch_soc_idle_cb(void)
  *
  * Sizes come from PICO_STACK_SIZE and PICO_CORE1_STACK_SIZE; the symbols are absolute, so their
  * addresses are the values.
+ *
+ * @param[in] core_id      Core index.
+ * @return Lowest address of that core handler stack, or 0.
  */
 uint32_t os_arch_handler_stack_limit_cb(uint32_t core_id)
 {
@@ -219,6 +252,9 @@ uint32_t os_arch_handler_stack_limit_cb(uint32_t core_id)
  *
  * Unknown core ids fall back to core 0's stack: the only other stack this package has placed, and a
  * guess of nothing would be far worse than a shared region.
+ *
+ * @param[in] core_id      Core index.
+ * @return Top address of that core handler stack, or 0.
  */
 uint32_t os_arch_handler_stack_top_cb(uint32_t core_id)
 {
@@ -275,7 +311,6 @@ void os_arch_soc_init_cb(void)
 }
 
 #if (OS_CONFIG_TICK_SOURCE == OS_CONFIG_TICK_SOURCE_SYSTICK) && (SOC_CONFIG_SYSTICK_VECTOR != 0U)
-
 /******************************************************************************************************/
 /**
  * @brief SysTick vector: advance the kernel clock.
@@ -297,11 +332,9 @@ void isr_systick(void)
 {
     os_tick_handler();
 }
-
 #endif /* OS_CONFIG_TICK_SOURCE_SYSTICK && SOC_CONFIG_SYSTICK_VECTOR */
 
 #if (OS_CONFIG_CORE_COUNT > 1U)
-
 /******************************************************************************************************/
 /**
  * @brief Boot a secondary core so it reaches os_core_start(). Called by os_start().
@@ -315,6 +348,8 @@ void isr_systick(void)
  * why the id is checked rather than assumed: these chips have exactly one secondary core, and a
  * request for any other is a configuration error the kernel cannot see (it only knows the count
  * the application asked for) but this package can.
+ *
+ * @param[in] core_id      Core index.
  */
 void os_arch_core_launch_cb(uint32_t core_id)
 {
@@ -339,7 +374,8 @@ void os_arch_core_launch_cb(uint32_t core_id)
      * and multicore_launch_core1() does not return until the handshake is complete. Core 1 arms its
      * own in soc_core1_entry().
      *
-     * A request arriving in the remaining sliver is deferred, not lost: the next tick re-evaluates. */
+     * A request arriving in the remaining sliver is deferred, not lost: the next tick re-evaluates.
+     */
         soc_ipi_arm();
     }
 }
@@ -425,25 +461,16 @@ void os_arch_soc_diagnose_cb(void)
  *
  * Reads the SIO CPUID register, which is the only place a Cortex-M can learn this: the
  * architecture has no core-id register, which is why the kernel asks the SoC.
+ *
+ * @return This core's index, as the SoC reports it.
  */
 OS_WEAK uint32_t os_arch_core_id_get_cb(void)
 {
     return (uint32_t)get_core_num();
 }
-
-#if defined(OS_ARCH_CORE_ID_REG)
-/* soc.cmake publishes that address so os_arch_core_id_get() can load it instead of calling here,
- * which makes the literal a second copy of a fact the SDK already owns. This is the only file that
- * can see both, so this is where the two are held together: a chip that moved the register would
- * otherwise read garbage as a core index and misbehave in ways nothing would point at. */
-OS_STATIC_ASSERT(OS_ARCH_CORE_ID_REG == (uint32_t)(uintptr_t)&sio_hw->cpuid,
-                 "OS_ARCH_CORE_ID_REG in soc.cmake no longer matches the SDK's sio_hw->cpuid");
-#endif
-
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 #if (OS_ARCH_SPINLOCK_USE_CB)
-
 /******************************************************************************************************/
 /**
  * @brief Take the kernel spinlock, busy-waiting until it is free.
@@ -460,6 +487,8 @@ OS_STATIC_ASSERT(OS_ARCH_CORE_ID_REG == (uint32_t)(uintptr_t)&sio_hw->cpuid,
  *
  * The "unsafe" in the SDK's name means "does not touch the interrupt mask", which is what is
  * wanted here: the kernel has already masked interrupts before calling.
+ *
+ * @param[in] lock         Spinlock object.
  */
 OS_WEAK void os_arch_spinlock_acquire_cb(os_arch_spinlock_t *lock)
 {
@@ -471,6 +500,8 @@ OS_WEAK void os_arch_spinlock_acquire_cb(os_arch_spinlock_t *lock)
 /******************************************************************************************************/
 /**
  * @brief Release the kernel spinlock taken by os_arch_spinlock_acquire_cb.
+ *
+ * @param[in] lock         Spinlock object.
  */
 OS_WEAK void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock)
 {
@@ -478,11 +509,9 @@ OS_WEAK void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock)
 
     spin_unlock_unsafe(soc_lock);
 }
-
 #endif /* OS_ARCH_SPINLOCK_USE_CB */
 
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U)
-
 /******************************************************************************************************/
 /**
  * @brief Called right before the idle sleep.
@@ -503,11 +532,9 @@ OS_WEAK void os_tickless_pre_sleep_cb(void)
 OS_WEAK void os_tickless_post_sleep_cb(void)
 {
 }
-
 #endif /* OS_CONFIG_TICKLESS_ENABLE */
 
 #if (SOC_CONFIG_FAULT_REPORT != 0U)
-
 /******************************************************************************************************/
 /**
  * @brief Report a fault and park, instead of the SDK's silent breakpoint.
@@ -521,7 +548,7 @@ OS_WEAK void os_tickless_post_sleep_cb(void)
  * Printing from fault context is best-effort, not guaranteed - the transport may already be
  * wedged, and this runs with the faulting core's state half gone. It costs nothing to try.
  *
- * @param frame The exception frame, picked from MSP or PSP by the naked wrapper below.
+ * @param[in] frame  The exception frame, picked from MSP or PSP by the naked wrapper below.
  */
 void soc_fault_report(const uint32_t *frame)
 {
@@ -712,8 +739,48 @@ __attribute__((naked)) void isr_hardfault(void)
         "b    soc_fault_report \n"   /* r0 is its const uint32_t *frame argument     */
     );
 }
-
 #endif /* SOC_CONFIG_FAULT_REPORT */
+
+/* TIMER continues in LIGHT sleep and does not depend on SysTick interrupt service. */
+/******************************************************************************************************/
+/**
+ * @brief The RP2 TIMER counts at 1 MHz, and keeps counting through LIGHT sleep.
+ *
+ * @return Rate of the SoC reference clock, in Hz; 0 where there is none.
+ */
+uint32_t os_arch_reference_clock_hz_cb(void)
+{
+    return 1000000U;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief The RP2 TIMER's 64-bit microsecond count.
+ *
+ * @return The SoC reference clock count.
+ */
+uint64_t os_arch_reference_clock_get_cb(void)
+{
+    return time_us_64();
+}
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief The rate a window is measured against: the 1 MHz TIMER under LIGHT, 0 under DEEP where it
+ *        stops.
+ *
+ * @return Rate a window is measured against, in Hz; 0 when it cannot be measured that way.
+ */
+uint32_t os_arch_tick_reference_clock_hz_cb(void)
+{
+#if (OS_CONFIG_TICKLESS_DEEP_ENABLE == 0U)
+    return os_arch_reference_clock_hz_cb();
+#else
+    return 0U;
+#endif
+}
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -722,7 +789,6 @@ __attribute__((naked)) void isr_hardfault(void)
 */
 
 #if (OS_CONFIG_CORE_COUNT > 1U)
-
 /******************************************************************************************************/
 /**
  * @brief Core 1's entry point. Arms this core's IPI, then enters the scheduler and stays there.
@@ -759,11 +825,9 @@ static void soc_core1_entry(void)
     /* Does not return, and re-enables interrupts on the way in. */
     os_core_start();
 }
-
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 #if SOC_PANIC_OUTPUT
-
 /******************************************************************************************************/
 /**
  * @brief Write a string straight at the UART, with no stdio and no locks.
@@ -779,6 +843,8 @@ static void soc_core1_entry(void)
  *
  * Silently does nothing on a board with no default UART, which is correct - the diagnostic is a
  * bonus, never a dependency.
+ *
+ * @param[in] text         Text to print.
  */
 static void soc_panic_puts(const char *text)
 {
@@ -807,6 +873,8 @@ static void soc_panic_puts(const char *text)
 /******************************************************************************************************/
 /**
  * @brief Write a 32-bit value as eight hex digits through soc_panic_puts.
+ *
+ * @param[in] value        Value to apply.
  */
 static void soc_panic_hex(uint32_t value)
 {
@@ -825,27 +893,4 @@ static void soc_panic_hex(uint32_t value)
 
     soc_panic_puts(text);
 }
-
 #endif /* SOC_PANIC_OUTPUT */
-
-/* TIMER continues in LIGHT sleep and does not depend on SysTick interrupt service. */
-uint32_t os_arch_reference_clock_hz_cb(void)
-{
-    return 1000000U;
-}
-
-uint64_t os_arch_reference_clock_get_cb(void)
-{
-    return time_us_64();
-}
-
-#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
-uint32_t os_arch_tick_reference_clock_hz_cb(void)
-{
-#if (OS_CONFIG_TICKLESS_DEEP_ENABLE == 0U)
-    return os_arch_reference_clock_hz_cb();
-#else
-    return 0U;
-#endif
-}
-#endif /* OS_CONFIG_TICKLESS_ENABLE */

@@ -14,6 +14,12 @@
 #ifndef OS_ARCH_PORT_COMMON_H
 #define OS_ARCH_PORT_COMMON_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -31,6 +37,17 @@
 #endif
 
 #include "os_config.h"
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
 
 /* Kernel-owned encodings for two os_config.h options. They live in the PORT header on both
  * architectures, which means every port owes them - and a port that forgets is not caught by the
@@ -67,28 +84,28 @@
 /* Reject incomplete configurations: a missing option would otherwise read
  * as 0 in #if directives and silently disable or misconfigure features.
  * Start from template/os_config.h, which lists every required option. */
-#if !defined(OS_CONFIG_MUTEX_ENABLE) || !defined(OS_CONFIG_SEM_ENABLE) ||                       \
-    !defined(OS_CONFIG_QUEUE_ENABLE) || !defined(OS_CONFIG_EVENT_ENABLE) ||                           \
-    !defined(OS_CONFIG_MSG_ENABLE) ||                                                                 \
-    !defined(OS_CONFIG_TIMER_ENABLE) || !defined(OS_CONFIG_ALLOC_ENABLE) ||                           \
-    !defined(OS_CONFIG_ATOMIC_ENABLE) || !defined(OS_CONFIG_NOTIFY_ENABLE) ||                         \
-    !defined(OS_CONFIG_LOG_ENABLE) || !defined(OS_CONFIG_ASSERT_ENABLE) ||                            \
-    !defined(OS_CONFIG_STACK_WATERMARK_ENABLE) || !defined(OS_CONFIG_STACK_CHECK_ENABLE) ||           \
-    !defined(OS_CONFIG_TASK_NAME_ENABLE) ||                                                           \
-    !defined(OS_CONFIG_CPU_USAGE_ENABLE) || !defined(OS_CONFIG_TEST_ENABLE) ||                        \
-    !defined(OS_CONFIG_TICKLESS_ENABLE) ||                                                            \
-    !defined(OS_CONFIG_LOG_LEVEL) || !defined(OS_CONFIG_LOG_BUFFER_SIZE) ||                           \
-    !defined(OS_CONFIG_LOG_LINE_MAX) || !defined(OS_CONFIG_LOG_TASK_STACK_SIZE) ||                    \
-    !defined(OS_CONFIG_LOG_TASK_PRIORITY) || !defined(OS_CONFIG_LOG_CORE_AFFINITY) ||                                                          \
-    !defined(OS_CONFIG_TICK_HZ) || !defined(OS_CONFIG_TIME_SLICE_TICKS) ||                            \
-    !defined(OS_CONFIG_MAX_USER_TASKS) || !defined(OS_CONFIG_MIN_STACK_SIZE) ||                       \
-    !defined(OS_CONFIG_HEAP_SIZE) ||                                                                  \
-    !defined(OS_CONFIG_TIMER_PRIORITY) || !defined(OS_CONFIG_TIMER_STACK_SIZE) ||                     \
-    !defined(OS_CONFIG_TIMER_CORE_AFFINITY) ||                                                        \
-    !defined(OS_CONFIG_MAIN_TASK_STACK_SIZE) || !defined(OS_CONFIG_MAIN_TASK_PRIORITY) ||             \
-    !defined(OS_CONFIG_TEST_STACK_SIZE) || !defined(OS_CONFIG_TEST_PRIORITY) ||                       \
-    !defined(OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY) ||                  \
-    !defined(OS_CONFIG_CORE_COUNT) ||                     \
+#if !defined(OS_CONFIG_MUTEX_ENABLE) || !defined(OS_CONFIG_SEM_ENABLE) ||                   \
+    !defined(OS_CONFIG_QUEUE_ENABLE) || !defined(OS_CONFIG_EVENT_ENABLE) ||                 \
+    !defined(OS_CONFIG_MSG_ENABLE) ||                                                       \
+    !defined(OS_CONFIG_TIMER_ENABLE) || !defined(OS_CONFIG_ALLOC_ENABLE) ||                 \
+    !defined(OS_CONFIG_ATOMIC_ENABLE) || !defined(OS_CONFIG_NOTIFY_ENABLE) ||               \
+    !defined(OS_CONFIG_LOG_ENABLE) || !defined(OS_CONFIG_ASSERT_ENABLE) ||                  \
+    !defined(OS_CONFIG_STACK_WATERMARK_ENABLE) || !defined(OS_CONFIG_STACK_CHECK_ENABLE) || \
+    !defined(OS_CONFIG_TASK_NAME_ENABLE) ||                                                 \
+    !defined(OS_CONFIG_CPU_USAGE_ENABLE) || !defined(OS_CONFIG_TEST_ENABLE) ||              \
+    !defined(OS_CONFIG_TICKLESS_ENABLE) ||                                                  \
+    !defined(OS_CONFIG_LOG_LEVEL) || !defined(OS_CONFIG_LOG_BUFFER_SIZE) ||                 \
+    !defined(OS_CONFIG_LOG_LINE_MAX) || !defined(OS_CONFIG_LOG_TASK_STACK_SIZE) ||          \
+    !defined(OS_CONFIG_LOG_TASK_PRIORITY) || !defined(OS_CONFIG_LOG_CORE_AFFINITY) ||       \
+    !defined(OS_CONFIG_TICK_HZ) || !defined(OS_CONFIG_TIME_SLICE_TICKS) ||                  \
+    !defined(OS_CONFIG_MAX_USER_TASKS) || !defined(OS_CONFIG_MIN_STACK_SIZE) ||             \
+    !defined(OS_CONFIG_HEAP_SIZE) ||                                                        \
+    !defined(OS_CONFIG_TIMER_PRIORITY) || !defined(OS_CONFIG_TIMER_STACK_SIZE) ||           \
+    !defined(OS_CONFIG_TIMER_CORE_AFFINITY) ||                                              \
+    !defined(OS_CONFIG_MAIN_TASK_STACK_SIZE) || !defined(OS_CONFIG_MAIN_TASK_PRIORITY) ||   \
+    !defined(OS_CONFIG_TEST_STACK_SIZE) || !defined(OS_CONFIG_TEST_PRIORITY) ||             \
+    !defined(OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY) ||                                         \
+    !defined(OS_CONFIG_CORE_COUNT) ||                                                       \
     !defined(OS_CONFIG_TICKLESS_MIN_IDLE_MS)
 #error "os_config.h is incomplete: it must define every option listed in template/os_config.h."
 #endif
@@ -104,15 +121,12 @@
 #endif
 #endif
 
-/*
- * ***********************************************************************************************************
- * OPTIONAL configuration
- * ***********************************************************************************************************
+/* OPTIONAL configuration.
  *
  * Same terms as the ARM port: everything checked above is mandatory because a missing switch would
  * read as 0 in an #if. The names below are defaulted with #ifndef instead, so a missing one is
  * caught rather than misread.
-*/
+ */
 
 /*
  * The symbol the port gives the machine software interrupt handler - the ONE vector the kernel must
@@ -164,17 +178,6 @@
 #ifndef OS_CONFIG_TICK_SOURCE
 #define OS_CONFIG_TICK_SOURCE          OS_CONFIG_TICK_SOURCE_EXTERNAL
 #endif
-
-#ifdef __cplusplus
-extern "C"
-{
-#endif
-
-/*
- * ***********************************************************************************************************
- * Architecture facts
- * ***********************************************************************************************************
-*/
 
 /* No Security Extension equivalent. RISC-V privilege modes are not TrustZone: there is no banked
  * stack pointer pair to switch per task and no secure-context API to call, so the kernel's
@@ -239,7 +242,8 @@ extern "C"
 #define OS_ARCH_CSR_MCOUNTINHIBIT         0x320
 #define OS_ARCH_MCOUNTINHIBIT_CY_MSK      (1UL << 0)
 
-/* Trap causes, which double as the vector table index in mtvec vectored mode (offset = cause * 4). */
+/* Trap causes, which double as the vector table index in mtvec vectored mode (offset = cause * 4).
+ */
 #define OS_ARCH_TRAP_CAUSE_SWI            3U
 #define OS_ARCH_TRAP_CAUSE_TIMER          7U
 #define OS_ARCH_TRAP_CAUSE_EXTERNAL       11U
@@ -248,15 +252,17 @@ extern "C"
 #define OS_ARCH_STRINGIFY(text)           OS_ARCH_STRINGIFY_(text)
 
 /* Register qualifiers. These carry CMSIS names because the kernel core uses them for shared state
- * (see kernel/os_internal.h) and the ARM port introduced them - so they are part of the port contract
- * rather than an ARM detail, and every port owes them. Defined here rather than included from
- * anywhere: RISC-V has no CMSIS, and the kernel depends on no SDK. */
+ * (see kernel/os_internal.h) and the ARM port introduced them - so they are part of the port
+ * contract rather than an ARM detail, and every port owes them. Defined here rather than included
+ * from anywhere: RISC-V has no CMSIS, and the kernel depends on no SDK. */
 #ifndef __IO
 #define __IO volatile             /*!< read/write */
 #endif
+
 #ifndef __I
 #define __I  volatile const       /*!< read only  */
 #endif
+
 #ifndef __O
 #define __O  volatile             /*!< write only */
 #endif
@@ -317,61 +323,43 @@ extern "C"
 #endif
 #endif
 
-/* The kernel spinlock. Declared here with the other architecture facts rather than beside its
- * accessors, because the SoC callbacks that may implement it are named before those. */
-typedef struct
-{
-    volatile uint32_t locked;
-
-} os_arch_spinlock_t;
-
 #define OS_ARCH_SPINLOCK_INIT  { 0U }
 
-
-/*
- * ***********************************************************************************************************
- * CSR access
- * ***********************************************************************************************************
+/* CSR access.
  *
  * Written out here rather than taken from the Pico SDK's hardware/riscv.h, for the same reason the
  * ARM port defines __IO itself instead of including a CMSIS core header: the kernel names no vendor
  * and depends on no SDK. These are plain Zicsr instructions, which every RISC-V build has.
-*/
+ */
 
-#define OS_ARCH_CSR_READ(csr)                                                                        \
-    ({ uint32_t os_arch_csr_value_;                                                                  \
-       __asm volatile ("csrr %0, " OS_ARCH_STRINGIFY(csr) : "=r"(os_arch_csr_value_) :: "memory");   \
+#define OS_ARCH_CSR_READ(csr)                                                                      \
+    ({ uint32_t os_arch_csr_value_;                                                                \
+       __asm volatile ("csrr %0, " OS_ARCH_STRINGIFY(csr) : "=r"(os_arch_csr_value_) :: "memory"); \
        os_arch_csr_value_; })
 
-#define OS_ARCH_CSR_WRITE(csr, value)                                                                \
+#define OS_ARCH_CSR_WRITE(csr, value)                                                              \
     do { __asm volatile ("csrw " OS_ARCH_STRINGIFY(csr) ", %0" :: "r"(value) : "memory"); } while (0)
 
-#define OS_ARCH_CSR_SET(csr, mask)                                                                   \
+#define OS_ARCH_CSR_SET(csr, mask)                                                                 \
     do { __asm volatile ("csrs " OS_ARCH_STRINGIFY(csr) ", %0" :: "r"(mask) : "memory"); } while (0)
 
-#define OS_ARCH_CSR_CLEAR(csr, mask)                                                                 \
+#define OS_ARCH_CSR_CLEAR(csr, mask)                                                               \
     do { __asm volatile ("csrc " OS_ARCH_STRINGIFY(csr) ", %0" :: "r"(mask) : "memory"); } while (0)
 
 /* Read-and-set / read-and-clear as one instruction. The immediate forms take a 5-bit mask, which is
  * all mstatus.MIE needs, and they are what makes the kernel's mask save atomic - on ARM that same
  * step is a read followed by a separate cpsid. */
-#define OS_ARCH_CSR_READ_SET_IMM(csr, imm)                                                           \
-    ({ uint32_t os_arch_csr_value_;                                                                  \
-       __asm volatile ("csrrsi %0, " OS_ARCH_STRINGIFY(csr) ", " OS_ARCH_STRINGIFY(imm)              \
-                       : "=r"(os_arch_csr_value_) :: "memory");                                      \
+#define OS_ARCH_CSR_READ_SET_IMM(csr, imm)                                                         \
+    ({ uint32_t os_arch_csr_value_;                                                                \
+       __asm volatile ("csrrsi %0, " OS_ARCH_STRINGIFY(csr) ", " OS_ARCH_STRINGIFY(imm)            \
+                       : "=r"(os_arch_csr_value_) :: "memory");                                    \
        os_arch_csr_value_; })
 
-#define OS_ARCH_CSR_READ_CLEAR_IMM(csr, imm)                                                         \
-    ({ uint32_t os_arch_csr_value_;                                                                  \
-       __asm volatile ("csrrci %0, " OS_ARCH_STRINGIFY(csr) ", " OS_ARCH_STRINGIFY(imm)              \
-                       : "=r"(os_arch_csr_value_) :: "memory");                                      \
+#define OS_ARCH_CSR_READ_CLEAR_IMM(csr, imm)                                                       \
+    ({ uint32_t os_arch_csr_value_;                                                                \
+       __asm volatile ("csrrci %0, " OS_ARCH_STRINGIFY(csr) ", " OS_ARCH_STRINGIFY(imm)            \
+                       : "=r"(os_arch_csr_value_) :: "memory");                                    \
        os_arch_csr_value_; })
-
-/*
- * ***********************************************************************************************************
- * Barriers, interrupt control and idle
- * ***********************************************************************************************************
-*/
 
 /* RISC-V has no DSB/ISB pair. "fence" orders memory accesses; "fence.i" additionally synchronises
  * the instruction stream, which is what an ISB is for. Both are mapped so shared kernel code reads
@@ -425,10 +413,11 @@ typedef struct
 #define OS_ARCH_SEV()                     do { } while (0)
 #define OS_ARCH_WFE()                     OS_ARCH_IDLE()
 #endif
+
 /* The sleep is a callback rather than the raw WFI it defaults to: with the window already armed,
  * the core may go as deep as the SoC's own wake source survives, and only the package knows how
  * deep that is. The weak default in os_kernel.c is exactly the WFI this line used to hold. */
-#define OS_ARCH_SLEEP(ticks)                                                                         \
+#define OS_ARCH_SLEEP(ticks)                                                                       \
     do { os_arch_sleep_prepare((ticks)); OS_ARCH_DSB(); os_arch_soc_sleep_cb(); OS_ARCH_ISB(); } while (0)
 
 /*
@@ -446,94 +435,96 @@ typedef struct
  */
 #define OS_ARCH_CONTEXT_SWITCH_REQUEST()  os_arch_swi_request_cb()
 
+/* Whether this core's index can be read straight out of mhartid.
+ *
+ * Set by the SoC package through soc.cmake, like every other target fact, and 0 unless it says so.
+ * The RISC-V privileged spec requires ONE hart to have mhartid 0 and leaves the rest
+ * implementation-defined - the numbering need not be dense and need not match whatever the chip
+ * calls "core 1" - so the architecture layer cannot assume it and the package has to state it.
+ *
+ * Stating it is worth a whole option because of where the answer is used: os_critical_enter() and
+ * os_critical_exit() each need this core's index, so every mutex, semaphore, queue, message, event
+ * and timer operation in the kernel pays for it twice. Through the callback that is a call into
+ * another translation unit - which no -O level can inline away - plus, on the RP2350, a load from
+ * SIO. As a CSR read it is one instruction, inline, with no bus access at all. */
+#ifndef OS_CONFIG_ARCH_CORE_ID_MHARTID
+#define OS_CONFIG_ARCH_CORE_ID_MHARTID    0U
+#endif
+
+#ifndef OS_ARCH_HAS_XH3IRQ
+#define OS_ARCH_HAS_XH3IRQ    0
+#endif
+
+#if (OS_ARCH_HAS_XH3IRQ == 1)
+/* meicontext, Hazard3's interrupt-context CSR. Addressed by number rather than by name because the
+ * assembler only knows the standard CSRs - a vendor extension is not in its table - and named here
+ * rather than pulled from the SDK's rvcsr.h for the reason given in os_arch_port.h. */
+#define OS_ARCH_CSR_MEICONTEXT            0xbe5
+#define OS_ARCH_MEICONTEXT_NOIRQ_MSK      (1UL << 15)
+#endif
+
 /*
  * ***********************************************************************************************************
- * Inline helpers
+ * Types
  * ***********************************************************************************************************
 */
 
+/* The kernel spinlock. Declared here with the other architecture facts rather than beside its
+ * accessors, because the SoC callbacks that may implement it are named before those. */
 /******************************************************************************************************/
-/**
- * @brief Index of the highest set bit in a non-zero bitmap (the scheduler's ready-priority pick).
- *        One clz instruction where Zbb is present, which every Pico SDK RISC-V build has; GCC falls
- *        back to a small library routine otherwise.
- */
-OS_INLINE uint32_t os_arch_highest_bit_get(uint32_t bitmap)
+typedef struct
 {
-    return 31U - (uint32_t)__builtin_clz(bitmap);
-}
+    __IO uint32_t locked;
 
-/******************************************************************************************************/
-/**
- * @brief Index of the lowest set bit in a non-zero bitmap (picks the IPI target from an
- *        affinity mask).
- */
-OS_INLINE uint32_t os_arch_lowest_bit_get(uint32_t bitmap)
-{
-    return (uint32_t)__builtin_ctz(bitmap);
-}
-
-/******************************************************************************************************/
-/**
- * @brief Raise the kernel interrupt mask; returns the previous mask state for restore.
- *
- * Returns 0 when interrupts were enabled on entry and nonzero when they were already masked - the
- * same convention the ARM port uses for PRIMASK, so the shared kernel code that saves and restores
- * these values needs no per-architecture knowledge.
- */
-OS_INLINE uint32_t os_arch_kernel_mask_save(void)
-{
-    /* One instruction reads mstatus and clears MIE, so there is no window between sampling the
-     * previous state and masking - the two-step the ARM PRIMASK path has to live with. */
-    uint32_t previous = OS_ARCH_CSR_READ_CLEAR_IMM(mstatus, 8);
-
-    return ((previous & OS_ARCH_MSTATUS_MIE_MSK) != 0UL) ? 0U : 1U;
-}
-
-/******************************************************************************************************/
-/**
- * @brief Restore the kernel interrupt mask to a state returned by os_arch_kernel_mask_save.
- */
-OS_INLINE void os_arch_kernel_mask_restore(uint32_t saved_state)
-{
-    if (saved_state == 0U)
-    {
-        OS_ARCH_IRQ_ENABLE();
-    }
-}
-
-/******************************************************************************************************/
-/**
- * @brief Return nonzero while the kernel interrupt mask is raised (diagnostics/self-test).
- */
-OS_INLINE uint32_t os_arch_kernel_mask_active(void)
-{
-    return ((OS_ARCH_CSR_READ(mstatus) & OS_ARCH_MSTATUS_MIE_MSK) != 0UL) ? 0U : 1U;
-}
-
-/******************************************************************************************************/
-/**
- * @brief Trap for unrecoverable configuration faults detected at runtime; parks the core
- *        with all interrupts masked so a debugger lands right at the cause.
- */
-OS_INLINE void os_arch_config_fault_trap(void)
-{
-    OS_ARCH_IRQ_DISABLE();
-
-    while (1)
-    {
-    }
-}
+} os_arch_spinlock_t;
 
 /*
  * ***********************************************************************************************************
- * SoC-owned callbacks
+ * Global variables
  * ***********************************************************************************************************
+*/
+
+/* Trap context.
+ *
+ * "Am I in an interrupt?" is one CSR read on Cortex-M (IPSR) and genuinely has no architectural
+ * answer on RISC-V. The Pico SDK says so in as many words: "there is no way to get the current
+ * exception on RISC-V (as there is no such thing -- the hardware does not model the exception
+ * lifecycle like on Arm)".
+ *
+ * The answer therefore comes from two places, OR'd together, and between them they cover every
+ * context that can reach a kernel API:
+ *
+ *   1. The core's interrupt controller, where it has one. On Hazard3 meicontext.NOIRQ is clear
+ *      exactly while an external IRQ is being dispatched, which is self-maintaining, correct
+ *      through arbitrary nesting, and costs four instructions. THIS is the one that matters,
+ *      because every application ISR and the kernel tick arrive as external IRQs.
+ *
+ *   2. os_arch_isr_nesting, for a trap that is NOT an external IRQ and still wants kernel APIs.
+ *      Nothing in the kernel needs it today - the context-switch handler deliberately does not
+ *      touch it, since it calls no API that asks and it is the hottest path in the port - but a
+ *      tick driven straight off mip.MTIP rather than through the interrupt controller would, and
+ *      os_arch_isr_enter/exit() are how such a handler declares itself.
+ *
+ * Getting this wrong is not loud: os_task_current_get() would hand an ISR a task pointer, and a
+ * blocking call from interrupt context would be accepted instead of rejected. Hence two mechanisms
+ * rather than a single one that is nearly always right.
+ */
+
+/* Set while a non-external trap that wants kernel APIs is running; see os_arch_isr_enter(). */
+extern __IO uint32_t os_arch_isr_nesting[OS_CONFIG_CORE_COUNT];
+
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+/* SoC-owned callbacks.
  *
  * The kernel calls these and defines none of them: a SoC package supplies the group, or the
  * application copies template/soc_cb.c. See doc/soc.md for the one-definition rule that makes the
  * split safe.
-*/
+ */
 
 /******************************************************************************************************/
 /**
@@ -588,6 +579,11 @@ void os_arch_core_launch_cb(uint32_t core_id);
  * @brief Take / release the SoC's own cross-core lock, under OS_CONFIG_SPINLOCK_SOC_BACKEND.
  */
 void os_arch_spinlock_acquire_cb(os_arch_spinlock_t *lock);
+
+/******************************************************************************************************/
+/**
+ * @brief Release the kernel spinlock taken by os_arch_spinlock_acquire_cb.
+ */
 void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock);
 
 /******************************************************************************************************/
@@ -603,166 +599,18 @@ uint32_t os_arch_handler_stack_top_cb(uint32_t core_id);
 uint32_t os_arch_handler_stack_limit_cb(uint32_t core_id);
 #endif
 
-/* Whether this core's index can be read straight out of mhartid.
- *
- * Set by the SoC package through soc.cmake, like every other target fact, and 0 unless it says so.
- * The RISC-V privileged spec requires ONE hart to have mhartid 0 and leaves the rest
- * implementation-defined - the numbering need not be dense and need not match whatever the chip
- * calls "core 1" - so the architecture layer cannot assume it and the package has to state it.
- *
- * Stating it is worth a whole option because of where the answer is used: os_critical_enter() and
- * os_critical_exit() each need this core's index, so every mutex, semaphore, queue, message, event
- * and timer operation in the kernel pays for it twice. Through the callback that is a call into
- * another translation unit - which no -O level can inline away - plus, on the RP2350, a load from
- * SIO. As a CSR read it is one instruction, inline, with no bus access at all. */
-#ifndef OS_CONFIG_ARCH_CORE_ID_MHARTID
-#define OS_CONFIG_ARCH_CORE_ID_MHARTID    0U
-#endif
-
-/******************************************************************************************************/
-/**
- * @brief This core's index.
- *
- * Constant 0 on a single-core build, so the callback is never reached and a package that does not
- * implement it is still a valid single-core package. Defined here rather than beside the other
- * inline helpers because os_arch_isr_enter() below is its first user.
- */
-OS_INLINE uint32_t os_arch_core_id_get(void)
-{
-#if (OS_CONFIG_CORE_COUNT == 1U)
-    return 0U;
-#elif (OS_CONFIG_ARCH_CORE_ID_MHARTID == 1U)
-    return OS_ARCH_CSR_READ(mhartid);
-#else
-    return os_arch_core_id_get_cb();
-#endif
-}
-
-/*
- * ***********************************************************************************************************
- * Trap context
- * ***********************************************************************************************************
- *
- * "Am I in an interrupt?" is one CSR read on Cortex-M (IPSR) and genuinely has no architectural
- * answer on RISC-V. The Pico SDK says so in as many words: "there is no way to get the current
- * exception on RISC-V (as there is no such thing -- the hardware does not model the exception
- * lifecycle like on Arm)".
- *
- * The answer therefore comes from two places, OR'd together, and between them they cover every
- * context that can reach a kernel API:
- *
- *   1. The core's interrupt controller, where it has one. On Hazard3 meicontext.NOIRQ is clear
- *      exactly while an external IRQ is being dispatched, which is self-maintaining, correct
- *      through arbitrary nesting, and costs four instructions. THIS is the one that matters,
- *      because every application ISR and the kernel tick arrive as external IRQs.
- *
- *   2. os_arch_isr_nesting, for a trap that is NOT an external IRQ and still wants kernel APIs.
- *      Nothing in the kernel needs it today - the context-switch handler deliberately does not
- *      touch it, since it calls no API that asks and it is the hottest path in the port - but a
- *      tick driven straight off mip.MTIP rather than through the interrupt controller would, and
- *      os_arch_isr_enter/exit() are how such a handler declares itself.
- *
- * Getting this wrong is not loud: os_task_current_get() would hand an ISR a task pointer, and a
- * blocking call from interrupt context would be accepted instead of rejected. Hence two mechanisms
- * rather than a single one that is nearly always right.
-*/
-
-/* Set while a non-external trap that wants kernel APIs is running; see os_arch_isr_enter(). */
-extern __IO uint32_t os_arch_isr_nesting[OS_CONFIG_CORE_COUNT];
-
-#ifndef OS_ARCH_HAS_XH3IRQ
-#define OS_ARCH_HAS_XH3IRQ    0
-#endif
-
-#if (OS_ARCH_HAS_XH3IRQ == 1)
-
-/* meicontext, Hazard3's interrupt-context CSR. Addressed by number rather than by name because the
- * assembler only knows the standard CSRs - a vendor extension is not in its table - and named here
- * rather than pulled from the SDK's rvcsr.h for the reason given in os_arch_port.h. */
-#define OS_ARCH_CSR_MEICONTEXT            0xbe5
-#define OS_ARCH_MEICONTEXT_NOIRQ_MSK      (1UL << 15)
-
-/******************************************************************************************************/
-/**
- * @brief True while the core's interrupt controller is dispatching an external IRQ.
- *
- * NOIRQ reads 1 when no IRQ is active, so the sense is inverted here. The bit is maintained by the
- * hardware and by the dispatcher's meinext updates, which is what makes this correct under
- * preemption without the port counting anything.
- */
-OS_INLINE bool os_arch_ext_irq_active(void)
-{
-    uint32_t meicontext;
-
-    __asm volatile("csrr %0, " OS_ARCH_STRINGIFY(OS_ARCH_CSR_MEICONTEXT) : "=r"(meicontext));
-
-    return ((meicontext & OS_ARCH_MEICONTEXT_NOIRQ_MSK) == 0UL);
-}
-
-#else
-
-/******************************************************************************************************/
-/**
- * @brief No interrupt controller the port knows how to ask; os_arch_isr_nesting carries the answer
- *        alone, and every trap that uses kernel APIs must bracket itself.
- */
-OS_INLINE bool os_arch_ext_irq_active(void)
-{
-    return false;
-}
-
-#endif
-
-/******************************************************************************************************/
-/**
- * @brief Declare that a non-external trap handler is running, so os_arch_in_isr() reports it.
- *
- * Only needed by a handler the core's interrupt controller does not account for - a tick taken
- * straight off mip.MTIP is the realistic case. An external IRQ needs neither call.
- */
-OS_INLINE void os_arch_isr_enter(void)
-{
-#if (OS_CONFIG_CORE_COUNT > 1U)
-    os_arch_isr_nesting[os_arch_core_id_get()]++;
-#else
-    os_arch_isr_nesting[0]++;
-#endif
-}
-
-/******************************************************************************************************/
-/**
- * @brief Close the bracket opened by os_arch_isr_enter().
- */
-OS_INLINE void os_arch_isr_exit(void)
-{
-#if (OS_CONFIG_CORE_COUNT > 1U)
-    os_arch_isr_nesting[os_arch_core_id_get()]--;
-#else
-    os_arch_isr_nesting[0]--;
-#endif
-}
-
-/*
- * ***********************************************************************************************************
- * CPU clock
- * ***********************************************************************************************************
+/* CPU clock.
  *
  * The kernel needs the CPU frequency to size the tick and the microsecond busy-waits. On CMSIS
  * parts that symbol is SystemCoreClock and the vendor's startup code maintains it; RISC-V has no
  * such convention at all, so the value comes through the SoC package like every other silicon fact.
-*/
+ */
 
 /******************************************************************************************************/
 /**
  * @brief The CPU clock in Hz.
  */
 uint32_t os_arch_clock_hz_get(void);
-
-/*
- * ***********************************************************************************************************
- * Public function prototypes
- * ***********************************************************************************************************
-*/
 
 /******************************************************************************************************/
 /**
@@ -794,31 +642,38 @@ uint32_t os_arch_cycle_count_get(void);
 /* Busy-waits require a free-running counter which advances with IRQs masked.
  * Frequency is in Hz; get returns low 32 bits in those units. Frequency 0
  * means unsupported and causes an explicit configuration fault on a nonzero delay. */
+/******************************************************************************************************/
+/**
+ * @brief Rate of the busy-wait counter, in Hz; 0 where the target has none.
+ */
 uint32_t os_arch_delay_counter_hz_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief The busy-wait counter itself: its low 32 bits, in its own units.
+ */
 uint32_t os_arch_delay_counter_get(void);
 
 /* Optional independent SoC timer, in explicit counter units. Read must be
  * coherent, IRQ-independent, monotonic and global across scheduling cores.
  * LIGHT sleep must retain this timer and the CPU clock frequency. */
+/******************************************************************************************************/
+/**
+ * @brief Rate of the reference clock windows are re-measured against.
+ */
 uint32_t os_arch_reference_clock_hz_cb(void);
-uint64_t os_arch_reference_clock_get_cb(void);
 
 /******************************************************************************************************/
 /**
- * @brief Told by the kernel that this core's tick just fired, so a counter synthesized from the
- *        tick timer can close the period. Nothing to do where the counter is real hardware.
+ * @brief Read the reference clock.
  */
-OS_INLINE void os_arch_cycle_tick(void)
-{
-}
+uint64_t os_arch_reference_clock_get_cb(void);
 
 /******************************************************************************************************/
 /**
  * @brief Whole ticks elapsed since the last tick interrupt (tickless accounting).
  */
 uint32_t os_arch_elapsed_ticks_get(void);
-
-
 
 /******************************************************************************************************/
 /**
@@ -837,83 +692,60 @@ uint32_t* os_arch_task_stack_initialize(uint8_t *stack_base, size_t stack_bytes,
  */
 void os_arch_task_exit_trap(void);
 
-/******************************************************************************************************/
-/**
- * @brief True when the caller is in trap context.
- */
-OS_FORCE_INLINE bool os_arch_in_isr(void)
-{
-    bool in_trap = os_arch_ext_irq_active();
-
-    if (!in_trap)
-    {
-        /* Not an external IRQ, so the only remaining source is a trap that raised the nesting
-         * count for itself - see the "Trap context" section above for why one source is not
-         * enough. Checked second because it is the dearer of the two: a load from RAM against a
-         * CSR read. */
-#if (OS_CONFIG_CORE_COUNT > 1U)
-        in_trap = (os_arch_isr_nesting[os_arch_core_id_get()] != 0U);
-#else
-        in_trap = (os_arch_isr_nesting[0] != 0U);
-#endif
-    }
-
-    return in_trap;
-}
-
-/******************************************************************************************************/
-/**
- * @brief Assert that the calling interrupt is allowed to use kernel APIs.
- *
- * A no-op on RISC-V. On ARM this catches an ISR above OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY calling
- * into the kernel; here every kernel critical section masks all interrupts (OS_ARCH_HAS_BASEPRI is
- * 0), so there is no such class of interrupt to catch.
- *
- * Inline, exactly as the ARM port has it, and that is not a style choice: os_critical_enter() calls
- * this on EVERY entry, so out of line it cost a jalr and a ret - plus whatever the XIP cache made
- * of them - to run an empty body, on the one path every mutex, semaphore, queue, message, event and
- * timer operation in the kernel goes through.
- */
-OS_INLINE void os_arch_isr_priority_check(void)
-{
-}
-
-/******************************************************************************************************/
-/**
- * @brief Read a word indivisibly.
- *
- * Inline here rather than written out in os_arch_atomic.c, for the same reason as on ARM: a
- * naturally aligned 32-bit load is already indivisible on RV32, so the whole operation is one lw and
- * calling across to the port would cost several times what it does. The volatile access is what
- * stops the compiler reusing a value it cached before another path changed the word.
- */
-OS_INLINE int32_t os_arch_atomic_load(const volatile int32_t *target)
-{
-    return *target;
-}
-
 #if (OS_CONFIG_ATOMIC_ENABLE == 1U)
-
 /*
  * The kernel's atomic set. Lock-free wherever OS_ARCH_HAS_EXCLUSIVES is 1, which on RV32 means the
  * A extension; see os_arch_atomic.c for how much of this is a single instruction here.
  *
  * Each returns the value held BEFORE the operation.
  */
-int32_t os_arch_atomic_exchange(volatile int32_t *target, int32_t value);
-int32_t os_arch_atomic_add(volatile int32_t *target, int32_t value);
-int32_t os_arch_atomic_sub(volatile int32_t *target, int32_t value);
-int32_t os_arch_atomic_or(volatile int32_t *target, int32_t value);
-int32_t os_arch_atomic_and(volatile int32_t *target, int32_t value);
-int32_t os_arch_atomic_xor(volatile int32_t *target, int32_t value);
-int32_t os_arch_atomic_nand(volatile int32_t *target, int32_t value);
+/******************************************************************************************************/
+/**
+ * @brief Atomic exchange. See os_arch_port_common.h.
+ */
+int32_t os_arch_atomic_exchange(__IO int32_t *target, int32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic add. See os_arch_port_common.h.
+ */
+int32_t os_arch_atomic_add(__IO int32_t *target, int32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic subtract. See os_arch_port_common.h.
+ */
+int32_t os_arch_atomic_sub(__IO int32_t *target, int32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic bitwise OR. See os_arch_port_common.h.
+ */
+int32_t os_arch_atomic_or(__IO int32_t *target, int32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic bitwise AND. See os_arch_port_common.h.
+ */
+int32_t os_arch_atomic_and(__IO int32_t *target, int32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic bitwise XOR. See os_arch_port_common.h.
+ */
+int32_t os_arch_atomic_xor(__IO int32_t *target, int32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Atomic bitwise NAND. See os_arch_port_common.h.
+ */
+int32_t os_arch_atomic_nand(__IO int32_t *target, int32_t value);
 
 /******************************************************************************************************/
 /**
  * @brief Compare-and-swap, used by the kernel's atomics.
  */
-bool os_arch_atomic_cas(volatile int32_t *target, int32_t expected, int32_t desired);
-
+bool os_arch_atomic_cas(__IO int32_t *target, int32_t expected, int32_t desired);
 #endif /* OS_CONFIG_ATOMIC_ENABLE */
 
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U)
@@ -988,7 +820,8 @@ uint32_t os_arch_tick_suppress_min_cb(void);
  * the periodic cadence uses, or every sleep loses whatever fraction of a tick it rounded away and
  * the clock drifts by that much per wake.
  *
- * @param[in] ticks  How many tick periods to skip; always at least the floor OS_CONFIG_TICKLESS_MIN_IDLE_MS sets.
+ * @param[in] ticks  How many tick periods to skip; always at least the floor
+ *                   OS_CONFIG_TICKLESS_MIN_IDLE_MS sets.
  * @return None.
  */
 void os_arch_tick_suppress_cb(uint32_t ticks);
@@ -1005,18 +838,366 @@ void os_arch_tick_suppress_cb(uint32_t ticks);
  *                    pending in the interrupt controller.
  */
 uint32_t os_arch_tick_resume_cb(void);
-
 #endif
+
+/******************************************************************************************************/
+/**
+ * @brief Index of the highest set bit in a non-zero bitmap (the scheduler's ready-priority pick).
+ *        One clz instruction where Zbb is present, which every Pico SDK RISC-V build has; GCC falls
+ *        back to a small library routine otherwise.
+ */
+OS_INLINE uint32_t os_arch_highest_bit_get(uint32_t bitmap);
+
+/******************************************************************************************************/
+/**
+ * @brief Index of the lowest set bit in a non-zero bitmap (picks the IPI target from an
+ *        affinity mask).
+ */
+OS_INLINE uint32_t os_arch_lowest_bit_get(uint32_t bitmap);
+
+/******************************************************************************************************/
+/**
+ * @brief Raise the kernel interrupt mask; returns the previous mask state for restore.
+ */
+OS_INLINE uint32_t os_arch_kernel_mask_save(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Restore the kernel interrupt mask to a state returned by os_arch_kernel_mask_save.
+ */
+OS_INLINE void os_arch_kernel_mask_restore(uint32_t saved_state);
+
+/******************************************************************************************************/
+/**
+ * @brief Return nonzero while the kernel interrupt mask is raised (diagnostics/self-test).
+ */
+OS_INLINE uint32_t os_arch_kernel_mask_active(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Trap for unrecoverable configuration faults detected at runtime; parks the core
+ *        with all interrupts masked so a debugger lands right at the cause.
+ */
+OS_INLINE void os_arch_config_fault_trap(void);
+
+/******************************************************************************************************/
+/**
+ * @brief This core's index.
+ */
+OS_INLINE uint32_t os_arch_core_id_get(void);
+
+#if (OS_ARCH_HAS_XH3IRQ == 1)
+/******************************************************************************************************/
+/**
+ * @brief True while the core's interrupt controller is dispatching an external IRQ.
+ */
+OS_INLINE bool os_arch_ext_irq_active(void);
+#else
+/******************************************************************************************************/
+/**
+ * @brief No interrupt controller the port knows how to ask; os_arch_isr_nesting carries the answer
+ *        alone, and every trap that uses kernel APIs must bracket itself.
+ */
+OS_INLINE bool os_arch_ext_irq_active(void);
+#endif
+
+/******************************************************************************************************/
+/**
+ * @brief Declare that a non-external trap handler is running, so os_arch_in_isr() reports it.
+ */
+OS_INLINE void os_arch_isr_enter(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Close the bracket opened by os_arch_isr_enter().
+ */
+OS_INLINE void os_arch_isr_exit(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Told by the kernel that this core's tick just fired, so a counter synthesized from the
+ *        tick timer can close the period. Nothing to do where the counter is real hardware.
+ */
+OS_INLINE void os_arch_cycle_tick(void);
+
+/******************************************************************************************************/
+/**
+ * @brief True when the caller is in trap context.
+ */
+OS_FORCE_INLINE bool os_arch_in_isr(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Assert that the calling interrupt is allowed to use kernel APIs.
+ */
+OS_INLINE void os_arch_isr_priority_check(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Read a word indivisibly.
+ */
+OS_INLINE int32_t os_arch_atomic_load(const __IO int32_t *target);
+
+/******************************************************************************************************/
+/**
+ * @brief Take a kernel spinlock. Spins until it is held; callers mask interrupts around it.
+ */
+OS_INLINE void os_arch_spinlock_acquire(os_arch_spinlock_t *lock);
+
+/******************************************************************************************************/
+/**
+ * @brief Release a kernel spinlock.
+ */
+OS_INLINE void os_arch_spinlock_release(os_arch_spinlock_t *lock);
 
 /*
  * ***********************************************************************************************************
- * Spinlock
+ * Public function implementations
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
 /**
+ * @brief Index of the highest set bit in a non-zero bitmap (the scheduler's ready-priority pick).
+ *        One clz instruction where Zbb is present, which every Pico SDK RISC-V build has; GCC falls
+ *        back to a small library routine otherwise.
+ *
+ * @param[in] bitmap       Word to scan.
+ * @return Index of the highest set bit; 0 when the word is empty.
+ */
+OS_INLINE uint32_t os_arch_highest_bit_get(uint32_t bitmap)
+{
+    return 31U - (uint32_t)__builtin_clz(bitmap);
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Index of the lowest set bit in a non-zero bitmap (picks the IPI target from an
+ *        affinity mask).
+ *
+ * @param[in] bitmap       Word to scan.
+ * @return Index of the lowest set bit; 0 when the word is empty.
+ */
+OS_INLINE uint32_t os_arch_lowest_bit_get(uint32_t bitmap)
+{
+    return (uint32_t)__builtin_ctz(bitmap);
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Raise the kernel interrupt mask; returns the previous mask state for restore.
+ *
+ * Returns 0 when interrupts were enabled on entry and nonzero when they were already masked - the
+ * same convention the ARM port uses for PRIMASK, so the shared kernel code that saves and restores
+ * these values needs no per-architecture knowledge.
+ *
+ * @return Opaque token for os_arch_kernel_mask_restore.
+ */
+OS_INLINE uint32_t os_arch_kernel_mask_save(void)
+{
+    /* One instruction reads mstatus and clears MIE, so there is no window between sampling the
+     * previous state and masking - the two-step the ARM PRIMASK path has to live with. */
+    uint32_t previous = OS_ARCH_CSR_READ_CLEAR_IMM(mstatus, 8);
+
+    return ((previous & OS_ARCH_MSTATUS_MIE_MSK) != 0UL) ? 0U : 1U;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Restore the kernel interrupt mask to a state returned by os_arch_kernel_mask_save.
+ *
+ * @param[in] saved_state  Token from os_arch_kernel_mask_save.
+ */
+OS_INLINE void os_arch_kernel_mask_restore(uint32_t saved_state)
+{
+    if (saved_state == 0U)
+    {
+        OS_ARCH_IRQ_ENABLE();
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Return nonzero while the kernel interrupt mask is raised (diagnostics/self-test).
+ *
+ * @return Nonzero while the kernel mask is raised.
+ */
+OS_INLINE uint32_t os_arch_kernel_mask_active(void)
+{
+    return ((OS_ARCH_CSR_READ(mstatus) & OS_ARCH_MSTATUS_MIE_MSK) != 0UL) ? 0U : 1U;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Trap for unrecoverable configuration faults detected at runtime; parks the core
+ *        with all interrupts masked so a debugger lands right at the cause.
+ */
+OS_INLINE void os_arch_config_fault_trap(void)
+{
+    OS_ARCH_IRQ_DISABLE();
+
+    while (1)
+    {
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief This core's index.
+ *
+ * Constant 0 on a single-core build, so the callback is never reached and a package that does not
+ * implement it is still a valid single-core package. Defined here rather than beside the other
+ * inline helpers because os_arch_isr_enter() below is its first user.
+ *
+ * @return This core's index.
+ */
+OS_INLINE uint32_t os_arch_core_id_get(void)
+{
+#if (OS_CONFIG_CORE_COUNT == 1U)
+    return 0U;
+#elif (OS_CONFIG_ARCH_CORE_ID_MHARTID == 1U)
+    return OS_ARCH_CSR_READ(mhartid);
+#else
+    return os_arch_core_id_get_cb();
+#endif
+}
+
+#if (OS_ARCH_HAS_XH3IRQ == 1)
+/******************************************************************************************************/
+/**
+ * @brief True while the core's interrupt controller is dispatching an external IRQ.
+ *
+ * NOIRQ reads 1 when no IRQ is active, so the sense is inverted here. The bit is maintained by the
+ * hardware and by the dispatcher's meinext updates, which is what makes this correct under
+ * preemption without the port counting anything.
+ *
+ * @return True while an external interrupt is being serviced.
+ */
+OS_INLINE bool os_arch_ext_irq_active(void)
+{
+    uint32_t meicontext;
+
+    __asm volatile("csrr %0, " OS_ARCH_STRINGIFY(OS_ARCH_CSR_MEICONTEXT) : "=r"(meicontext));
+
+    return ((meicontext & OS_ARCH_MEICONTEXT_NOIRQ_MSK) == 0UL);
+}
+#else
+/******************************************************************************************************/
+/**
+ * @brief No interrupt controller the port knows how to ask; os_arch_isr_nesting carries the answer
+ *        alone, and every trap that uses kernel APIs must bracket itself.
+ *
+ * @return True while an external interrupt is being serviced.
+ */
+OS_INLINE bool os_arch_ext_irq_active(void)
+{
+    return false;
+}
+#endif
+
+/******************************************************************************************************/
+/**
+ * @brief Declare that a non-external trap handler is running, so os_arch_in_isr() reports it.
+ *
+ * Only needed by a handler the core's interrupt controller does not account for - a tick taken
+ * straight off mip.MTIP is the realistic case. An external IRQ needs neither call.
+ */
+OS_INLINE void os_arch_isr_enter(void)
+{
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    os_arch_isr_nesting[os_arch_core_id_get()]++;
+#else
+    os_arch_isr_nesting[0]++;
+#endif
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Close the bracket opened by os_arch_isr_enter().
+ */
+OS_INLINE void os_arch_isr_exit(void)
+{
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    os_arch_isr_nesting[os_arch_core_id_get()]--;
+#else
+    os_arch_isr_nesting[0]--;
+#endif
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Told by the kernel that this core's tick just fired, so a counter synthesized from the
+ *        tick timer can close the period. Nothing to do where the counter is real hardware.
+ */
+OS_INLINE void os_arch_cycle_tick(void)
+{
+}
+
+/******************************************************************************************************/
+/**
+ * @brief True when the caller is in trap context.
+ *
+ * @return True when the caller is in interrupt context.
+ */
+OS_FORCE_INLINE bool os_arch_in_isr(void)
+{
+    bool in_trap = os_arch_ext_irq_active();
+
+    if (!in_trap)
+    {
+        /* Not an external IRQ, so the only remaining source is a trap that raised the nesting
+         * count for itself - see the "Trap context" section above for why one source is not
+         * enough. Checked second because it is the dearer of the two: a load from RAM against a
+         * CSR read. */
+#if (OS_CONFIG_CORE_COUNT > 1U)
+        in_trap = (os_arch_isr_nesting[os_arch_core_id_get()] != 0U);
+#else
+        in_trap = (os_arch_isr_nesting[0] != 0U);
+#endif
+    }
+
+    return in_trap;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Assert that the calling interrupt is allowed to use kernel APIs.
+ *
+ * A no-op on RISC-V. On ARM this catches an ISR above OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY calling
+ * into the kernel; here every kernel critical section masks all interrupts (OS_ARCH_HAS_BASEPRI is
+ * 0), so there is no such class of interrupt to catch.
+ *
+ * Inline, exactly as the ARM port has it, and that is not a style choice: os_critical_enter() calls
+ * this on EVERY entry, so out of line it cost a jalr and a ret - plus whatever the XIP cache made
+ * of them - to run an empty body, on the one path every mutex, semaphore, queue, message, event and
+ * timer operation in the kernel goes through.
+ */
+OS_INLINE void os_arch_isr_priority_check(void)
+{
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Read a word indivisibly.
+ *
+ * Inline here rather than written out in os_arch_atomic.c, for the same reason as on ARM: a
+ * naturally aligned 32-bit load is already indivisible on RV32, so the whole operation is one lw
+ * and calling across to the port would cost several times what it does. The volatile access is what
+ * stops the compiler reusing a value it cached before another path changed the word.
+ *
+ * @param[in] target       Word to operate on.
+ * @return The word as read.
+ */
+OS_INLINE int32_t os_arch_atomic_load(const __IO int32_t *target)
+{
+    return *target;
+}
+
+/******************************************************************************************************/
+/**
  * @brief Take a kernel spinlock. Spins until it is held; callers mask interrupts around it.
+ *
+ * @param[in] lock         Spinlock object.
  */
 OS_INLINE void os_arch_spinlock_acquire(os_arch_spinlock_t *lock)
 {
@@ -1051,6 +1232,8 @@ OS_INLINE void os_arch_spinlock_acquire(os_arch_spinlock_t *lock)
 /******************************************************************************************************/
 /**
  * @brief Release a kernel spinlock.
+ *
+ * @param[in] lock         Spinlock object.
  */
 OS_INLINE void os_arch_spinlock_release(os_arch_spinlock_t *lock)
 {

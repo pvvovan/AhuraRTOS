@@ -13,6 +13,12 @@
 #ifndef OS_MUTEX_H
 #define OS_MUTEX_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "os_types.h"
 
 #ifdef __cplusplus
@@ -22,12 +28,11 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Mutex              - OS_CONFIG_MUTEX_ENABLE
+ * Types
  * ***********************************************************************************************************
 */
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
-
 /******************************************************************************************************/
 /**
  * @brief Mutex object.
@@ -40,7 +45,15 @@ typedef struct
     os_list_node_t owner_node; /**< Links into the owner's owned-mutex list (priority inheritance). */
 
 } os_mutex_t;
+#endif /* OS_CONFIG_MUTEX_ENABLE */
 
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Initialize a mutex object.
@@ -58,7 +71,6 @@ os_err_t os_mutex_lock(os_mutex_t *mutex, uint32_t timeout_ms);
  * @brief Release a mutex object (only the owner may unlock).
  */
 os_err_t os_mutex_unlock(os_mutex_t *mutex);
-
 #endif /* OS_CONFIG_MUTEX_ENABLE */
 
 #ifdef __cplusplus

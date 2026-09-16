@@ -15,6 +15,12 @@
 
 #include "os_internal.h"
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 /* OS_WEAK comes from the port layer (os_arch_port_common.h). */
 
 /** The application's floor in ticks, from the milliseconds it states.
@@ -22,7 +28,7 @@
  * Ceiling division, and never below 2. Rounding down could reach 0, and a floor of 0 means
  * "always suppress" - the opposite of what the option is for. Two tick periods is the hardware
  * floor underneath any policy: one is what the tick would have done anyway. */
-#define OS_TICKLESS_MIN_IDLE_TICKS                                                                \
+#define OS_TICKLESS_MIN_IDLE_TICKS                                                                 \
     ((((OS_CONFIG_TICKLESS_MIN_IDLE_MS * OS_CONFIG_TICK_HZ) + 999UL) / 1000UL) < 2UL ?             \
      2UL : (((OS_CONFIG_TICKLESS_MIN_IDLE_MS * OS_CONFIG_TICK_HZ) + 999UL) / 1000UL))
 
@@ -30,14 +36,15 @@
  *
  * Not a policy and not configurable: it is a fact about a 32-bit tick counter.
  *
- * os_tickless_expected_idle_ticks_get() answers UINT32_MAX when there is genuinely nothing pending -
- * no timer, no finite-delay sleeper - and that is the honest answer. A port whose wake source is 64
- * bits wide reports no ceiling of its own for the same honest reason (soc/raspberrypi/rp235x_riscv
- * returns UINT32_MAX: mtime cannot run out). Put together, those two truths would plan a window
- * spanning the entire range of os_tick_count, and then:
+ * os_tickless_expected_idle_ticks_get() answers UINT32_MAX when there is genuinely nothing pending
+ * - no timer, no finite-delay sleeper - and that is the honest answer. A port whose wake source is
+ * 64 bits wide reports no ceiling of its own for the same honest reason
+ * (soc/raspberrypi/rp235x_riscv returns UINT32_MAX: mtime cannot run out). Put together, those two
+ * truths would plan a window spanning the entire range of os_tick_count, and then:
  *
  *   - os_tick_announce() does os_tick_count += elapsed. At UINT32_MAX that lands one tick BELOW
- *     where it started, so the clock runs backwards - the one thing a monotonic counter must not do.
+ *     where it started, so the clock runs backwards - the one thing a monotonic counter must not
+ *     do.
  *   - Every wrap-safe difference in the kernel - os_internal_wait_remaining(), the retry loop in
  *     os_delay_ticks() - reads os_tick_get() - start as a forward elapsed. An unsigned difference
  *     only says "forward" while the real elapsed is under half the range; past that it is
@@ -48,9 +55,10 @@
  * real workload asks for - this exists to stop the degenerate case, not to shape ordinary ones.
  *
  * FreeRTOS bounds the same thing with xMaximumPossibleSuppressedTicks, derived in the PORT from the
- * timer's width. This kernel already has that: os_arch_max_suppressed_ticks_get() is exactly it, and
- * every port with a narrow timer answers from its register width. This constant is the other half of
- * the same rule - the limit the KERNEL's own counter imposes once the hardware imposes none. */
+ * timer's width. This kernel already has that: os_arch_max_suppressed_ticks_get() is exactly it,
+ * and every port with a narrow timer answers from its register width. This constant is the other
+ * half of the same rule - the limit the KERNEL's own counter imposes once the hardware imposes
+ * none. */
 #define OS_TICKLESS_MAX_IDLE_TICKS   (UINT32_MAX / 2U)
 
 /*
@@ -90,6 +98,26 @@ static __IO uint32_t os_tick_usage_idle_ticks  = 0U;
  *  costs far more than the load. os_tickless_remote_window_wait stays as the slow path. */
 __IO bool os_tickless_window_open = false;
 #endif
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/* Only core 0 suppresses the shared timebase. While its window is open,
+ * remote outer kernel entries acquire the lock, observe the flag, send an IPI,
+ * then release/retry until the elapsed time has been announced. The owner holds
+ * no spinlock across sleep. Thus a new relative deadline or tick read cannot
+ * be published against the time origin from before the suppressed interval.
+ * All flag transitions and tests use the global lock; local masking alone
+ * would leave an open-versus-remote-entry race. */
+static __IO uint32_t os_tickless_last_plan_tick = 0U;
+
+/** Bumped whenever a new expiry joins a kernel time source. A hint, not a guarantee: written from
+ *  any core, read without a lock, and nothing rests on it being current - a stale read costs one
+ *  idle pass. It only lets the guard below tell "nothing changed" from "re-planning could now
+ *  answer differently". */
+static __IO uint32_t os_tickless_plan_generation = 0U;
+
+/** The value of the above as of the last planning pass. */
+static __IO uint32_t os_tickless_last_plan_generation = 0U;
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -294,29 +322,18 @@ uint32_t os_cpu_usage_get(void)
 #endif /* OS_CONFIG_CPU_USAGE_ENABLE */
 
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U)
-
-/* Only core 0 suppresses the shared timebase. While its window is open,
- * remote outer kernel entries acquire the lock, observe the flag, send an IPI,
- * then release/retry until the elapsed time has been announced. The owner holds
- * no spinlock across sleep. Thus a new relative deadline or tick read cannot
- * be published against the time origin from before the suppressed interval.
- * All flag transitions and tests use the global lock; local masking alone
- * would leave an open-versus-remote-entry race. */
-static __IO uint32_t os_tickless_last_plan_tick = 0U;
-
-/** Bumped whenever a new expiry joins a kernel time source. A hint, not a guarantee: written from
- *  any core, read without a lock, and nothing rests on it being current - a stale read costs one
- *  idle pass. It only lets the guard below tell "nothing changed" from "re-planning could now
- *  answer differently". */
-static __IO uint32_t os_tickless_plan_generation = 0U;
-
-/** The value of the above as of the last planning pass. */
-static __IO uint32_t os_tickless_last_plan_generation = 0U;
-
 #if (OS_CONFIG_CORE_COUNT > 1U)
 /* Called with the kernel spinlock held and local scheduling excluded. The
  * caller releases the lock before retrying, allowing core 0 to announce and
  * close. Checking under the lock closes the open-versus-remote-entry race. */
+/******************************************************************************************************/
+/**
+ * @brief Wait out core 0's suppressed window; true means drop the lock and retry.
+ *
+ * @param[in] core         Core index.
+ *
+ * @return True means drop the lock and retry.
+ */
 bool os_tickless_remote_window_wait(uint32_t core)
 {
     bool wait = os_tickless_window_open && (core != 0U);
@@ -377,7 +394,8 @@ uint32_t os_tickless_expected_idle_ticks_get(void)
  * instead of assuming any particular tick count.
  *
  * @return uint32_t  Maximum suppressible ticks; 0 when the active port does not yet suppress
- *                    ticking for real (see doc/porting.md "Tickless idle" for which ports currently do).
+ *                    ticking for real (see doc/porting.md "Tickless idle" for which ports currently
+ *                    do).
  */
 uint32_t os_tickless_max_suppressed_ticks_get(void)
 {
@@ -448,15 +466,14 @@ void os_tickless_idle_process(void)
          * accounted for.
          *
          * Every input to that decision - the next timer expiry, the earliest sleeping task - is
-         * something an ISR can change. Reading them with interrupts live leaves a
-         * window in which an ISR registers a nearer deadline than the one just computed, and the sleep
-         * then runs straight past it. Waking a task in that window is harmless, because that pends
-         * PendSV and a pending exception cuts the WFI short, but starting a timer pends nothing at
-         * all: there would be no wake-up event, and the timer would fire late by the whole
-         * remaining window.
+         * something an ISR can change. Reading them with interrupts live leaves a window in which
+         * an ISR registers a nearer deadline than the one just computed, and the sleep then runs
+         * straight past it. Waking a task in that window is harmless, because that pends PendSV and
+         * a pending exception cuts the WFI short, but starting a timer pends nothing at all: there
+         * would be no wake-up event, and the timer would fire late by the whole remaining window.
          *
-         * Masking first closes it. A WFI still wakes on a pending interrupt while masked, so anything
-         * arriving from here on shortens the sleep rather than being missed. */
+         * Masking first closes it. A WFI still wakes on a pending interrupt while masked, so
+         * anything arriving from here on shortens the sleep rather than being missed. */
 
 #if (OS_CONFIG_CORE_COUNT > 1U)
         /* Serialize the opening with remote kernel entry before reading any
@@ -509,30 +526,32 @@ void os_tickless_idle_process(void)
          *
          * That last part is what makes this a correctness test rather than an optimisation.
          * OS_ARCH_SLEEP() ends in os_arch_soc_sleep_cb(), which a package is entitled to define as
-         * its deepest mode: on an STM32 under OS_CONFIG_TICKLESS_DEEP_ENABLE it is a Stop entry. Entered
-         * with no wake source armed it also stops SysTick, so the core waits on whatever unrelated
-         * interrupt happens along, and os_arch_elapsed_ticks_get() - correctly, having armed nothing
+         * its deepest mode: on an STM32 under OS_CONFIG_TICKLESS_DEEP_ENABLE it is a Stop entry.
+         * Entered with no wake source armed it also stops SysTick, so the core waits on whatever
+         * unrelated interrupt happens along, and os_arch_elapsed_ticks_get() - correctly, having
+         * armed nothing
          * - reports 0. The whole sleep is then missing from os_tick_count, and every delay, timeout
          * and software timer overruns by it with nothing anywhere to say so. That is what a v7m
          * target with an STM32 DEEP build did before this test existed.
          *
          * Nothing replaces the sleep here, deliberately. os_task_idle_entry calls
-         * os_arch_soc_idle_cb() on the very next line, OUTSIDE this mask, which is where an ordinary
-         * idle belongs - and it is the call the packages define as WFE rather than WFI where that
-         * matters (a core another core must be able to wake). Doing it from in here instead would
-         * put a latching WFE inside a masked region, and would call the sleep hooks around a window
-         * that does not exist. */
+         * os_arch_soc_idle_cb() on the very next line, OUTSIDE this mask, which is where an
+         * ordinary idle belongs - and it is the call the packages define as WFE rather than WFI
+         * where that matters (a core another core must be able to wake). Doing it from in here
+         * instead would put a latching WFE inside a masked region, and would call the sleep hooks
+         * around a window that does not exist. */
         if ((suppress_ceiling != 0U) && (planned_idle_ticks >= suppress_floor))
         {
             os_tickless_pre_sleep_cb();
 
             OS_ARCH_SLEEP(planned_idle_ticks);
 
-            /* Wake path, in this order for a reason: measure while the counter still holds the sleep,
-             * let the application restore its hardware, announce so the clock catches up, and only
-             * then release the mask. Announcing after the release, or before the restore, both break -
-             * os_tick_count is short by the whole sleep until step 3, and the switch os_tick_announce
-             * can pend would otherwise be taken while the idle task still has SLEEPDEEP set. */
+            /* Wake path, in this order for a reason: measure while the counter still holds the
+             * sleep, let the application restore its hardware, announce so the clock catches up,
+             * and only then release the mask. Announcing after the release, or before the restore,
+             * both break - os_tick_count is short by the whole sleep until step 3, and the switch
+             * os_tick_announce can pend would otherwise be taken while the idle task still has
+             * SLEEPDEEP set. */
             elapsed_ticks = os_arch_elapsed_ticks_get();
 
             os_tickless_post_sleep_cb();
@@ -553,10 +572,10 @@ void os_tickless_idle_process(void)
          * unwound even when the plan above was too short to enter sleep. */
         os_arch_soc_sleep_finish_cb();
 
-        /* Releases the mask taken before the sleep was planned. Nesting is deliberate: the port's own
-         * mask (taken in os_arch_sleep_prepare, released by os_arch_sleep_finish above) sits inside
-         * this one, and both are save/restore rather than unconditional enables, so the interrupt
-         * state the idle task arrived with is what it leaves with. */
+        /* Releases the mask taken before the sleep was planned. Nesting is deliberate: the port's
+         * own mask (taken in os_arch_sleep_prepare, released by os_arch_sleep_finish above) sits
+         * inside this one, and both are save/restore rather than unconditional enables, so the
+         * interrupt state the idle task arrived with is what it leaves with. */
     }
     os_arch_kernel_mask_restore(mask_state);
 }
@@ -608,5 +627,4 @@ void os_tickless_deadline_armed(void)
  * An application that needs more - a UART flushed before the clock stops, a sensor parked - defines
  * either one strongly and displaces the package's default for that hook alone. It does NOT need to
  * define them just to enable tickless idle. */
-
 #endif /* OS_CONFIG_TICKLESS_ENABLE */

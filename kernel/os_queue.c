@@ -17,19 +17,22 @@
 
 #include <string.h>
 
-#if (OS_CONFIG_QUEUE_ENABLE == 1U)
-
-#if (OS_CONFIG_ALLOC_ENABLE == 1U)
-
 /*
  * ***********************************************************************************************************
  * Private function prototypes
  * ***********************************************************************************************************
 */
 
-static os_err_t os_queue_bind_buffer(os_queue_t *queue, void *buffer, size_t item_size, size_t capacity);
-
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Bind a queue to an item buffer at run time.
+ */
+static os_err_t os_queue_bind_buffer(os_queue_t *queue, void *buffer, size_t item_size,
+                                     size_t capacity);
 #endif /* OS_CONFIG_ALLOC_ENABLE */
+#endif /* OS_CONFIG_QUEUE_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -37,6 +40,7 @@ static os_err_t os_queue_bind_buffer(os_queue_t *queue, void *buffer, size_t ite
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Send one item into queue, waiting up to timeout_ms when full.
@@ -388,17 +392,17 @@ os_err_t os_queue_init_dynamic(os_queue_t *queue, size_t item_size, size_t capac
         {
             /* One critical section covers both the initialization and the ownership flag.
              *
-             * Setting buffer_owned in a second, separate critical section would leave the queue fully
-             * usable but still claiming it does not own its buffer. An os_queue_cleanup landing in that gap
-             * would reset the queue and, seeing buffer_owned false, walk away without freeing the
-             * allocation just made - a permanent leak of item_size * capacity bytes with nothing to
-             * report it. The window is only a few instructions wide, which is exactly the kind that
-             * survives testing and fails in the field.
+             * Setting buffer_owned in a second, separate critical section would leave the queue
+             * fully usable but still claiming it does not own its buffer. An os_queue_cleanup
+             * landing in that gap would reset the queue and, seeing buffer_owned false, walk away
+             * without freeing the allocation just made - a permanent leak of item_size * capacity
+             * bytes with nothing to report it. The window is only a few instructions wide, which is
+             * exactly the kind that survives testing and fails in the field.
              *
-             * os_queue_bind_buffer performs the waiter check and every field assignment, so this path
-             * leaves the object holding exactly what OS_QUEUE_INITIALIZER writes for the compile-time
-             * ones. It only fails here if the queue still has blocked waiters, in which case the
-             * allocation has to go back rather than leak. */
+             * os_queue_bind_buffer performs the waiter check and every field assignment, so this
+             * path leaves the object holding exactly what OS_QUEUE_INITIALIZER writes for the
+             * compile-time ones. It only fails here if the queue still has blocked waiters, in
+             * which case the allocation has to go back rather than leak. */
             os_critical_enter();
 
             status = os_queue_bind_buffer(queue, buffer, item_size, capacity);
@@ -461,29 +465,32 @@ os_err_t os_queue_cleanup(os_queue_t *queue)
         }
         else
         {
-        /* Emptied either way. The waiter lists are already empty - the check above just proved it -
-         * so re-initializing them only guarantees a tail left behind by a list bug cannot survive. */
-        queue->head  = 0U;
-        queue->tail  = 0U;
-        queue->count = 0U;
-        os_list_init(&queue->send_waiters);
-        os_list_init(&queue->receive_waiters);
+            /* Emptied either way. The waiter lists are already empty - the check above just proved
+             * it - so re-initializing them only guarantees a tail left behind by a list bug cannot
+             * survive.
+             */
+            queue->head  = 0U;
+            queue->tail  = 0U;
+            queue->count = 0U;
+            os_list_init(&queue->send_waiters);
+            os_list_init(&queue->receive_waiters);
 
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
-        if (queue->buffer_owned)
-        {
-            /* Dropped before the critical section ends so the queue cannot be used against a buffer
-             * that is about to be released; the freeing itself happens outside, since os_mem_free
-             * walks the heap free list and there is no reason to hold interrupts off for it. */
-            buffer_to_free      = queue->buffer;
-            queue->buffer       = NULL;
-            queue->item_size    = 0U;
-            queue->capacity     = 0U;
-            queue->buffer_owned = false;
-        }
+            if (queue->buffer_owned)
+            {
+                /* Dropped before the critical section ends so the queue cannot be used against a
+                 * buffer that is about to be released; the freeing itself happens outside, since
+                 * os_mem_free walks the heap free list and there is no reason to hold interrupts
+                 * off for it. */
+                buffer_to_free      = queue->buffer;
+                queue->buffer       = NULL;
+                queue->item_size    = 0U;
+                queue->capacity     = 0U;
+                queue->buffer_owned = false;
+            }
 #endif
 
-            status = OS_ERR_NONE;
+                status = OS_ERR_NONE;
         }
 
         os_critical_exit();
@@ -497,8 +504,7 @@ os_err_t os_queue_cleanup(os_queue_t *queue)
 
     return status;
 }
-
-#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+#endif /* OS_CONFIG_QUEUE_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -506,6 +512,8 @@ os_err_t os_queue_cleanup(os_queue_t *queue)
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Bind a queue to an item buffer at run time.
@@ -521,7 +529,8 @@ os_err_t os_queue_cleanup(os_queue_t *queue)
  * @param[in]     capacity   Number of items buffer can hold.
  * @return os_err_t    Status code.
  */
-static os_err_t os_queue_bind_buffer(os_queue_t *queue, void *buffer, size_t item_size, size_t capacity)
+static os_err_t os_queue_bind_buffer(os_queue_t *queue, void *buffer, size_t item_size,
+                                     size_t capacity)
 {
     os_err_t status = OS_ERR_INVALID_ARG;
 
@@ -557,7 +566,5 @@ static os_err_t os_queue_bind_buffer(os_queue_t *queue, void *buffer, size_t ite
 
     return status;
 }
-
 #endif /* OS_CONFIG_ALLOC_ENABLE */
-
 #endif /* OS_CONFIG_QUEUE_ENABLE */

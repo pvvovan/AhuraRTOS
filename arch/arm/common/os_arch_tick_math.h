@@ -34,6 +34,27 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Count the whole tick boundaries a suppressed window crossed.
+ */
+static inline uint32_t os_arch_tick_wraps(uint64_t reference_cycles,
+                                          uint32_t start_cvr, uint32_t end_cvr,
+                                          uint32_t period);
+
+/******************************************************************************************************/
+/**
+ * @brief Cycles left in the tick that was already running, for the reload after an early wake.
+ */
+static inline uint32_t os_arch_tick_remaining(uint32_t elapsed_cycles,
+                                              uint32_t head_cycles, uint32_t period);
+
+/*
+ * ***********************************************************************************************************
  * Public function implementations
  * ***********************************************************************************************************
 */

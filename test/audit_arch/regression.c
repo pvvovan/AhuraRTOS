@@ -9,6 +9,7 @@
  *            SPDX-License-Identifier: GPL-3.0-or-later
  *            See LICENSE in the project root for the full license text.
  */
+
 /*
  * ***********************************************************************************************************
  * Includes
@@ -20,7 +21,29 @@
 #include "../../kernel/os_delay.c"
 #include "../../arch/arm/common/os_arch_tick_math.h"
 
-volatile uint32_t test_failure;
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
+#define CHECK(condition)                                    \
+    do                                                      \
+    {                                                       \
+        if (!(condition))                                   \
+        {                                                   \
+            test_failure = __LINE__;                        \
+            __asm volatile("bkpt #0");                      \
+        }                                                   \
+    } while (0)
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
+__IO uint32_t test_failure;
 static uint32_t test_core;
 static uint32_t test_masks[2];
 static uint32_t test_ipis;
@@ -44,22 +67,19 @@ static uint32_t test_sleep_phase;
 __IO bool os_kernel_running;
 __IO uint32_t os_kernel_lock_count[OS_CONFIG_CORE_COUNT];
 
-#define CHECK(condition)                                    \
-    do                                                      \
-    {                                                       \
-        if (!(condition))                                   \
-        {                                                   \
-            test_failure = __LINE__;                        \
-            __asm volatile("bkpt #0");                      \
-        }                                                   \
-    } while (0)
-
 /*
  * ***********************************************************************************************************
- * Function implementations
+ * Public function implementations
  * ***********************************************************************************************************
 */
 
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_kernel_mask_save: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @return Opaque token for os_arch_kernel_mask_restore.
+ */
 uint32_t os_arch_kernel_mask_save(void)
 {
     if (test_migrate && !test_masks[test_core])
@@ -71,38 +91,99 @@ uint32_t os_arch_kernel_mask_save(void)
     test_masks[test_core] = 1U;
     return old;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_kernel_mask_restore: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @param[in] mask         Mask value.
+ */
 void os_arch_kernel_mask_restore(uint32_t mask)
 {
     test_masks[test_core] = mask;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_core_id_get: what this harness needs of it, with no kernel behind it.
+ *
+ * @return This core's index.
+ */
 uint32_t os_arch_core_id_get(void)
 {
     return test_core;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_in_isr: what this harness needs of it, with no kernel behind it.
+ *
+ * @return True when the caller is in interrupt context.
+ */
 bool os_arch_in_isr(void)
 {
     return true;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_isr_priority_check: what this harness needs of it, with no kernel
+ *        behind it.
+ */
 void os_arch_isr_priority_check(void)
 {
-     
+
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_tick_init: what this harness needs of it, with no kernel behind it.
+ */
 void os_arch_tick_init(void)
 {
-     
+
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_cycle_tick: what this harness needs of it, with no kernel behind it.
+ */
 void os_arch_cycle_tick(void)
 {
-     
+
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_kernel_is_running: what this harness needs of it, with no kernel behind
+ *        it.
+ *
+ * @return What this stand-in reports.
+ */
 bool os_kernel_is_running(void)
 {
     return false;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_reschedule_possible: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @return What this stand-in reports.
+ */
 bool os_task_reschedule_possible(void)
 {
     return false;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_tick_update: what this harness needs of it, with no kernel behind it.
+ *
+ * @param[in] elapsed      Ticks that have elapsed.
+ */
 void os_task_tick_update(uint32_t elapsed)
 {
     test_updated += elapsed;
@@ -112,14 +193,36 @@ void os_task_tick_update(uint32_t elapsed)
         test_sleep_phase = 6U;
     }
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_slice_tick: what this harness needs of it, with no kernel behind it.
+ *
+ * @param[in] elapsed      Ticks that have elapsed.
+ */
 void os_task_slice_tick(uint32_t elapsed)
 {
     (void)elapsed;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_sleep_ticks: what this harness needs of it, with no kernel behind it.
+ *
+ * @param[in] ticks        Tick periods.
+ */
 void os_task_sleep_ticks(uint32_t ticks)
 {
     (void)ticks; CHECK(false);
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_current_is_idle: what this harness needs of it, with no kernel behind
+ *        it.
+ *
+ * @return What this stand-in reports.
+ */
 bool os_task_current_is_idle(void)
 {
     /* The previous writer did not take the lock: this assertion detects A17. */
@@ -127,39 +230,97 @@ bool os_task_current_is_idle(void)
     test_lock_checks++;
     return test_idle;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_next_delay_ticks_get: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @return What this stand-in reports.
+ */
 uint32_t os_task_next_delay_ticks_get(void)
 {
     return test_next_deadline;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_max_suppressed_ticks_get: what this harness needs of it, with no
+ *        kernel behind it.
+ *
+ * @return What this stand-in reports.
+ */
 uint32_t os_arch_max_suppressed_ticks_get(void)
 {
     return 100U;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_min_suppressed_ticks_get: what this harness needs of it, with no
+ *        kernel behind it.
+ *
+ * @return What this stand-in reports.
+ */
 uint32_t os_arch_min_suppressed_ticks_get(void)
 {
     return 2U;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_elapsed_ticks_get: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @return What this stand-in reports.
+ */
 uint32_t os_arch_elapsed_ticks_get(void)
 {
     CHECK(test_sleep_phase == 3U);
     test_sleep_phase = 4U;
     return 50U;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_sleep_finish: what this harness needs of it, with no kernel behind
+ *        it.
+ */
 void os_arch_sleep_finish(void)
 {
     CHECK(test_sleep_phase == 6U);
     test_sleep_phase = 7U;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_tickless_pre_sleep_cb: what this harness needs of it, with no kernel
+ *        behind it.
+ */
 void os_tickless_pre_sleep_cb(void)
 {
     CHECK(test_sleep_phase == 1U);
     test_sleep_phase = 2U;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_tickless_post_sleep_cb: what this harness needs of it, with no kernel
+ *        behind it.
+ */
 void os_tickless_post_sleep_cb(void)
 {
     CHECK(test_sleep_phase == 4U);
     test_sleep_phase = 5U;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_soc_sleep_prepare_cb: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @return What this stand-in reports.
+ */
 bool os_arch_soc_sleep_prepare_cb(void)
 {
     CHECK(!test_locked && !os_tickless_window_open && test_masks[test_core] != 0U);
@@ -176,6 +337,12 @@ bool os_arch_soc_sleep_prepare_cb(void)
     }
     return true;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_soc_sleep_finish_cb: what this harness needs of it, with no kernel
+ *        behind it.
+ */
 void os_arch_soc_sleep_finish_cb(void)
 {
     CHECK(test_prepared && !test_locked && !os_tickless_window_open);
@@ -184,6 +351,13 @@ void os_arch_soc_sleep_finish_cb(void)
     test_finish_calls++;
     test_prepared = false;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Run one modeled tickless window of the requested length.
+ *
+ * @param[in] ticks        Tick periods.
+ */
 void audit_sleep(uint32_t ticks)
 {
     CHECK(test_core == 0U && !test_locked && ticks == test_next_deadline);
@@ -191,17 +365,41 @@ void audit_sleep(uint32_t ticks)
     test_sleep_phase = 3U;
     test_sleep_calls++;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_core_ipi_request_cb: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @param[in] core         Core index.
+ */
 void os_arch_core_ipi_request_cb(uint32_t core)
 {
     CHECK(test_locked && test_core == 1U && core == 0U);
     test_ipis++;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_spinlock_acquire: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @param[in] lock         Spinlock object.
+ */
 void os_arch_spinlock_acquire(os_arch_spinlock_t *lock)
 {
     (void)lock;
     CHECK(!test_locked);
     test_locked = true;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_spinlock_release: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @param[in] lock         Spinlock object.
+ */
 void os_arch_spinlock_release(os_arch_spinlock_t *lock)
 {
     (void)lock;
@@ -221,20 +419,48 @@ void os_arch_spinlock_release(os_arch_spinlock_t *lock)
         test_core = 1U;
     }
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_delay_counter_hz_get: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @return What this stand-in reports.
+ */
 uint32_t os_arch_delay_counter_hz_get(void)
 {
     return test_hz;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_delay_counter_get: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @return What this stand-in reports.
+ */
 uint32_t os_arch_delay_counter_get(void)
 {
     return test_clock++;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_config_fault_trap: what this harness needs of it, with no kernel
+ *        behind it.
+ */
 void os_arch_config_fault_trap(void)
 {
     CHECK(test_fault_expected);
     __asm volatile("bkpt #0");
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: the far core reads time from the same origin.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_remote_time_origin(void)
 {
     test_core = 1U;
@@ -243,7 +469,8 @@ uint32_t test_remote_time_origin(void)
     test_reconcile = true;
 
     /* A bare tick read is deliberately allowed to be behind while a window is outstanding: making
-     * it current cost 147 cycles through the lock and 454 through the wake source, both measured. */
+     * it current cost 147 cycles through the lock and 454 through the wake source, both measured.
+     */
     CHECK(os_tick_get() == 100U);
     CHECK(!test_locked && test_ipis == 0U && test_updated == 0U);
 
@@ -258,6 +485,12 @@ uint32_t test_remote_time_origin(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: time read under the raw lock matches the kernel view.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_raw_lock_time_origin(void)
 {
     test_core = 1U;
@@ -270,6 +503,12 @@ uint32_t test_raw_lock_time_origin(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: window ownership moves with the task.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_tickless_owner_migration(void)
 {
     test_core = 0U;
@@ -281,6 +520,12 @@ uint32_t test_tickless_owner_migration(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: only the owner closes the window it opened.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_tickless_owner_window(void)
 {
     test_core = 0U;
@@ -292,6 +537,12 @@ uint32_t test_tickless_owner_window(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: the SoC declines the sleep, so no window opens.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_sleep_prepare_declines(void)
 {
     os_tick_count = 10U;
@@ -303,6 +554,12 @@ uint32_t test_sleep_prepare_declines(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: a deadline too near to be worth a window.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_sleep_prepare_short_deadline(void)
 {
     os_tick_count = 10U;
@@ -315,6 +572,12 @@ uint32_t test_sleep_prepare_short_deadline(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: a deadline that arrives while planning.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_sleep_prepare_replans_deadline(void)
 {
     os_tick_count = 10U;
@@ -326,6 +589,12 @@ uint32_t test_sleep_prepare_replans_deadline(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: the CPU-usage writer takes the lock it must.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_usage_writer_lock(void)
 {
     test_idle = false;
@@ -343,6 +612,12 @@ uint32_t test_usage_writer_lock(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: a busy-wait with interrupts masked still advances.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_masked_busy_wait(void)
 {
     os_critical_enter();
@@ -356,6 +631,12 @@ uint32_t test_masked_busy_wait(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: no busy-wait counter is a configuration fault.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_missing_busy_wait_counter(void)
 {
     test_hz = 0U;
@@ -365,6 +646,12 @@ uint32_t test_missing_busy_wait_counter(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: tick phase arithmetic across a wrap.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_tick_phase_arithmetic(void)
 {
     uint32_t period = 1000U;

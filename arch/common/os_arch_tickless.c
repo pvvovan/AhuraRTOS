@@ -29,19 +29,17 @@
  *            See LICENSE in the project root for the full license text.
  */
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #ifndef OS_ARCH_PORT_TRANSLATION_UNIT
 #error "os_arch_tickless.c is a textual include, not a translation unit. Compile arch/<family>/<core>/os_arch_port.c instead - it defines OS_ARCH_PORT_TRANSLATION_UNIT and includes this. See doc/installation.md."
 #endif
 
-
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U)
-
-/*
- * ***********************************************************************************************************
- * Port answers - defaults for a port that does not override them
- * ***********************************************************************************************************
-*/
-
 #ifndef OS_ARCH_TICKLESS_TICK_SILENCE
 /** No periodic tick of this port's own to silence: the SoC owns the tick timer. */
 #define OS_ARCH_TICKLESS_TICK_SILENCE()   do { } while (0)
@@ -62,9 +60,11 @@
 #endif
 
 #ifndef OS_ARCH_TICKLESS_SELF_SUPPRESS
-/** This port cannot stretch its own tick timer; a SoC wake source is the only way to open a window. */
+/** This port cannot stretch its own tick timer; a SoC wake source is the only way to open a
+ *  window. */
 #define OS_ARCH_TICKLESS_SELF_SUPPRESS    0
 #endif
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -72,8 +72,10 @@
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
 /** Ticks the current window was opened for, 0 when none is open. Non-zero is the only reason to
- *  ask a wake source how long a window lasted; the value is the ceiling that answer is clamped to. */
+ *  ask a wake source how long a window lasted; the value is the ceiling that answer is clamped
+ *  to. */
 static __IO uint32_t os_arch_tickless_planned = 0U;
 
 #if (OS_ARCH_TICKLESS_SELF_SUPPRESS == 1)
@@ -81,16 +83,21 @@ static __IO uint32_t os_arch_tickless_planned = 0U;
  *  has both needs to ask. */
 static __IO bool os_arch_tickless_soc_window = false;
 #endif
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
 
 /*
  * ***********************************************************************************************************
- * SoC callbacks - weak defaults
+ * Public function implementations
  * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/* SoC callbacks - weak defaults.
  *
  * The entire interface to a package's wake source. Nothing above names a timer, so the same code
  * serves a part nobody has packaged yet. A package that defines none of them suppresses nothing:
  * the ceiling answers 0, the kernel skips the sleep, and idle stays a plain WFI.
-*/
+ */
 
 /******************************************************************************************************/
 /**
@@ -136,12 +143,6 @@ OS_WEAK uint32_t os_arch_tick_resume_cb(void)
 {
     return 0U;
 }
-
-/*
- * ***********************************************************************************************************
- * Public function implementations
- * ***********************************************************************************************************
-*/
 
 /******************************************************************************************************/
 /**
@@ -298,5 +299,4 @@ void os_arch_sleep_finish(void)
     os_arch_tickless_self_finish();
 #endif
 }
-
 #endif /* OS_CONFIG_TICKLESS_ENABLE */

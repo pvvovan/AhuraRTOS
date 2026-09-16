@@ -24,15 +24,15 @@
 
 #include <stdio.h>
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #if !(OS_CONFIG_EVENT_ENABLE == 1U)
 #error "os_main_event.c needs OS_CONFIG_EVENT_ENABLE=1 in os_config.h"
 #endif
-
-/*
- * ***********************************************************************************************************
- * Private objects
- * ***********************************************************************************************************
-*/
 
 #define BIT_A (1UL << 0)
 #define BIT_B (1UL << 1)
@@ -47,6 +47,12 @@
     OS_TASK_CONFIG((entry), (context), (priority), OS_TASK_CORE_ANY)
 #endif
 
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
 OS_TASK_DEFINE(task_a, 512U);
 OS_TASK_DEFINE(task_b, 512U);
 
@@ -54,35 +60,21 @@ static os_event_t os_main_event;
 
 /*
  * ***********************************************************************************************************
- * Private function implementations
+ * Private function prototypes
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
-static void task_a_entry(void *context)
-{
-    (void)context;
-
-    while (1)
-    {
-        os_delay_ms(300U);
-        printf("[event] task_a setting BIT_A\r\n");
-        (void)os_event_set_bits(&os_main_event, BIT_A);
-    }
-}
+/**
+ * @brief Wait for the event bits task B sets, then report.
+ */
+static void task_a_entry(void *context);
 
 /******************************************************************************************************/
-static void task_b_entry(void *context)
-{
-    (void)context;
-
-    while (1)
-    {
-        os_delay_ms(500U);
-        printf("[event] task_b setting BIT_B\r\n");
-        (void)os_event_set_bits(&os_main_event, BIT_B);
-    }
-}
+/**
+ * @brief Set the event bits task A is waiting on.
+ */
+static void task_b_entry(void *context);
 
 /*
  * ***********************************************************************************************************
@@ -110,5 +102,47 @@ void os_main(void)
 
         (void)os_event_wait_bits(&os_main_event, BIT_A | BIT_B, true, true, &matched, OS_WAIT_FOREVER);
         printf("[event] both BIT_A and BIT_B observed (matched=%lu)\r\n", (unsigned long)matched);
+    }
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Wait for the event bits task B sets, then report.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
+static void task_a_entry(void *context)
+{
+    (void)context;
+
+    while (1)
+    {
+        os_delay_ms(300U);
+        printf("[event] task_a setting BIT_A\r\n");
+        (void)os_event_set_bits(&os_main_event, BIT_A);
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Set the event bits task A is waiting on.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
+static void task_b_entry(void *context)
+{
+    (void)context;
+
+    while (1)
+    {
+        os_delay_ms(500U);
+        printf("[event] task_b setting BIT_B\r\n");
+        (void)os_event_set_bits(&os_main_event, BIT_B);
     }
 }

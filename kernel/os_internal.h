@@ -10,6 +10,12 @@
 #ifndef OS_INTERNAL_H
 #define OS_INTERNAL_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "ahura.h"
 #include "os_arch_port.h"
 
@@ -20,27 +26,111 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Internal function prototypes
+ * Macros
  * ***********************************************************************************************************
 */
 
-/*
- * ***********************************************************************************************************
- * PART 1 - ALWAYS AVAILABLE
- * ***********************************************************************************************************
-*/
+#if (OS_CONFIG_MUTEX_ENABLE == 1U) && (OS_CONFIG_ASSERT_ENABLE == 1U)
+/* Mutex deadlock detection - development builds only.
+ *
+ * Tied to OS_CONFIG_ASSERT_ENABLE rather than carrying a switch of its own, because an assertion is
+ * the only way it can report: with assertions compiled out it would walk the wait chain and then
+ * throw the answer away. Off also means the TCB does not carry the field this needs, so a release
+ * build pays neither the RAM nor the walk.
+ *
+ * Worth having on in development precisely because priority inheritance cannot help here. A
+ * deadlock is an ORDERING fault - two tasks taking the same two mutexes in opposite orders - while
+ * inheritance only fixes the TIMING of a wait. Nothing the scheduler can do breaks a cycle, so
+ * without this the symptom is a board that silently stops, with every task blocked and nothing
+ * pointing at which lock pair caused it.
+ */
+
+#define OS_MUTEX_DEADLOCK_CHECK  1
+#else
+#define OS_MUTEX_DEADLOCK_CHECK  0
+#endif
+
+/* Longest wait chain either walk follows: the most mutexes a reported deadlock can name, and the
+ * most links a priority boost is carried along. Defined outside the debug guard below because
+ * priority inheritance uses it in every build, not only in one with assertions on.
+ *
+ * The bound is load-bearing rather than decorative. A cycle that has already formed among other
+ * tasks would otherwise be walked forever - inside a critical section, on the path of an ordinary
+ * mutex lock. Eight is far past any sane nesting depth; a design needing more than a couple of held
+ * mutexes at once has a lock-ordering problem neither walk can fix. */
+#define OS_TASK_DEADLOCK_MAX_DEPTH   8U
 
 /*
  * ***********************************************************************************************************
- * Tasks and the scheduler
+ * Types
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
 /**
- * @brief Initialize the task management subsystem (os_task.c).
+ * @brief Waker-side condition callback for os_task_waiters_wake_match: receives one waiter's
+ *        wait data; returns true to wake that waiter and stores its delivery in *result_out.
  */
-void os_task_system_init(void);
+typedef bool (*os_task_wait_match_fn)(uint32_t data0, uint32_t data1, void *context, uint32_t *result_out);
+
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
+/* Task notification mailbox - the storage os_notify.c works on.
+ *
+ * The mailbox lives in the TCB because it belongs to the task, not to any object; os_notify.c owns
+ * what it MEANS. These three calls are the whole surface between them - os_task.c never reads or
+ * writes a slot, and os_notify.c never sees a TCB - and they join os_task_tcb_resolve,
+ * os_task_wake_tcb and os_task_sleep_ticks, which the notify module uses as they stand.
+ */
+
+/******************************************************************************************************/
+/**
+ * @brief One task's notification mailbox: a value with overwrite semantics, plus the two flags
+ *        that say whether one is latched and whether the owner is parked waiting for it.
+ */
+typedef struct
+{
+    uint32_t value;   /* latched value (overwrite: last os_notify_give wins)          */
+    bool     pending; /* a value is latched, waiting to be consumed by os_notify_wait */
+    bool     waiting; /* true only while the task is blocked inside os_notify_wait    */
+
+} os_notify_slot_t;
+#endif /* OS_CONFIG_NOTIFY_ENABLE */
+
+#if (OS_MUTEX_DEADLOCK_CHECK == 1)
+/******************************************************************************************************/
+/**
+ * @brief What the last detected deadlock consisted of - written the instant a cycle is found, and
+ *        left in RAM for the debugger.
+ *
+ * This exists because an assertion can only carry a file and a line, and those are always the same
+ * ones inside os_mutex.c: "a deadlock happened" without saying between what. Nor can the details be
+ * printed on the way down. The kernel log is a ring drained by a task, and that task will never run
+ * again once the core parks; calling the output transport directly from here would be worse still,
+ * since a DMA-based os_log_output_cb would wait forever for a completion interrupt that cannot
+ * arrive with interrupts masked.
+ *
+ * So it is left where a halted core can still be asked: break in after the assert and read
+ * os_task_deadlock_report. A deliberately non-static symbol, so it can be found by name in the map
+ * file of a build with no debug info at all. `requested` is NULL until something is recorded.
+ */
+typedef struct
+{
+    const os_mutex_t *requested;    /* mutex the blocking task asked for                         */
+    const char       *waiter_name;  /* task that was about to block (NULL if unnamed)            */
+    uint32_t          waiter_id;
+    const char       *owner_name;   /* task holding `requested`, i.e. the one it waits behind    */
+    uint32_t          owner_id;
+    uint32_t          cycle_length; /* mutexes in the cycle: 1 = it waits behind itself, 2 = pair */
+    const os_mutex_t *cycle[OS_TASK_DEADLOCK_MAX_DEPTH]; /* those mutexes, in the order walked   */
+
+} os_task_deadlock_report_t;
+#endif /* OS_MUTEX_DEADLOCK_CHECK */
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
 
 /*
  * Scheduler-lock state, defined in os_kernel.c and read directly here rather than through
@@ -58,6 +148,31 @@ extern __IO uint32_t os_kernel_lock_count[OS_CONFIG_CORE_COUNT];
 extern __IO bool os_kernel_running;
 extern __IO bool     os_kernel_switch_pending[OS_CONFIG_CORE_COUNT];
 
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/* Raised by core 0 for as long as a suppressed window is outstanding. Read directly, like
+ * os_kernel_lock_count above: os_critical_enter asks on every outermost entry and the answer is
+ * almost always false, so the question has to be a load rather than a call. */
+extern __IO bool os_tickless_window_open;
+#endif
+#endif
+
+#if (OS_MUTEX_DEADLOCK_CHECK == 1)
+extern os_task_deadlock_report_t os_task_deadlock_report;
+#endif /* OS_MUTEX_DEADLOCK_CHECK */
+
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Initialize the task management subsystem (os_task.c).
+ */
+void os_task_system_init(void);
+
 /******************************************************************************************************/
 /**
  * @brief Create the mandatory idle task (os_task.c).
@@ -72,7 +187,8 @@ bool os_task_idle_is_created(void);
 
 /******************************************************************************************************/
 /**
- * @brief Update task delays with elapsed kernel ticks; wakes expired tasks (os_task.c, ISR context).
+ * @brief Update task delays with elapsed kernel ticks; wakes expired tasks (os_task.c, ISR
+ *        context).
  */
 void os_task_tick_update(uint32_t elapsed_ticks);
 
@@ -154,13 +270,6 @@ uint32_t os_task_wait_result_get(void);
 
 /******************************************************************************************************/
 /**
- * @brief Waker-side condition callback for os_task_waiters_wake_match: receives one waiter's
- *        wait data; returns true to wake that waiter and stores its delivery in *result_out.
- */
-typedef bool (*os_task_wait_match_fn)(uint32_t data0, uint32_t data1, void *context, uint32_t *result_out);
-
-/******************************************************************************************************/
-/**
  * @brief Wake every waiter whose condition the callback confirms, storing each waiter's result
  *        for os_task_wait_result_get. Call inside a critical section; ISR-safe (os_task.c).
  *
@@ -217,7 +326,8 @@ void os_task_stack_save_current(uint32_t *stack_ptr);
 
 /******************************************************************************************************/
 /**
- * @brief Select the next task to run and return its stack pointer; never NULL (os_task.c, called from PendSV).
+ * @brief Select the next task to run and return its stack pointer; never NULL (os_task.c, called
+ *        from PendSV).
  */
 uint32_t* os_task_stack_select_next(void);
 
@@ -235,45 +345,19 @@ uint32_t os_task_next_delay_ticks_get(void);
 void os_tickless_deadline_armed(void);
 
 #if (OS_CONFIG_CORE_COUNT > 1U)
-/* Raised by core 0 for as long as a suppressed window is outstanding. Read directly, like
- * os_kernel_lock_count above: os_critical_enter asks on every outermost entry and the answer is
- * almost always false, so the question has to be a load rather than a call. */
-extern __IO bool os_tickless_window_open;
-
 /* The slow path, entered only once that flag is actually up. Called with the kernel spinlock held.
  * True means release/retry while core 0 closes its window. The caller passes its own core id: it
  * already fetched it on this path, and the spinlock is held, so re-reading the SoC CPUID here
  * would be pure overhead on the hottest path in the kernel. */
+/******************************************************************************************************/
+/**
+ * @brief Wait out core 0's suppressed window; true means drop the lock and retry.
+ */
 bool os_tickless_remote_window_wait(uint32_t core);
 #endif
-
 #endif
 
 #if (OS_CONFIG_NOTIFY_ENABLE == 1U)
-/*
- * ***********************************************************************************************************
- * Task notification mailbox - the storage os_notify.c works on
- * ***********************************************************************************************************
- *
- * The mailbox lives in the TCB because it belongs to the task, not to any object; os_notify.c owns
- * what it MEANS. These three calls are the whole surface between them - os_task.c never reads or
- * writes a slot, and os_notify.c never sees a TCB - and they join os_task_tcb_resolve,
- * os_task_wake_tcb and os_task_sleep_ticks, which the notify module uses as they stand.
-*/
-
-/******************************************************************************************************/
-/**
- * @brief One task's notification mailbox: a value with overwrite semantics, plus the two flags
- *        that say whether one is latched and whether the owner is parked waiting for it.
- */
-typedef struct
-{
-    uint32_t value;   /* latched value (overwrite: last os_notify_give wins)          */
-    bool     pending; /* a value is latched, waiting to be consumed by os_notify_wait */
-    bool     waiting; /* true only while the task is blocked inside os_notify_wait    */
-
-} os_notify_slot_t;
-
 /******************************************************************************************************/
 /**
  * @brief The calling task's TCB handle, or NULL for the idle task and before the scheduler starts
@@ -294,12 +378,6 @@ os_notify_slot_t* os_task_notify_slot(void *tcb_handle);
 bool os_task_tcb_is_blocked(const void *tcb_handle);
 #endif /* OS_CONFIG_NOTIFY_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Tick
- * ***********************************************************************************************************
-*/
-
 /******************************************************************************************************/
 /**
  * @brief Initialize the kernel tick source and bookkeeping (os_tick.c).
@@ -318,12 +396,6 @@ void os_tick_handler(void);
  */
 void os_tick_announce(uint32_t elapsed_ticks);
 
-/*
- * ***********************************************************************************************************
- * Internal helpers
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_CORE_COUNT > 1U)
 /******************************************************************************************************/
 /**
@@ -337,11 +409,195 @@ void os_critical_multicore_lock(void);
  * @brief Release the cross-core kernel spinlock acquired by os_critical_multicore_lock.
  */
 void os_critical_multicore_unlock(void);
-#else
-/* No cross-core exclusion needed on single-core builds: the local kernel mask
- * (already raised by every caller) is already sufficient by itself. */
-OS_INLINE void os_critical_multicore_lock(void)   { }
-OS_INLINE void os_critical_multicore_unlock(void) { }
+#endif
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/* PART 2 - CONFIGURABLE.
+ *
+ * Same order as PART 2 of ahura.h and of os_config.h. Every prototype here is
+ * behind the guard of the module that DEFINES it, so a disabled feature cannot
+ * leave a declaration pointing at a symbol that was never compiled.
+ */
+
+/******************************************************************************************************/
+/**
+ * @brief Link a just-acquired mutex into the calling task's owned-mutex list (os_task.c,
+ *        call inside the same critical section as the successful lock).
+ */
+void os_task_mutex_owner_link(os_list_node_t *owner_node);
+
+/******************************************************************************************************/
+/**
+ * @brief Boost owner_task_id's effective priority to the calling (waiting) task's effective
+ *        priority if that is higher, then walk the blocked_on_mutex chain so every owner behind
+ *        it is raised too (os_task.c, call inside a critical section, right before joining the
+ *        mutex's waiter list).
+ */
+void os_task_mutex_priority_inherit(uint32_t owner_task_id);
+
+/******************************************************************************************************/
+/**
+ * @brief Unlink a released mutex from the owned-mutex list of the task owner_id names - not the
+ *        calling task, which need not be the owner - and recompute that owner's effective
+ *        priority as max(base_priority, highest waiter still queued on any mutex it still holds)
+ *        (os_task.c, call inside a critical section, right after releasing).
+ */
+void os_task_mutex_owner_unlink_and_reprioritize(uint32_t owner_id, os_list_node_t *owner_node);
+
+/******************************************************************************************************/
+/**
+ * @brief Release the priority boost the CALLING task handed a mutex owner, now that it is leaving
+ *        the waiter queue without having acquired (os_task.c, call inside a critical section, once
+ *        the task is off the waiter list).
+ *
+ * The counterpart to os_task_mutex_priority_inherit. A boost is a debt owed for as long as the
+ * waiter is queued; os_mutex_unlock is only the most common way that ends, and the others - the
+ * wait timing out, the waiter being paused or deleted - would otherwise leave the owner running at
+ * a priority nothing is waiting on until it happened to unlock. Pause and delete are handled inside
+ * os_task.c; this is the entry point for the timeout paths in os_mutex.c.
+ */
+void os_task_mutex_waiter_depart(void);
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Record the mutex the calling task is about to block on, so another task's chain walk can
+ *        follow it (os_task.c, call inside the same critical section as the wait). Cleared for the
+ *        caller by os_task_wait_end().
+ *
+ * Call it for EVERY blocking mutex wait. Priority inheritance follows this edge to find the task
+ * a boost actually has to reach, and a waiter that will time out still blocks the owner - and still
+ * inverts priorities - for as long as its timeout lasts.
+ *
+ * `forever` says whether the wait is an unbounded one, which is the narrower question the deadlock
+ * walk asks: a task that will give up breaks any cycle it is part of, so reporting it would be a
+ * false alarm. That distinction used to be carried by simply not publishing the edge; it has its
+ * own flag now because the two walks want different subsets of the same information.
+ */
+void os_task_mutex_blocked_on_set(const os_mutex_t *mutex, bool forever);
+#endif
+
+#if (OS_MUTEX_DEADLOCK_CHECK == 1)
+/******************************************************************************************************/
+/**
+ * @brief Report whether blocking the calling task on this mutex would close a wait cycle - i.e.
+ *        deadlock (os_task.c, call inside a critical section, right before joining the waiter
+ *        list). Diagnostic only: it detects, it cannot recover.
+ */
+bool os_task_mutex_deadlock_check(const os_mutex_t *mutex);
+#endif /* OS_MUTEX_DEADLOCK_CHECK */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Create and start the kernel timer service task (os_timer.c).
+ */
+os_err_t os_timer_system_init(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Advance all registered software timers by elapsed ticks (os_timer.c, ISR context).
+ */
+void os_timer_tick_process(uint32_t elapsed_ticks);
+
+/******************************************************************************************************/
+/**
+ * @brief Return ticks until the next active timer expiry, UINT32_MAX when none (os_timer.c).
+ */
+uint32_t os_timer_next_expiry_ticks_get(void);
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Create and start the kernel log service task (os_log.c).
+ */
+os_err_t os_log_system_init(void);
+#endif /* OS_CONFIG_LOG_ENABLE */
+
+#if (OS_CONFIG_CORE_COUNT == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Nothing to take on a single-core build: the local kernel mask every caller holds is
+ *        sufficient by itself.
+ */
+OS_INLINE void os_critical_multicore_lock(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Nothing to release on a single-core build (see os_critical_multicore_lock).
+ */
+OS_INLINE void os_critical_multicore_unlock(void);
+#endif
+
+/******************************************************************************************************/
+/**
+ * @brief Freeze migration across a read of this core's id AND the per-core slot it indexes.
+ */
+OS_FORCE_INLINE uint32_t os_internal_migration_lock(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Release os_internal_migration_lock. Nothing at all on a single-core build.
+ */
+OS_FORCE_INLINE void os_internal_migration_unlock(uint32_t mask_state);
+
+/******************************************************************************************************/
+/**
+ * @brief Check whether the caller is allowed to block (task context, scheduler running and not
+ *        locked).
+ */
+OS_FORCE_INLINE bool os_internal_can_block(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Convert a millisecond timeout to ticks, preserving OS_WAIT_FOREVER and saturating
+ *        huge finite values one tick short of the sentinel (a finite request must never
+ *        silently become "wait forever").
+ */
+OS_INLINE uint32_t os_internal_timeout_to_ticks(uint32_t timeout_ms);
+
+/******************************************************************************************************/
+/**
+ * @brief The tick a timeout is measured FROM. Current even while a suppressed window is open.
+ */
+OS_INLINE uint32_t os_internal_wait_origin(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Remaining wait budget measured against the wall clock: budget minus ticks elapsed
+ *        since start_tick (wrap-safe), never below 0, OS_WAIT_FOREVER passed through.
+ */
+OS_INLINE uint32_t os_internal_wait_remaining(uint32_t budget_ticks, uint32_t start_tick);
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_CORE_COUNT == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Nothing to take on a single-core build: the local kernel mask every caller holds is
+ *        sufficient by itself.
+ *
+ * @return None.
+ */
+OS_INLINE void os_critical_multicore_lock(void)
+{
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Nothing to release on a single-core build (see os_critical_multicore_lock).
+ *
+ * @return None.
+ */
+OS_INLINE void os_critical_multicore_unlock(void)
+{
+}
 #endif
 
 /******************************************************************************************************/
@@ -393,6 +649,8 @@ OS_FORCE_INLINE void os_internal_migration_unlock(uint32_t mask_state)
  * A scheduler lock defers the very context switch blocking depends on, so a primitive that blocked
  * under one would leave its task running while the kernel had it parked. Every blocking primitive
  * therefore degrades to its OS_WAIT_NOTHING behaviour there, exactly as it does in an ISR.
+ *
+ * @return True when the caller may block.
  */
 OS_FORCE_INLINE bool os_internal_can_block(void)
 {
@@ -410,6 +668,9 @@ OS_FORCE_INLINE bool os_internal_can_block(void)
  * @brief Convert a millisecond timeout to ticks, preserving OS_WAIT_FOREVER and saturating
  *        huge finite values one tick short of the sentinel (a finite request must never
  *        silently become "wait forever").
+ *
+ * @param[in] timeout_ms   Timeout in milliseconds, or OS_WAIT_FOREVER.
+ * @return The timeout in ticks, OS_WAIT_FOREVER preserved.
  */
 OS_INLINE uint32_t os_internal_timeout_to_ticks(uint32_t timeout_ms)
 {
@@ -444,6 +705,8 @@ OS_INLINE uint32_t os_internal_timeout_to_ticks(uint32_t timeout_ms)
  * The flag test costs one load, and the reconcile costs a critical section only while a window is
  * genuinely open - which is the same critical section the caller takes on its very next line, so
  * on the path that pays, nothing new is woken.
+ *
+ * @return The tick a timeout is measured from.
  */
 OS_INLINE uint32_t os_internal_wait_origin(void)
 {
@@ -476,6 +739,10 @@ OS_INLINE uint32_t os_internal_wait_origin(void)
  * Blocking primitives recompute their budget with this after every spurious wake, so time
  * spent READY (preempted between wake and re-check) counts against the timeout - a relative
  * re-arm would freeze the clock and stretch timeouts unboundedly under wake traffic.
+ *
+ * @param[in] budget_ticks Ticks the wait was granted in total.
+ * @param[in] start_tick   Tick the wait started on.
+ * @return Ticks left of the budget, never below 0.
  */
 OS_INLINE uint32_t os_internal_wait_remaining(uint32_t budget_ticks, uint32_t start_tick)
 {
@@ -490,198 +757,6 @@ OS_INLINE uint32_t os_internal_wait_remaining(uint32_t budget_ticks, uint32_t st
 
     return result;
 }
-
-/*
- * ***********************************************************************************************************
- * PART 2 - CONFIGURABLE
- * ***********************************************************************************************************
- *
- * Same order as PART 2 of ahura.h and of os_config.h. Every prototype here is
- * behind the guard of the module that DEFINES it, so a disabled feature cannot
- * leave a declaration pointing at a symbol that was never compiled.
-*/
-
-/*
- * ***********************************************************************************************************
- * Mutex priority inheritance - OS_CONFIG_MUTEX_ENABLE
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Link a just-acquired mutex into the calling task's owned-mutex list (os_task.c,
- *        call inside the same critical section as the successful lock).
- */
-void os_task_mutex_owner_link(os_list_node_t *owner_node);
-
-/******************************************************************************************************/
-/**
- * @brief Boost owner_task_id's effective priority to the calling (waiting) task's effective
- *        priority if that is higher, then walk the blocked_on_mutex chain so every owner behind
- *        it is raised too (os_task.c, call inside a critical section, right before joining the
- *        mutex's waiter list).
- */
-void os_task_mutex_priority_inherit(uint32_t owner_task_id);
-
-/******************************************************************************************************/
-/**
- * @brief Unlink a released mutex from the owned-mutex list of the task owner_id names - not the
- *        calling task, which need not be the owner - and recompute that owner's effective
- *        priority as max(base_priority, highest waiter still queued on any mutex it still holds)
- *        (os_task.c, call inside a critical section, right after releasing).
- */
-void os_task_mutex_owner_unlink_and_reprioritize(uint32_t owner_id, os_list_node_t *owner_node);
-
-/******************************************************************************************************/
-/**
- * @brief Release the priority boost the CALLING task handed a mutex owner, now that it is leaving
- *        the waiter queue without having acquired (os_task.c, call inside a critical section, once
- *        the task is off the waiter list).
- *
- * The counterpart to os_task_mutex_priority_inherit. A boost is a debt owed for as long as the
- * waiter is queued; os_mutex_unlock is only the most common way that ends, and the others - the
- * wait timing out, the waiter being paused or deleted - would otherwise leave the owner running at
- * a priority nothing is waiting on until it happened to unlock. Pause and delete are handled inside
- * os_task.c; this is the entry point for the timeout paths in os_mutex.c.
- */
-void os_task_mutex_waiter_depart(void);
-#endif /* OS_CONFIG_MUTEX_ENABLE */
-
-/*
- * ***********************************************************************************************************
- * Mutex deadlock detection - development builds only
- * ***********************************************************************************************************
- *
- * Tied to OS_CONFIG_ASSERT_ENABLE rather than carrying a switch of its own, because an assertion is
- * the only way it can report: with assertions compiled out it would walk the wait chain and then
- * throw the answer away. Off also means the TCB does not carry the field this needs, so a release
- * build pays neither the RAM nor the walk.
- *
- * Worth having on in development precisely because priority inheritance cannot help here. A
- * deadlock is an ORDERING fault - two tasks taking the same two mutexes in opposite orders - while
- * inheritance only fixes the TIMING of a wait. Nothing the scheduler can do breaks a cycle, so
- * without this the symptom is a board that silently stops, with every task blocked and nothing
- * pointing at which lock pair caused it.
-*/
-#if (OS_CONFIG_MUTEX_ENABLE == 1U) && (OS_CONFIG_ASSERT_ENABLE == 1U)
-#define OS_MUTEX_DEADLOCK_CHECK  1
-#else
-#define OS_MUTEX_DEADLOCK_CHECK  0
-#endif
-
-/* Longest wait chain either walk follows: the most mutexes a reported deadlock can name, and the
- * most links a priority boost is carried along. Defined outside the debug guard below because
- * priority inheritance uses it in every build, not only in one with assertions on.
- *
- * The bound is load-bearing rather than decorative. A cycle that has already formed among other
- * tasks would otherwise be walked forever - inside a critical section, on the path of an ordinary
- * mutex lock. Eight is far past any sane nesting depth; a design needing more than a couple of held
- * mutexes at once has a lock-ordering problem neither walk can fix. */
-#define OS_TASK_DEADLOCK_MAX_DEPTH   8U
-
-#if (OS_MUTEX_DEADLOCK_CHECK == 1)
-
-/******************************************************************************************************/
-/**
- * @brief What the last detected deadlock consisted of - written the instant a cycle is found, and
- *        left in RAM for the debugger.
- *
- * This exists because an assertion can only carry a file and a line, and those are always the same
- * ones inside os_mutex.c: "a deadlock happened" without saying between what. Nor can the details be
- * printed on the way down. The kernel log is a ring drained by a task, and that task will never run
- * again once the core parks; calling the output transport directly from here would be worse still,
- * since a DMA-based os_log_output_cb would wait forever for a completion interrupt that cannot
- * arrive with interrupts masked.
- *
- * So it is left where a halted core can still be asked: break in after the assert and read
- * os_task_deadlock_report. A deliberately non-static symbol, so it can be found by name in the map
- * file of a build with no debug info at all. `requested` is NULL until something is recorded.
- */
-typedef struct
-{
-    const os_mutex_t *requested;    /* mutex the blocking task asked for                         */
-    const char       *waiter_name;  /* task that was about to block (NULL if unnamed)            */
-    uint32_t          waiter_id;
-    const char       *owner_name;   /* task holding `requested`, i.e. the one it waits behind    */
-    uint32_t          owner_id;
-    uint32_t          cycle_length; /* mutexes in the cycle: 1 = it waits behind itself, 2 = pair */
-    const os_mutex_t *cycle[OS_TASK_DEADLOCK_MAX_DEPTH]; /* those mutexes, in the order walked   */
-
-} os_task_deadlock_report_t;
-
-extern os_task_deadlock_report_t os_task_deadlock_report;
-
-#endif /* OS_MUTEX_DEADLOCK_CHECK */
-
-/******************************************************************************************************/
-/**
- * @brief Record the mutex the calling task is about to block on, so another task's chain walk can
- *        follow it (os_task.c, call inside the same critical section as the wait). Cleared for the
- *        caller by os_task_wait_end().
- *
- * Call it for EVERY blocking mutex wait. Priority inheritance follows this edge to find the task
- * a boost actually has to reach, and a waiter that will time out still blocks the owner - and still
- * inverts priorities - for as long as its timeout lasts.
- *
- * `forever` says whether the wait is an unbounded one, which is the narrower question the deadlock
- * walk asks: a task that will give up breaks any cycle it is part of, so reporting it would be a
- * false alarm. That distinction used to be carried by simply not publishing the edge; it has its
- * own flag now because the two walks want different subsets of the same information.
- */
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-void os_task_mutex_blocked_on_set(const os_mutex_t *mutex, bool forever);
-#endif
-
-#if (OS_MUTEX_DEADLOCK_CHECK == 1)
-/******************************************************************************************************/
-/**
- * @brief Report whether blocking the calling task on this mutex would close a wait cycle - i.e.
- *        deadlock (os_task.c, call inside a critical section, right before joining the waiter
- *        list). Diagnostic only: it detects, it cannot recover.
- */
-bool os_task_mutex_deadlock_check(const os_mutex_t *mutex);
-#endif /* OS_MUTEX_DEADLOCK_CHECK */
-
-/*
- * ***********************************************************************************************************
- * Software timers            - OS_CONFIG_TIMER_ENABLE
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_TIMER_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Create and start the kernel timer service task (os_timer.c).
- */
-os_err_t os_timer_system_init(void);
-
-/******************************************************************************************************/
-/**
- * @brief Advance all registered software timers by elapsed ticks (os_timer.c, ISR context).
- */
-void os_timer_tick_process(uint32_t elapsed_ticks);
-
-/******************************************************************************************************/
-/**
- * @brief Return ticks until the next active timer expiry, UINT32_MAX when none (os_timer.c).
- */
-uint32_t os_timer_next_expiry_ticks_get(void);
-#endif /* OS_CONFIG_TIMER_ENABLE */
-
-/*
- * ***********************************************************************************************************
- * Buffered logging           - OS_CONFIG_LOG_ENABLE
- * ***********************************************************************************************************
-*/
-
-#if (OS_CONFIG_LOG_ENABLE == 1U)
-/******************************************************************************************************/
-/**
- * @brief Create and start the kernel log service task (os_log.c).
- */
-os_err_t os_log_system_init(void);
-#endif /* OS_CONFIG_LOG_ENABLE */
 
 #ifdef __cplusplus
 }

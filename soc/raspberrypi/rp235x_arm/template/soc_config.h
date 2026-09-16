@@ -1,6 +1,7 @@
 /**
  * @file soc_config.h
- * @brief Template for the application's soc_config.h - every option of the raspberrypi/rp235x_arm SoC
+ * @brief Template for the application's soc_config.h - every option of the raspberrypi/rp235x_arm
+ *        SoC
  *        package at its default value.
  *
  * NOT included by the package as it sits here: copy it into the application beside os_config.h,
@@ -20,8 +21,25 @@
 #ifndef SOC_CONFIG_H
 #define SOC_CONFIG_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 /* The tickless guard must work even when this header is included first. */
 #include "os_config.h"
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
 
 /**
  * Which lock id the kernel takes for its critical sections.
@@ -94,5 +112,9 @@
  * attached and the breakpoint is what you actually want.
  */
 #define SOC_CONFIG_FAULT_REPORT             1U
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SOC_CONFIG_H */

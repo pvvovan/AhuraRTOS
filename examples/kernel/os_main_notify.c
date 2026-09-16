@@ -23,15 +23,15 @@
 
 #include <stdio.h>
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #if !(OS_CONFIG_NOTIFY_ENABLE == 1U)
 #error "os_main_notify.c needs OS_CONFIG_NOTIFY_ENABLE=1 in os_config.h"
 #endif
-
-/*
- * ***********************************************************************************************************
- * Private objects
- * ***********************************************************************************************************
-*/
 
 /* Every task states its core affinity on a multi-core build: the kernel asks for that argument
  * rather than defaulting it, so the decision is made on purpose at each creation site. These
@@ -43,29 +43,25 @@
     OS_TASK_CONFIG((entry), (context), (priority), OS_TASK_CORE_ANY)
 #endif
 
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
 OS_TASK_DEFINE(receiver, 512U);
 
 /*
  * ***********************************************************************************************************
- * Private function implementations
+ * Private function prototypes
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
-static void receiver_entry(void *context)
-{
-    (void)context;
-
-    while (1)
-    {
-        uint32_t value;
-
-        if (os_notify_wait(OS_WAIT_FOREVER, &value) == OS_ERR_NONE)
-        {
-            printf("[notify] receiver got value=%lu\r\n", (unsigned long)value);
-        }
-    }
-}
+/**
+ * @brief Wait for notifications and print what arrived.
+ */
+static void receiver_entry(void *context);
 
 /*
  * ***********************************************************************************************************
@@ -92,5 +88,32 @@ void os_main(void)
         (void)os_notify_give(&receiver, counter);
         counter++;
         os_delay_ms(500U);
+    }
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Wait for notifications and print what arrived.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
+static void receiver_entry(void *context)
+{
+    (void)context;
+
+    while (1)
+    {
+        uint32_t value;
+
+        if (os_notify_wait(OS_WAIT_FOREVER, &value) == OS_ERR_NONE)
+        {
+            printf("[notify] receiver got value=%lu\r\n", (unsigned long)value);
+        }
     }
 }

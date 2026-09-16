@@ -22,7 +22,20 @@
  * Includes
  * ***********************************************************************************************************
 */
+
 #include "os_task_internal.h"
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
+#if (OS_MUTEX_DEADLOCK_CHECK == 1)
+/* Post-mortem record for the debugger; see os_internal.h for why an assertion cannot carry this
+ * itself. Zero-initialised, so requested == NULL means nothing has been detected. */
+os_task_deadlock_report_t os_task_deadlock_report;
+#endif /* OS_MUTEX_DEADLOCK_CHECK */
 
 /*
  * ***********************************************************************************************************
@@ -31,8 +44,13 @@
 */
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Recompute owner's effective priority as max(base_priority, highest waiter still queued on
+ *        any mutex it still holds). Caller must hold a critical section.
+ */
 static void os_task_mutex_effective_recompute(os_task_tcb_t *owner);
-#endif
+#endif /* OS_CONFIG_MUTEX_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -115,7 +133,8 @@ void os_task_mutex_priority_inherit(uint32_t owner_task_id)
 
 /******************************************************************************************************/
 /**
- * @brief Release the priority boost tcb handed a mutex owner, now that it has left the waiter queue.
+ * @brief Release the priority boost tcb handed a mutex owner, now that it has left the waiter
+ *        queue.
  *
  * Call AFTER the task has been unlinked from the waiter list: the recompute is a max() over the
  * tasks still queued, so running it while this one is still linked would just re-derive the boost
@@ -173,7 +192,8 @@ void os_task_mutex_waiter_depart(void)
  * for a non-owner too, and working on the caller would splice this node out of the REAL owner's
  * list while updating the CALLER's head and tail. An unresolvable owner has nothing to undo.
  *
- * @param[in]     owner_id    Id the mutex recorded for its owner, captured before unlock cleared it.
+ * @param[in]     owner_id    Id the mutex recorded for its owner, captured before unlock cleared
+ *                            it.
  * @param[in,out] owner_node  The mutex's own owner_node link, already unlocked by the caller.
  * @return None.
  */
@@ -202,13 +222,14 @@ void os_task_mutex_owner_unlink_and_reprioritize(uint32_t owner_id, os_list_node
         }
     }
 }
+
 /******************************************************************************************************/
 /**
  * @brief Record the mutex the calling task is about to block on, and whether that wait ever ends.
  *        Cleared when the waiter leaves its queue, with os_task_wait_end() as a backstop.
  *
- * In every build, not only a debug one: this edge is what os_task_mutex_priority_recompute follows to
- * find the task a boost actually has to reach.
+ * In every build, not only a debug one: this edge is what os_task_mutex_priority_recompute follows
+ * to find the task a boost actually has to reach.
  *
  * @param[in] mutex    Mutex about to be waited on, NULL to clear.
  * @param[in] forever  True for an OS_WAIT_FOREVER wait - the narrower case the deadlock walk wants.
@@ -270,57 +291,9 @@ void os_task_mutex_priority_recompute(os_task_tcb_t *task)
         depth++;
     }
 }
-
-/*
- * ***********************************************************************************************************
- * Private function implementations
- * ***********************************************************************************************************
-*/
-
-/******************************************************************************************************/
-/**
- * @brief Recompute owner's effective priority as max(base_priority, highest waiter still queued on
- *        any mutex it still holds). Caller must hold a critical section.
- *
- * The single definition of what a task's inherited priority IS, so that every event which can change
- * the answer - an unlock, a waiter timing out, a waiter being paused or deleted - arrives at it the
- * same way instead of each path carrying its own idea.
- *
- * @param[in,out] owner  Task whose effective priority is recomputed.
- * @return None.
- */
-static void os_task_mutex_effective_recompute(os_task_tcb_t *owner)
-{
-    os_list_node_t *node;
-    uint32_t        new_priority = owner->base_priority;
-
-    for (node = owner->owned_mutexes.head; node != NULL; node = node->next)
-    {
-        const os_mutex_t *held       = OS_MUTEX_FROM_OWNER_NODE(node);
-        os_list_node_t   *top_waiter = held->waiters.head;
-
-        if (top_waiter != NULL)
-        {
-            uint32_t waiter_priority = OS_TASK_TCB_FROM_WAIT_NODE(top_waiter)->priority;
-
-            if (waiter_priority > new_priority)
-            {
-                new_priority = waiter_priority;
-            }
-        }
-    }
-
-    os_task_effective_priority_set(owner, new_priority);
-}
-
 #endif /* OS_CONFIG_MUTEX_ENABLE */
 
 #if (OS_MUTEX_DEADLOCK_CHECK == 1)
-
-/* Post-mortem record for the debugger; see os_internal.h for why an assertion cannot carry this
- * itself. Zero-initialised, so requested == NULL means nothing has been detected. */
-os_task_deadlock_report_t os_task_deadlock_report;
-
 /******************************************************************************************************/
 /**
  * @brief Report whether blocking the calling task on this mutex would close a wait cycle.
@@ -399,3 +372,47 @@ bool os_task_mutex_deadlock_check(const os_mutex_t *mutex)
     return cycle;
 }
 #endif /* OS_MUTEX_DEADLOCK_CHECK */
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Recompute owner's effective priority as max(base_priority, highest waiter still queued on
+ *        any mutex it still holds). Caller must hold a critical section.
+ *
+ * The single definition of what a task's inherited priority IS, so that every event which can
+ * change the answer - an unlock, a waiter timing out, a waiter being paused or deleted - arrives at
+ * it the same way instead of each path carrying its own idea.
+ *
+ * @param[in,out] owner  Task whose effective priority is recomputed.
+ * @return None.
+ */
+static void os_task_mutex_effective_recompute(os_task_tcb_t *owner)
+{
+    os_list_node_t *node;
+    uint32_t        new_priority = owner->base_priority;
+
+    for (node = owner->owned_mutexes.head; node != NULL; node = node->next)
+    {
+        const os_mutex_t *held       = OS_MUTEX_FROM_OWNER_NODE(node);
+        os_list_node_t   *top_waiter = held->waiters.head;
+
+        if (top_waiter != NULL)
+        {
+            uint32_t waiter_priority = OS_TASK_TCB_FROM_WAIT_NODE(top_waiter)->priority;
+
+            if (waiter_priority > new_priority)
+            {
+                new_priority = waiter_priority;
+            }
+        }
+    }
+
+    os_task_effective_priority_set(owner, new_priority);
+}
+#endif /* OS_CONFIG_MUTEX_ENABLE */

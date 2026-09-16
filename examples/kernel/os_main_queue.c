@@ -35,15 +35,15 @@
 
 #include <stdio.h>
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #if !(OS_CONFIG_QUEUE_ENABLE == 1U)
 #error "os_main_queue.c needs OS_CONFIG_QUEUE_ENABLE=1 in os_config.h"
 #endif
-
-/*
- * ***********************************************************************************************************
- * Private objects
- * ***********************************************************************************************************
-*/
 
 /* Every task states its core affinity on a multi-core build: the kernel asks for that argument
  * rather than defaulting it, so the decision is made on purpose at each creation site. These
@@ -55,14 +55,20 @@
     OS_TASK_CONFIG((entry), (context), (priority), OS_TASK_CORE_ANY)
 #endif
 
-OS_TASK_DEFINE(consumer, 512U);
-
 #define QUEUE_CAPACITY 4U
 
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
+OS_TASK_DEFINE(consumer, 512U);
+
 /* Declares the queue AND its buffer, and initializes both at compile time - there is nothing to
- * call before the first send. The buffer is os_main_static_queue_queue_buf and should never be named by
- * hand. The item size is a byte count, the same argument os_queue_init_dynamic takes below, which
- * is what lets these two queues differ in storage and in nothing else. */
+ * call before the first send. The buffer is os_main_static_queue_queue_buf and should never be
+ * named by hand. The item size is a byte count, the same argument os_queue_init_dynamic takes
+ * below, which is what lets these two queues differ in storage and in nothing else. */
 OS_QUEUE_DEFINE(os_main_static_queue, sizeof(uint32_t), QUEUE_CAPACITY);
 
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
@@ -75,34 +81,15 @@ static os_queue_t os_main_dynamic_queue;
 
 /*
  * ***********************************************************************************************************
- * Private function implementations
+ * Private function prototypes
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
-static void consumer_entry(void *context)
-{
-    (void)context;
-
-    while (1)
-    {
-        uint32_t value;
-
-        /* Blocks until the producer sends. Nothing here is aware of where either queue keeps its
-         * items: a queue behaves the same whichever way it got its buffer. */
-        if (os_queue_receive(&os_main_static_queue, &value, OS_WAIT_FOREVER) == OS_ERR_NONE)
-        {
-            printf("[queue] consumer received %lu from the static queue\r\n", (unsigned long)value);
-        }
-
-#if (OS_CONFIG_ALLOC_ENABLE == 1U)
-        if (os_queue_receive(&os_main_dynamic_queue, &value, OS_WAIT_FOREVER) == OS_ERR_NONE)
-        {
-            printf("[queue] consumer received %lu from the dynamic queue\r\n", (unsigned long)value);
-        }
-#endif
-    }
-}
+/**
+ * @brief Take items off the queue and print them.
+ */
+static void consumer_entry(void *context);
 
 /*
  * ***********************************************************************************************************
@@ -162,8 +149,44 @@ void os_main(void)
     }
 
     /* Never reached here, but a queue that outlives its usefulness is torn down with
-     * os_queue_cleanup(&os_main_dynamic_queue), which returns the buffer to the kernel heap. The same
-     * call on os_main_static_queue just empties it, freeing nothing and leaving it usable, so teardown
-     * code does not care which kind it is holding. It refuses with OS_ERR_BUSY while any task
-     * is still blocked on the queue. */
+     * os_queue_cleanup(&os_main_dynamic_queue), which returns the buffer to the kernel heap. The
+     * same call on os_main_static_queue just empties it, freeing nothing and leaving it usable, so
+     * teardown code does not care which kind it is holding. It refuses with OS_ERR_BUSY while any
+     * task is still blocked on the queue. */
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Take items off the queue and print them.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
+static void consumer_entry(void *context)
+{
+    (void)context;
+
+    while (1)
+    {
+        uint32_t value;
+
+        /* Blocks until the producer sends. Nothing here is aware of where either queue keeps its
+         * items: a queue behaves the same whichever way it got its buffer. */
+        if (os_queue_receive(&os_main_static_queue, &value, OS_WAIT_FOREVER) == OS_ERR_NONE)
+        {
+            printf("[queue] consumer received %lu from the static queue\r\n", (unsigned long)value);
+        }
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+        if (os_queue_receive(&os_main_dynamic_queue, &value, OS_WAIT_FOREVER) == OS_ERR_NONE)
+        {
+            printf("[queue] consumer received %lu from the dynamic queue\r\n", (unsigned long)value);
+        }
+#endif
+    }
 }

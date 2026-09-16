@@ -551,11 +551,14 @@ so the PendSV vector already carries the kernel's default name and
 `SystemInit()`. Single-core parts need no core id, no inter-core IPI and no
 hardware spinlock. What is left is the handful of callbacks in `soc_cb.c`.
 
-Everything in it is **weak**, so a strong definition anywhere in the application
-replaces that one callback and leaves the rest of the package in place. Nothing
-is mandatory: with the HAL absent, or with the options in `soc_config.h` turned
-off, each body compiles to nothing and the kernel behaves exactly as it does
-with no package at all.
+The two tickless sleep hooks, `os_tickless_pre_sleep_cb()` and
+`os_tickless_post_sleep_cb()`, are **weak**: a strong definition anywhere in the
+application replaces that hook and leaves the rest of the package in place. The
+rest of the file is strong on purpose - the kernel and the CMSIS startup file
+already hold weak defaults for those symbols, and between two weak definitions
+the linker keeps whichever it reaches first. Nothing is mandatory: with the HAL
+absent, or with the options in `soc_config.h` turned off, each body compiles to
+nothing and the kernel behaves exactly as it does with no package at all.
 
 Options live in `soc_config.h`, copied from `template/soc_config.h` into
 `Core/Inc` beside `os_config.h`. The file and every option in it are required on
@@ -594,7 +597,7 @@ little.
 
 | | |
 |---|---|
-| `soc_cb.c` | The whole package: a clock refresh at start-up and two tickless sleep hooks. Every entry point is `OS_WEAK`, so an application that wants its own simply defines it |
+| `soc_cb.c` | The whole package: a clock refresh at start-up, the SysTick vector, the LPTIM wake source for deep sleep, and two tickless sleep hooks. Only the two hooks are `OS_WEAK`, so an application that wants its own simply defines them |
 | `template/soc_config.h` | Nine options, copied beside your `os_config.h` |
 
 There is no public header, because the package has nothing for the application

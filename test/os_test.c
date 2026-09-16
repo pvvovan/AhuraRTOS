@@ -17,6 +17,12 @@
  *            See LICENSE in the project root for the full license text.
  */
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "ahura.h"
 
 #include <stdio.h>
@@ -25,12 +31,9 @@
 
 /*
  * ***********************************************************************************************************
- * Test bookkeeping
+ * Macros
  * ***********************************************************************************************************
 */
-
-static uint32_t os_test_pass_count = 0U;
-static uint32_t os_test_fail_count = 0U;
 
 /* OS_TASK_CONFIG takes a core affinity only when OS_CONFIG_CORE_COUNT is above 1 - the kernel
  * makes that a compile error at every creation site on purpose, so raising the core count is a
@@ -67,41 +70,6 @@ static uint32_t os_test_fail_count = 0U;
         if (cond) { os_test_pass_count++; printf("  [PASS] " fmt "\r\n", ##__VA_ARGS__); } \
         else      { os_test_fail_count++; printf("  [FAIL] " fmt "  (os_test.c:%d)\r\n", ##__VA_ARGS__, __LINE__); } \
     } while (0)
-
-/******************************************************************************************************/
-static void test_print_section(const char *title)
-{
-    printf("\r\n--- %s ---\r\n", title);
-}
-
-/*
- * ***********************************************************************************************************
- * Shared kernel objects under test
- * ***********************************************************************************************************
-*/
-
-OS_TASK_DEFINE(worker, 512U);
-OS_TASK_DEFINE(helper, 512U);
-/* Two more concurrent task slots for the combined-scenario tests below, which run 3-4 tasks
- * at once (single-primitive tests above only ever run one helper at a time). */
-OS_TASK_DEFINE(helper2, 512U);
-OS_TASK_DEFINE(helper3, 512U);
-
-static __IO uint32_t os_test_worker_counter    = 0U;
-static __IO bool     os_test_worker_should_run = true;
-
-/* Shared between test_priority_preemption() and test_cpu_usage(): a task that spins
- * incrementing this counter, without ever yielding/delaying, so it only runs on ticks
- * nothing higher-priority is ready for. */
-static __IO uint32_t os_test_busy_counter    = 0U;
-static __IO bool     os_test_busy_should_run = true;
-
-/* test_scheduler_lock(): set by a task that outranks the test task, so the flag can only
- * turn true once the scheduler is actually allowed to switch. */
-static __IO bool     os_test_sched_lock_ran  = false;
-#if (OS_CONFIG_SEM_ENABLE == 1U)
-static os_sem_t os_test_sched_lock_sem;  /* left empty: a take would have to block */
-#endif
 
 #define TEST_BURST_ITERATIONS 200000UL
 
@@ -193,36 +161,1752 @@ static os_sem_t os_test_sched_lock_sem;  /* left empty: a take would have to blo
         (worst_out) = bench_worst;                                               \
     } while (0)
 
-/* Dedicated benchmark objects, kept separate from the functional tests' shared ones so a
- * leftover count/item/waiter from an earlier section cannot skew a measurement. */
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-static os_mutex_t     os_test_bench_mutex;
-#endif
-#if (OS_CONFIG_SEM_ENABLE == 1U)
-static os_sem_t os_test_bench_sem;
-#endif
-#if (OS_CONFIG_QUEUE_ENABLE == 1U)
-OS_QUEUE_DEFINE_ATTR(os_test_bench_queue, sizeof(uint32_t), 4, );
-#endif
-#if (OS_CONFIG_MSG_ENABLE == 1U)
-/* Room for one message of the longest size benchmarked below, header included - only one is
- * ever in flight, since each sample sends and then receives. */
-OS_MSG_DEFINE_ATTR(os_test_bench_msg, OS_MSG_SPACE(64U), );
-#endif
-#if (OS_CONFIG_EVENT_ENABLE == 1U)
-static os_event_t os_test_bench_event;
-#endif
-#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
-/* File scope, not a local: the port's operations want a naturally aligned 32-bit word, which a
- * static of this type is by definition. */
-static os_atomic_t os_test_bench_atomic = OS_ATOMIC_INIT(0);
-#endif
 /* Filler for the scheduler row: tasks that are READY and never get the CPU, so the ready lists are
  * loaded while the measurement itself is unchanged. Four is enough to tell a bitmap pick from a
  * walk - a walk would already be four times the work - and leaves the table's own tasks room
  * inside OS_CONFIG_MAX_USER_TASKS. Not under any feature guard: the scheduler is PART 1, so this
  * row runs in every configuration. */
 #define TEST_BENCH_TASK_FILL   4U
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/* Filler for the second timer row: start and stop search the running list, so their cost depends
+ * on how many timers are RUNNING. These sit in that list doing nothing, to make the slope visible
+ * rather than leaving it to be reasoned about. */
+#define TEST_BENCH_TIMER_FILL  8U
+#endif
+
+/* test_spawn_helper has to exist whenever a section that CALLS it is compiled in, and no more.
+ * Guarding it on a single feature left the others calling an undeclared function; listing a
+ * feature that does not actually call it leaves the helper defined and unused, which is what
+ * -Wunused-function reports (and -Werror fails on).
+ *
+ * OS_CONFIG_MUTEX_ENABLE is deliberately NOT here even though the mutex section contains a call:
+ * that call sits inside a nested OS_CONFIG_SEM_ENABLE guard, since handing a mutex over
+ * needs a semaphore to do it with. Mutexes alone never reach the helper, so the semaphore term
+ * below already covers that case. */
+#define TEST_HELPER_NEEDED ((OS_CONFIG_SEM_ENABLE == 1U) ||                                        \
+                            (OS_CONFIG_QUEUE_ENABLE == 1U)     ||                                  \
+                            (OS_CONFIG_EVENT_ENABLE == 1U))
+
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+/* Capture buffer for test_log(): this file supplies os_log_output_cb - the kernel declares it and
+ * defines nothing - so the log task hands its bytes here instead of to a UART. Kept small on
+ * purpose - only the most recent output needs inspecting. */
+/* Must hold everything a single drain can deliver after the capture is cleared: a full ring, plus
+ * the dropped-lines notice tsk_log emits once that ring empties.
+ *
+ * Sized from the ring rather than fixed, because getting this wrong does not look like a capture
+ * problem. At 512 bytes the flood test filled the capture with "flood ..." lines and silently
+ * discarded the notice that arrived after them, so three checks failed as though the kernel had
+ * never emitted it. */
+#define TEST_LOG_CAPTURE_SIZE (OS_CONFIG_LOG_BUFFER_SIZE + 128U)
+#endif
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_MUTEX_ENABLE == 1U)
+/* Combined-scenario context types and objects (see "Integration / Combined Scenarios" below).
+ *
+ * Unlike the single-primitive tests above (one helper task, one role at a time via
+ * os_test_helper_ctx), these run several DIFFERENT tasks concurrently, each with its own behavior -
+ * so each gets its own context struct, passed through OS_TASK_CONFIG's context pointer instead
+ * of the shared dispatch-by-role pattern.
+ */
+
+#define TEST_PIPELINE_ITEMS_PER_PRODUCER 6U
+#define TEST_PIPELINE_TOTAL_ITEMS        (2U * TEST_PIPELINE_ITEMS_PER_PRODUCER)
+#endif
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U) && (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && \
+    (OS_CONFIG_EVENT_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
+/* Concurrent multi-primitive stress/soak (see "Stress/Soak" below): unlike every scenario
+ * above, which runs a small fixed handful of tasks each doing ONE thing, this runs
+ * OS_TEST_STRESS_WORKER_COUNT tasks at distinct priorities that each hit a mutex, a
+ * deliberately under-provisioned semaphore and queue, an event, and the kernel heap -
+ * all at once, repeatedly, for many iterations, then check hard invariants instead of just
+ * "the call returned OK". Bump OS_TEST_STRESS_ITERATIONS for a longer soak run; the default
+ * is sized to add at most a couple of seconds to a boot-time log, not to replace a real
+ * multi-hour soak. */
+#define OS_TEST_STRESS_WORKER_COUNT   4U
+#define OS_TEST_STRESS_ITERATIONS     300U
+#define OS_TEST_STRESS_SEM_MAX        2U    /* < worker count: forces real blocking/timeouts */
+#define OS_TEST_STRESS_QUEUE_CAPACITY 3U    /* < worker count: forces real FULL/EMPTY paths  */
+#endif
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+/* Shared between the two contenders in test_atomic(): both hammer the same counters, one through
+ * os_atomic_inc and one with a plain read-modify-write, so the two can be compared directly. */
+#define TEST_ATOMIC_ITERATIONS 20000UL
+#endif /* OS_CONFIG_ATOMIC_ENABLE */
+#endif /* OS_CONFIG_QUEUE_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/* The timer API from an ISR.
+ *
+ * Everything above calls the timer API from a task. This section calls it from a real exception
+ * handler, because "ISR-safe" is a claim worth executing rather than reasoning about.
+ *
+ * SVC is the vehicle. It exists on every Cortex-M, it is synchronous - so the test knows exactly
+ * when the handler ran, with no peripheral to configure and no vendor header to include - and the
+ * kernel deliberately claims no SVC handler of its own. An application that defines one cannot link
+ * this suite: a duplicate symbol, which is the loudest way for that clash to be noticed.
+ */
+
+#define TEST_ISR_ACTION_ARM   0U
+#define TEST_ISR_ACTION_STOP  1U
+
+/* Whether this suite claims the SVC vector for itself (1, the default) or leaves it to the
+ * application (0).
+ *
+ * The kernel never uses SVC and says so - it folds starting the first task into PendSV precisely to
+ * leave SVC alone. The SUITE is the only part that wants it, and only to reach interrupt context so
+ * the ISR-safe APIs can be tested from a real ISR rather than from a task pretending to be one.
+ *
+ * Claiming it has to be a STRONG definition: CMSIS-Pack startup files declare SVC_Handler weak and
+ * alias it to Default_Handler, and between two weak definitions the linker keeps the startup file's
+ * - so a weak one here would leave `svc #0` branching into an infinite loop. That is the same
+ * mechanism that cost the ST package its SysTick vector.
+ *
+ * But strong collides with an application that generates its own SVC_Handler, which CubeMX does by
+ * default - and it collides as a bare "multiple definition of SVC_Handler" from the linker, which
+ * says nothing about why a test suite wants that symbol. Making the application delete a handler it
+ * owns, on every regeneration, to accommodate a test, is the wrong way round.
+ *
+ * So: leave this at 1 and the suite works out of the box on a project with no SVC handler of its
+ * own (the Pico SDK, a CubeMX project with SVC unticked). Set it to 0 when the application owns
+ * SVC, and call os_test_isr_entry() from that handler instead - one line, and on CubeMX it goes in
+ * a USER CODE block, which survives regeneration. Nothing is deleted and nothing collides.
+ *
+ * Same convention, and the same spelling, as SOC_CONFIG_SYSTICK_VECTOR in the ST package. Defaulted
+ * here rather than required in os_config.h so that existing projects keep building untouched. */
+#ifndef OS_CONFIG_TEST_SVC_VECTOR
+#define OS_CONFIG_TEST_SVC_VECTOR       1U
+#endif
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/* Deferred calls - os_timer_submit and its pool.
+ *
+ * The property that separates a submission from a start, and the reason both exist: os_timer_start
+ * on a pending timer RESCHEDULES it, so an interrupt firing twice produces one callback carrying
+ * only the second event. os_timer_submit takes a fresh slot each time, so both events arrive.
+ *
+ * The tests below assert both halves - the coalescing AND the non-coalescing - because either one
+ * alone would leave the difference undocumented by anything executable.
+ */
+
+#define TEST_POOL_SIZE     4U
+#define TEST_POOL_LOG_MAX  8U
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/* Timers under real-project conditions.
+ *
+ * The sections above check one property at a time. These are the situations an application actually
+ * produces: callbacks that re-arm or cancel themselves, a callback that blocks, work that outruns
+ * its own period, a cancel that races the expiry it is cancelling, and an interrupt burst deeper
+ * than the pool it feeds. Each is a place where a plausible implementation passes every test above
+ * and still fails in the field.
+ */
+
+#define TEST_RW_CHAIN_TARGET   5U
+#define TEST_RW_SAME_PERIOD    4U
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+/* Additional targeted churn/stress tests: unlike test_stress_soak() above (several DIFFERENT.
+ *
+ * primitives contended by several concurrent tasks), each of these hammers ONE subsystem's
+ * create/destroy or alloc/free path back-to-back, many times, in a tight loop from a single task.
+ * The single-primitive tests earlier in this file only exercise create/delete or alloc/free a
+ * handful of times each - not nearly enough repetition to shake out a slot-reuse bug, a list-
+ * corruption bug, or a leak that only shows up after hundreds of cycles.
+ */
+
+#define OS_TEST_CHURN_ITERATIONS 500U
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+#define OS_TEST_TIMER_CHURN_ITERATIONS 500U
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#ifndef OS_TEST_STRESS_EXTENDED
+#if defined(__OPTIMIZE__)
+/* Extended per-subsystem stress tests - OS_TEST_STRESS_EXTENDED.
+ *
+ * These cost roughly 15 KB of flash, most of it the .rodata for their PASS/FAIL messages, which is
+ * more than an unoptimized build of this project has left over: -O0 already sits at ~97% of the
+ * STM32H503's 128 KB, so linking them there overflows. They are therefore compiled in whenever the
+ * build is optimized at all (__OPTIMIZE__, i.e. any -O above -O0) and left out otherwise, with a
+ * SKIP line naming the reason at run time.
+ *
+ * Keyed on the optimization level rather than on a hand-set switch because that is the thing that
+ * actually decides whether they fit, and because a stress test is close to meaningless at -O0
+ * anyway: every timing margin and every contention window is distorted by unoptimized code, so a
+ * -O0 run would report numbers that say nothing about the firmware anyone ships. Define
+ * OS_TEST_STRESS_EXTENDED explicitly to override in either direction - to 0 to reclaim the flash
+ * in an optimized build, or to 1 at -O0 on a part with room to spare.
+ */
+
+#define OS_TEST_STRESS_EXTENDED 1U
+#else
+#define OS_TEST_STRESS_EXTENDED 0U
+#endif
+#endif
+
+#if (OS_TEST_STRESS_EXTENDED == 1U)
+/*
+ * These sit between the two kinds of stress test above. test_stress_soak() contends several
+ * DIFFERENT primitives from several tasks at once; the churn tests cycle ONE create/destroy path
+ * repeatedly from a single task. Each test below drives one subsystem at high volume AND checks an
+ * invariant strong enough to fail on a lost wakeup, a dropped or duplicated item, a leaked
+ * registry slot, or a heap block handed out twice - failures a low-repetition functional check
+ * cannot see, because the one interleaving it happens to produce is usually the easy one.
+ *
+ * Every count here is exact, not approximate: a test that only asserts "roughly the right number
+ * of things happened" cannot distinguish a real dropped wakeup from scheduling jitter, so it would
+ * have to be written loose enough to pass through the very bug it exists to catch. Where the
+ * hardware genuinely cannot be pinned down (timer fire counts over a wall-clock window), the
+ * tolerance is stated and bounded rather than left open.
+ *
+ * The multi-worker tests below start and join their tasks through os_test_stress_tasks[] rather
+ * than repeating four near-identical lines each: one format string covers every worker, which keeps
+ * per-worker failure attribution while costing a fraction of the .rodata that matters on a part
+ * this close to full (see OS_TEST_STRESS_EXTENDED below).
+*/
+
+/* The two helpers below drive the queue-producer, event-bit-storm and mutex-convoy tests, so they
+ * have to exist whenever ANY of those is compiled in: guarding them on a single feature would leave
+ * the others calling an undeclared function, and leaving them unguarded breaks an
+ * all-features-off build on -Wunused-function. Same reasoning as TEST_HELPER_NEEDED above. */
+#define TEST_STRESS_WORKERS_NEEDED                                        \
+    ((OS_CONFIG_MUTEX_ENABLE == 1U) || (OS_CONFIG_EVENT_ENABLE == 1U) ||  \
+     ((OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)))
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
+#define OS_TEST_QCHURN_ITERATIONS 200U
+
+#define OS_TEST_QPROD_COUNT 3U
+#define OS_TEST_QPROD_ITEMS 32U   /* 32 so one uint32_t mask tracks a producer's whole run */
+#endif /* OS_CONFIG_QUEUE_ENABLE && OS_CONFIG_ALLOC_ENABLE */
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+#define OS_TEST_FRAG_BLOCKS 24U
+#define OS_TEST_FRAG_SIZE   32U
+#endif /* OS_CONFIG_ALLOC_ENABLE */
+
+#if (OS_CONFIG_SEM_ENABLE == 1U)
+#define OS_TEST_PINGPONG_ROUNDS 1000U
+#endif /* OS_CONFIG_SEM_ENABLE */
+
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
+#define OS_TEST_NOTIFY_STORM_COUNT 1000U
+#endif /* OS_CONFIG_NOTIFY_ENABLE */
+
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+#define OS_TEST_EBS_WORKERS 4U
+#define OS_TEST_EBS_ITERS   250U
+#endif /* OS_CONFIG_EVENT_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+#define OS_TEST_TFLOOD_WINDOW 200U
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+#define OS_TEST_CONVOY_WORKERS 4U
+#define OS_TEST_CONVOY_ITERS   200U
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+#endif /* OS_TEST_STRESS_EXTENDED */
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/* Enough contention that a broken lock loses updates reliably rather than occasionally: each core
+ * does this many read-modify-writes on one word, as fast as it can, at the same time as the other.
+ * A lock that does not exclude drops hundreds, not one or two. */
+#define TEST_MC_LOCK_ITERATIONS     4000U
+
+/* How long core 0 waits for a task pinned to core 1 to run at all. Generous by design - this is
+ * the check that says whether the second core booted, and a slow answer is still an answer. */
+#define TEST_MC_START_TIMEOUT_MS    500U
+
+/* How often each parked worker proves its core is still alive, and how long the late check
+ * watches for. The window is several heartbeats so one missed wake cannot fail it. */
+#define TEST_MC_HEARTBEAT_MS        100U
+#define TEST_MC_WATCH_MS            600U
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/* Multi-core (SMP) stress - cross-core contention and wake integrity.
+ *
+ * Everything above proved the kernel one subsystem at a time, on the core each helper was pinned
+ * to. These push the SMP seams specifically, and each is built so a failure is exact rather than
+ * approximate: handshakes make every cross-core wake 1:1, so a lost or duplicated wake shows up
+ * as a miscounted value, and guarded counters come out exact only if the spinlock really excludes
+ * two cores at once.
+ *
+ * These run with OS_CONFIG_MAX_USER_TASKS at 8: the test task, the two heartbeat workers parked
+ * by test_multicore(), and up to five concurrent helpers below.
+ */
+
+#define TEST_SMP_NESTED_ITERATIONS   20000U
+#define TEST_SMP_ATOMIC_ITERATIONS   40000U
+#define TEST_SMP_PINGPONG_ROUNDS     500U
+#define TEST_SMP_EVENT_ROUNDS        300U
+#define TEST_SMP_QUEUE_ITEMS         300U
+#define TEST_SMP_CHURN_CYCLES        40U
+#define TEST_SMP_SUBMIT_EACH         16U
+#define TEST_SMP_SOAK_ITERATIONS     150U
+#define TEST_SMP_MIGRATION_SAMPLES   8U
+
+#if (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ATOMIC_ENABLE == 1U)
+#define TEST_ANY_WORKERS     4U
+#define TEST_ANY_ROUNDS      150U
+#define TEST_ANY_SENTINEL    0x5A5AC0DEUL
+#endif /* SEM && QUEUE && ATOMIC */
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+/* ---------------------------------------------------------------------------------------------
+ * FPU context
+ * ---------------------------------------------------------------------------------------------
+ *
+ * s16-s31 are what the PORT saves; s0-s15 the hardware stacks on its own. So these are the
+ * registers a broken context switch loses, and until now nothing here looked at them.
+ *
+ * The load and the compare have to sit in the SAME function as the yield. Put them in helpers and
+ * the compiler saves s16-s31 in each helper's prologue and restores them in its epilogue - hiding
+ * exactly the failure being looked for. Here it cannot: the AAPCS says a callee preserves them, so
+ * across os_task_yield() it emits no reload, and what comes back is what really survived.
+ */
+#if defined(__ARM_FP)
+#define TEST_FPU_REGS   16U            /* s16-s31 */
+
+#define TEST_FPU_LOAD(src)  __asm volatile("vldmia %0, {s16-s31}" :: "r"(src) :        \
+                                           "s16", "s17", "s18", "s19", "s20", "s21",   \
+                                           "s22", "s23", "s24", "s25", "s26", "s27",   \
+                                           "s28", "s29", "s30", "s31")
+
+#define TEST_FPU_STORE(dst) __asm volatile("vstmia %0, {s16-s31}" :: "r"(dst) : "memory")
+#endif /* __ARM_FP */
+
+/*
+ * ***********************************************************************************************************
+ * Types
+ * ***********************************************************************************************************
+*/
+
+typedef enum
+{
+    HELPER_NONE = 0,
+    HELPER_MUTEX_HOLD,
+    HELPER_SEM_GIVE_AFTER,
+    HELPER_EVENT_SET_AFTER,
+    HELPER_QUEUE_SEND_AFTER,
+
+} helper_role_t;
+
+typedef struct
+{
+    helper_role_t role;
+    uint32_t      hold_ms;
+    uint32_t      bits;
+    uint32_t      value;
+
+} helper_ctx_t;
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_MUTEX_ENABLE == 1U)
+typedef struct
+{
+    uint32_t base_value;
+    uint32_t count;
+
+} test_producer_ctx_t;
+#endif
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+typedef struct
+{
+    uint32_t priority_tag;
+
+} test_prio_ctx_t;
+#endif
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/* Two mutexes held at once by the same owner, each with its own higher-priority waiter -
+ * see test_mutex_multi_inheritance(). */
+typedef struct
+{
+    os_mutex_t *mutex;
+    uint32_t   tag;   /* OR'd into os_test_inherit2_done_mask once this waiter is granted the mutex */
+
+} test_inherit2_ctx_t;
+#endif
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
+typedef struct
+{
+    uint32_t bit;
+    uint32_t value;
+    uint32_t work_ms;
+
+} test_fanin_ctx_t;
+#endif
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U) && (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && \
+    (OS_CONFIG_EVENT_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
+typedef struct
+{
+    uint32_t worker_id;
+    uint32_t prng_state; /* xorshift32 stream, seeded distinctly per worker; never 0 */
+
+} test_stress_ctx_t;
+#endif
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+/* Statically defined queue used by test_queue_define_and_dynamic(): the whole point of the macro
+ * pair is that the geometry is stated once, here, and never repeated at the init call. */
+typedef struct
+{
+    uint32_t id;
+    uint8_t  payload[6];
+
+} test_queue_item_t;
+#endif /* OS_CONFIG_QUEUE_ENABLE */
+
+#if (OS_TEST_STRESS_EXTENDED == 1U)
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
+typedef struct
+{
+    uint32_t id;
+
+} test_qprod_ctx_t;
+#endif /* OS_CONFIG_QUEUE_ENABLE && OS_CONFIG_ALLOC_ENABLE */
+
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+typedef struct
+{
+    uint32_t id;
+    uint32_t bit;
+
+} test_ebs_ctx_t;
+#endif /* OS_CONFIG_EVENT_ENABLE */
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+typedef struct
+{
+    uint32_t id;
+
+} test_convoy_ctx_t;
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+#endif /* OS_TEST_STRESS_EXTENDED */
+
+/*
+ * ***********************************************************************************************************
+ * Private function prototypes
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Print a section heading on the test console.
+ */
+static void test_print_section(const char *title);
+
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Whether the captured log output contains the given text.
+ */
+static bool test_log_capture_contains(const char *needle);
+#endif /* OS_CONFIG_LOG_ENABLE */
+
+/******************************************************************************************************/
+/**
+ * @brief Poll (bounded) until a task reports INACTIVE, i.e. it has fully self-terminated
+ *        and its stack is free to reuse for the next helper.
+ */
+static bool test_wait_inactive(const os_task_t *task, uint32_t timeout_ms);
+
+/******************************************************************************************************/
+/**
+ * @brief Generic helper task: spin until the suite clears its run flag.
+ */
+static void test_worker_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Busy-spins incrementing os_test_busy_counter until told to stop - never yields or delays,
+ *        so
+ *        it only gets CPU time on ticks nothing higher-priority is ready for. Shared by
+ *        test_priority_preemption() and test_cpu_usage().
+ */
+static void test_busy_spin_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Burns a fixed number of cycles then returns (self-exiting) - never yields, delays, or
+ *        calls any blocking kernel API, so for its whole run nothing at an equal or lower
+ *        priority can execute. Used by test_priority_preemption() to prove strict priority
+ *        ordering, not just "eventually runs".
+ */
+static void test_burst_spin_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Increments os_test_switch_count then immediately yields, in a loop, until told to stop.
+ *        Run on two equal-priority tasks at once (see test_context_switch_timing()), they
+ *        ping-pong the CPU between them - each turn is one context switch in, so the total
+ *        count over a fixed window approximates how many switches occurred.
+ */
+static void test_switch_ping_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Worker body for the self-pause test: waits briefly, pauses itself (NULL means the
+ *        calling task), then - once resumed by another task - proves it by setting a sentinel.
+ */
+static void test_self_pause_worker_entry(void *context);
+
+#if TEST_HELPER_NEEDED
+/******************************************************************************************************/
+/**
+ * @brief Generic helper task body: reads os_test_helper_ctx (set by test_spawn_helper before
+ *        create)
+ *        to decide what to do, then returns - the port auto-deletes the task on return.
+ */
+static void test_helper_entry(void *context);
+#endif /* TEST_HELPER_NEEDED */
+
+#if TEST_HELPER_NEEDED
+/******************************************************************************************************/
+/**
+ * @brief Create and start the shared helper task in the requested role.
+ */
+static os_err_t test_spawn_helper(helper_role_t role, uint32_t hold_ms, uint32_t bits,
+                                  uint32_t value);
+#endif /* OS_CONFIG_SEM_ENABLE */
+
+/******************************************************************************************************/
+/**
+ * @brief Kernel and tick basics: the scheduler reports running, the tick advances.
+ */
+static void test_kernel_core(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Blocking delays: os_delay_ms lands on time, os_delay_us busy-waits.
+ */
+static void test_delay(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Critical sections: nesting, and interrupts really masked inside.
+ */
+static void test_critical_section(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Task create, start, pause, resume, delete, and the states between.
+ */
+static void test_task_lifecycle(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Proves task ids are true identities, not just slot indices: no two simultaneously live
+ *        tasks ever share an id, and a deleted task's id is never handed to the task that reuses
+ *        its slot. That second property is what stops a stale handle from silently addressing a
+ *        different task - e.g. unlocking a mutex owned by whoever now occupies the slot.
+ */
+static void test_task_identity(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Proves strict priority ordering, not just "eventually runs": a lower-priority task
+ *        spinning without ever yielding is fully starved for as long as a higher-priority task
+ *        is ready, and resumes the instant that higher-priority task is gone.
+ */
+static void test_priority_preemption(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Runs at TEST_PRIO_HIGH, so it outranks the test task and would preempt it the instant it
+ *        is started - unless the scheduler is locked.
+ */
+static void test_sched_lock_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief os_kernel_lock() defers preemption without masking interrupts.
+ */
+static void test_scheduler_lock(void);
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Mutex ownership, timeouts and the priority a waiter lends its owner.
+ */
+static void test_mutex(void);
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+
+#if (OS_CONFIG_SEM_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Counting semaphore: take, give, and what a timeout does.
+ */
+static void test_semaphore(void);
+#endif /* OS_CONFIG_SEM_ENABLE */
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Hammer the shared atomic counter from a second task.
+ */
+static void test_atomic_hammer_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Covers the os_atomic_* API: return values, bit operations, and that concurrent updates
+ *        from two tasks actually survive.
+ */
+static void test_atomic(void);
+#endif /* OS_CONFIG_ATOMIC_ENABLE */
+
+/******************************************************************************************************/
+/**
+ * @brief Covers both ways of getting a queue: OS_QUEUE_DEFINE static storage, and
+ *        os_queue_init_dynamic heap storage, including that cleanup frees one and not the other.
+ */
+static void test_queue_define_and_dynamic(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Fill os_test_ow_queue with 1, 2, 3 and report whether all three were accepted.
+ */
+static bool test_ow_fill(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Drain three items and report whether they came out as first, first+1, first+2.
+ */
+static bool test_ow_drain_is(uint32_t first);
+
+/******************************************************************************************************/
+/**
+ * @brief OS_QUEUE_MODE_OVERWRITE: which item is dropped, when it is dropped, and where it works.
+ */
+static void test_queue_overwrite(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Queue FIFO order, item accounting and overwrite mode.
+ */
+static void test_queue(void);
+#endif /* OS_CONFIG_QUEUE_ENABLE */
+
+#if (OS_CONFIG_MSG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Variable-length messages: whole-message delivery, byte accounting, the wrap, and the
+ *        three refusals that keep a bad call from becoming a hang.
+ */
+static void test_msg(void);
+#endif /* OS_CONFIG_MSG_ENABLE */
+
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Event bits: wait for any or all, timeouts, and clear-on-exit.
+ */
+static void test_event_group(void);
+#endif /* OS_CONFIG_EVENT_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief One-shot timer callback: count the firing.
+ */
+static void timer_oneshot_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Periodic timer callback: count the firings.
+ */
+static void timer_periodic_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Records whether both arguments arrived exactly as os_timer_start was given them.
+ */
+static void timer_args_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Software timers: one-shot, periodic, stop, restart.
+ */
+static void test_timer(void);
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Timer callback for the ISR-context checks: count the firing.
+ */
+static void test_isr_timer_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief The deferred call the ISR scheduled. Both of its arguments came from the os_timer_start
+ *        the ISR made, which is the whole point of the check.
+ */
+static void test_isr_defer_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Retune check: record the value this timer was given.
+ */
+static void timer_retune_a_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Retune check: record the context and value this timer was given.
+ */
+static void timer_retune_b_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Retuning a timer that is already running: the value, the callback and the period.
+ */
+static void test_timer_retune(void);
+
+/******************************************************************************************************/
+/**
+ * @brief The timer API called from interrupt context.
+ */
+static void test_timer_isr(void);
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Pool timer: check the context it was handed, and log the run.
+ */
+static void test_pool_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Second pool timer: count its runs.
+ */
+static void test_pool_other_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Coalescing check: remember the last value delivered.
+ */
+static void test_coalesce_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Deferred-call pool: fill it, exhaust it, and watch slots come back.
+ */
+static void test_timer_pool(void);
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Real-world timer: re-arm itself from inside its own callback.
+ */
+static void test_rw_rearm_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Real-world timer: stop itself once it has run often enough.
+ */
+static void test_rw_selfstop_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Real-world timer: a callback that overruns its own period.
+ */
+static void test_rw_slow_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Real-world timer: count the runs owed after a late drain.
+ */
+static void test_rw_owed_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Real-world timer: record which period each firing landed in.
+ */
+static void test_rw_same_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Real-world timer: change its own period while running.
+ */
+static void test_rw_retune_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Real-world timer: start the next timer in the chain.
+ */
+static void test_rw_chain_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Real-world timer: sum the values delivered per context out of the pool.
+ */
+static void test_rw_pool_cb(void *context, uint32_t value);
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Real-world timer: block on a mutex from callback context.
+ */
+static void test_rw_block_cb(void *context, uint32_t value);
+#endif
+
+/******************************************************************************************************/
+/**
+ * @brief Timer behaviour under the awkward patterns applications actually use.
+ */
+static void test_timer_real_world(void);
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Calls os_notify_wait(os_test_notify_wait_timeout_ms, ...) and records the result, the
+ *        delivered value, and the elapsed ticks - shared body for the give-before-wait,
+ *        wait-then-give, and timeout cases below (each just sets the timeout and interleaves
+ *        os_notify_give differently around starting this task).
+ */
+static void test_notify_wait_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Blocks in an unrelated os_delay_ms (not a notification wait), then does a
+ *        non-blocking os_notify_wait - proves a give() that arrives during the delay
+ *        neither cuts it short nor is lost.
+ */
+static void test_notify_unrelated_block_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Wait for a notification, then check the second one is not lost.
+ */
+static void test_notify_discard_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Task notifications: send, wait, time out, and stale handles.
+ */
+static void test_task_notify(void);
+#endif /* OS_CONFIG_NOTIFY_ENABLE */
+
+/******************************************************************************************************/
+/**
+ * @brief Checks that a PASSING assertion is invisible: no halt, no side effect, and the
+ *        expression is evaluated exactly once when assertions are compiled in.
+ */
+static void test_assert(void);
+
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Exercises the log ring end to end: delivery through the output hook, formatting, the
+ *        level filter, and the drop-and-count behavior when the buffer overruns.
+ */
+static void test_log(void);
+#else
+/******************************************************************************************************/
+/**
+ * @brief Exercises the log ring end to end: delivery through the output hook, formatting, the level
+ *        filter, and the drop-and-count behavior when the buffer overruns.
+ */
+static void test_log(void);
+#endif /* OS_CONFIG_LOG_ENABLE */
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Kernel heap: allocate, free, and the free-space accounting.
+ */
+static void test_alloc(void);
+#endif /* OS_CONFIG_ALLOC_ENABLE */
+
+#if (OS_CONFIG_STACK_WATERMARK_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Task stack watermark reporting.
+ */
+static void test_stack_watermark(void);
+#endif /* OS_CONFIG_STACK_WATERMARK_ENABLE */
+
+#if (OS_CONFIG_CPU_USAGE_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief CPU-load sampling, idle and busy.
+ */
+static void test_cpu_usage(void);
+#endif /* OS_CONFIG_CPU_USAGE_ENABLE */
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Sends ctx->count items (ctx->base_value .. +count-1) into the shared pipeline queue,
+ *        blocking whenever it is full - one of two producers running concurrently.
+ */
+static void test_pipeline_producer_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Drains the shared pipeline queue, accumulating into a mutex-protected running total -
+ *        one of two consumers running concurrently, so the mutex is under real contention:
+ *        if it ever failed to serialize the read-modify-write, the total would come out wrong.
+ *        Stops once the known total item count has been processed (by either consumer), or
+ *        after a receive timeout (the other consumer got the last item).
+ */
+static void test_pipeline_consumer_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Two producers and two consumers share a queue (capacity 3, far smaller than the 12
+ *        items produced, so both directions really block) and a mutex-protected accumulator.
+ *        The pass criterion is an exact sum: any lost mutex update or dropped/duplicated queue
+ *        item would show up as a wrong total, not just "some items arrived".
+ */
+static void test_pipeline(void);
+#endif /* OS_CONFIG_QUEUE_ENABLE && OS_CONFIG_MUTEX_ENABLE */
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Locks os_test_prio_mutex (blocking until granted), records ctx->priority_tag as the next
+ *        entry in the shared wake-order log, then unlocks and exits.
+ */
+static void test_prio_waiter_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Three tasks at three different priorities (started low-to-high, to rule out arrival
+ *        order) all block on a mutex this test task holds; releasing it must wake them
+ *        highest-priority-first, not creation/arrival order - proving the mutex waiter list is
+ *        genuinely priority-ordered under contention from more than one waiter (the
+ *        single-waiter test_mutex() above cannot distinguish priority order from FIFO order).
+ */
+static void test_mutex_priority_ordering(void);
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Blocks on os_test_inherit_mutex (held by the test task), which boosts the test task's
+ *        effective priority; once granted, records completion and releases it.
+ */
+static void test_inherit_high_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Burns a fixed number of cycles incrementing os_test_inherit_medium_counter then returns -
+ *        same shape as test_burst_spin_entry, but exposes its progress through a shared counter
+ *        so test_mutex_priority_inheritance() can prove it got zero CPU time while boosted.
+ */
+static void test_inherit_medium_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Proves single-level mutex priority inheritance closes the classic priority-inversion
+ *        window: while this test task - boosted to the blocked high-priority waiter's priority -
+ *        holds the mutex, an unrelated medium-priority task must get zero CPU time, and only
+ *        runs once the mutex is released and the boost drops back to base priority.
+ */
+static void test_mutex_priority_inheritance(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Blocks on the mutex named by its context, records its tag once granted, releases it.
+ *        Two of these run at different priorities against two different mutexes held by the same
+ *        owner - see test_mutex_multi_inheritance().
+ */
+static void test_inherit2_waiter_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief The case a single-mutex inheritance test cannot reach: ONE task holding TWO contended
+ *        mutexes at once.
+ */
+static void test_mutex_multi_inheritance(void);
+
+/******************************************************************************************************/
+/**
+ * @brief The chain a two-mutex test still cannot reach: the owner a high-priority task is waiting
+ *        for is ITSELF waiting for somebody else.
+ */
+static void test_inherit3_low_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief The middle link: takes the mutex HIGH wants, then blocks on the one LOW holds.
+ */
+static void test_inherit3_med_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief The top of the chain. Its acquisition is the moment the whole test turns on.
+ */
+static void test_inherit3_high_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Holds nothing, wants nothing, and sits between MED and HIGH. Its only job is to be
+ *        runnable, so that a LOW which was not boosted loses the CPU to it.
+ */
+static void test_inherit3_spin_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Priority inheritance followed along a chain of mutex owners.
+ */
+static void test_mutex_transitive_inheritance(void);
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Waits ctx->work_ms (staggered per task so completion order is not predictable), sends
+ *        ctx->value into the shared queue, then sets ctx->bit in the shared event - one
+ *        of three independent workers in a fan-out/fan-in pattern.
+ */
+static void test_fanin_worker_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Three tasks each do "work" for a different duration, then deliver a queue item and set
+ *        their own event bit. The test task wait-alls on all 3 bits (proving the event
+ *        correctly rendezvous-es 3 independent, differently-timed setters) then drains the
+ *        queue and checks the exact multiset of values arrived - order-independent, since which
+ *        worker finishes first is not deterministic.
+ */
+static void test_event_queue_fanin(void);
+#endif /* OS_CONFIG_QUEUE_ENABLE && OS_CONFIG_EVENT_ENABLE */
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U) && (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && \
+    (OS_CONFIG_EVENT_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Small, fast xorshift32 PRNG - just enough spread to pick different operations and
+ *        sizes per worker per iteration; not meant to be statistically strong.
+ */
+static uint32_t test_stress_prng_next(uint32_t *state);
+
+/******************************************************************************************************/
+/**
+ * @brief One stress worker: OS_TEST_STRESS_ITERATIONS times, pick one of 5 operations at
+ *        random and do it. Every operation either self-verifies (pattern-filled heap memory
+ *        read back unchanged, a received queue item decodes to a plausible sender/sequence) or
+ *        feeds a counter the parent checks after every worker has finished (successful mutex
+ *        locks vs. the shared counter they protect).
+ */
+static void test_stress_worker_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Concurrent multi-primitive stress/soak: OS_TEST_STRESS_WORKER_COUNT tasks at distinct
+ *        priorities hit a mutex, an under-provisioned semaphore and queue, an event, and
+ *        the kernel heap simultaneously and repeatedly, then the results are checked against
+ *        hard invariants (exact mutex-protected counter, exact semaphore token reconciliation,
+ *        no heap leak, no pattern/queue corruption) rather than just "the call returned OK".
+ *        Unlike every test above, several DIFFERENT primitives are under contention from
+ *        several tasks at once for many iterations, so this is the closest thing in the suite
+ *        to actually shaking out a wakeup-ordering or allocator race instead of only ever
+ *        exercising the one deterministic interleaving a scripted single-shot test happens to
+ *        produce on a given boot.
+ */
+static void test_stress_soak(void);
+#endif /* OS_CONFIG_MUTEX_ENABLE && OS_CONFIG_SEM_ENABLE && OS_CONFIG_QUEUE_ENABLE && OS_CONFIG_EVENT_ENABLE && OS_CONFIG_ALLOC_ENABLE */
+
+/******************************************************************************************************/
+/**
+ * @brief Churn worker: count one run and exit.
+ */
+static void test_churn_worker_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Creates, starts, and waits for a task to self-exit, back-to-back OS_TEST_CHURN_ITERATIONS
+ *        times on the same slot - a create/run/exit/slot-reuse cycle the earlier lifecycle test
+ *        only exercises a handful of times. Catches slot-reuse bugs (stale state left over from
+ *        the previous occupant) or ready-list corruption that only show up under repeated churn.
+ */
+static void test_stress_task_churn(void);
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Churn timer: count the firing.
+ */
+static void test_churn_timer_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Hammers os_timer_start()/os_timer_stop() on the same timer object back-
+ *        to-back, many times, always stopping it long before its (long) period could elapse -
+ *        purely to shake out add/remove bugs in the timer list under rapid churn. Finishes with
+ *        one real run to prove the timer list is still healthy afterward, not just that the API
+ *        calls returned OK.
+ */
+static void test_stress_timer_churn(void);
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Timer-flood callback: count the firing.
+ */
+static void test_tflood_cb(void *context, uint32_t value);
+#endif
+
+#if (OS_TEST_STRESS_EXTENDED == 1U)
+#if TEST_STRESS_WORKERS_NEEDED
+/******************************************************************************************************/
+/**
+ * @brief Start `count` of the shared task slots on the same entry point, each with its own context
+ *        and a distinct priority (3, 4, 5, ...), and report how many actually started.
+ */
+static uint32_t test_stress_start_workers(os_task_entry_t entry, void *contexts,
+                                          size_t context_size,
+                                          uint32_t count);
+
+/******************************************************************************************************/
+/**
+ * @brief Join `count` shared task slots, checking each one individually so a hang is attributed to
+ *        the worker that hung rather than to the group.
+ */
+static void test_stress_join_workers(uint32_t count, uint32_t timeout_ms);
+#endif /* TEST_STRESS_WORKERS_NEEDED */
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Creates, uses and deletes a HEAP-allocated queue back-to-back, with a different geometry
+ *        every cycle. test_queue_define_and_dynamic() proves one create/delete pair is correct;
+ *        this proves the pair stays correct 200 times running, which is what actually catches a
+ *        per-cycle leak or an allocator that mis-splits a reused hole.
+ */
+static void test_stress_queue_dynamic_churn(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Stress producer: push its whole run of items into the queue.
+ */
+static void test_qprod_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Three producers hammer a heap-allocated queue whose capacity is smaller than the producer
+ *        count, so nearly every send goes through the blocking path. The consumer then accounts for
+ *        every (producer, sequence) pair individually: a lost send-waiter wakeup shows up as a
+ *        missing bit, and a double delivery as an already-set one. The existing pipeline test
+ *        covers a STATIC queue with a handful of items; this covers the dynamic one at volume.
+ */
+static void test_stress_queue_dynamic_concurrent(void);
+#endif /* OS_CONFIG_QUEUE_ENABLE && OS_CONFIG_ALLOC_ENABLE */
+
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Fragments the heap deliberately, then checks the three things test_alloc() cannot: that
+ *        freeing a block never disturbs a live neighbour, that adjacent holes really do coalesce
+ *        back into one usable run, and that the heap recovers exactly after being driven to
+ *        exhaustion. A first-fit allocator with a coalescing bug passes a handful of alloc/free
+ *        calls easily and only misbehaves once the free list has holes on both sides of a block.
+ */
+static void test_stress_heap_fragmentation(void);
+#endif /* OS_CONFIG_ALLOC_ENABLE */
+
+#if (OS_CONFIG_SEM_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Stress ping-pong partner: hand the token straight back.
+ */
+static void test_pp_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Two tasks hand a token back and forth through a pair of binary semaphores, 1000 round
+ *        trips - 2000 blocking handoffs. Both semaphores start empty and the partner runs above
+ *        this task, so every single take genuinely blocks and every give genuinely wakes a waiter:
+ *        there is no already-available token to paper over a lost wakeup. One dropped wake stalls
+ *        the loop instead of quietly reducing a count.
+ */
+static void test_stress_semaphore_pingpong(void);
+#endif /* OS_CONFIG_SEM_ENABLE */
+
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Notify-storm partner: keep notifying until told to stop.
+ */
+static void test_ns_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief 1000 notifications delivered to a waiter running ABOVE the sender, so it preempts on
+ *        every give and consumes each value before the next is written. That is what makes exact
+ *        1:1 accounting meaningful for a mailbox whose documented behaviour is last-write-wins:
+ *        under this interleaving no overwrite is legitimate, so a missing or repeated value is
+ *        unambiguously a lost or duplicated wakeup rather than the overwrite semantics working.
+ */
+static void test_stress_notify_storm(void);
+#endif /* OS_CONFIG_NOTIFY_ENABLE */
+
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Event-bit storm worker: set its own bit and wait for the answer.
+ */
+static void test_ebs_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Four tasks each own one bit of the same event and pound set / wait / clear-on-exit
+ *        on it concurrently, 250 iterations apiece. Because a worker only ever touches its OWN bit
+ *        and consumes it in the same iteration it set it, the group must end with all four bits
+ *        clear - a bit left standing means one set was matched without being cleared, or cleared
+ *        without matching. That end-state invariant is what a single-task functional check cannot
+ *        provide: it needs concurrent set/wait/clear traffic on one group to be worth anything.
+ */
+static void test_stress_event_bit_storm(void);
+#endif /* OS_CONFIG_EVENT_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Arms every timer slot periodically at once, each at a different period, and lets them all
+ *        run together for a fixed window. test_timer() runs one timer at a time; this checks the
+ *        registry under a full load of concurrent expiries - that each timer keeps its own period
+ *        rather than inheriting a neighbour's, that one past capacity is refused, and that a
+ *        stopped timer really stops instead of firing once more from a stale registry entry.
+ */
+static void test_stress_timer_flood(void);
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Mutex convoy worker: take and release the shared mutex, repeatedly.
+ */
+static void test_convoy_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Four tasks at four different priorities queue up on a single mutex, 200 acquisitions
+ *        each, yielding inside the critical section every time. Checks exclusivity from inside
+ *        the section (see the worker), the exact total from outside, and that no task was starved
+ *        - priority inheritance is supposed to keep the lowest-priority worker making progress,
+ *        and only a run this long with a per-task tally can show whether it does.
+ */
+static void test_stress_mutex_convoy(void);
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+#endif /* OS_TEST_STRESS_EXTENDED */
+
+/******************************************************************************************************/
+/**
+ * @brief Prints task sizing info: the public handle size, each configured task stack size, and
+ *        actual peak stack usage (watermark) for this task and a freshly spun-up worker.
+ */
+static void test_task_footprint(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Estimates context-switch overhead: two equal-priority tasks ping-pong the CPU (each
+ *        increments a shared counter then yields) for a fixed window; dividing the window by
+ *        the total switch count gives an average, tick-resolution estimate of switch cost.
+ */
+static void test_context_switch_timing(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Exercises os_tickless_pre_sleep_cb()/os_tickless_post_sleep_cb() directly, in isolation
+ *        from the idle task and tick accounting.
+ */
+static void test_tickless_hooks(void);
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U) && (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Sleep long enough to open a tickless window, then report.
+ */
+static void test_tickless_sleeper_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief The window must never outlast the nearest deadline the kernel already knows about.
+ */
+static void test_tickless_bounds(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Many windows back to back: does the kernel clock keep up with a counter that never stops?
+ */
+static void test_tickless_drift(void);
+
+/******************************************************************************************************/
+/**
+ * @brief End-to-end tickless sleep, driven from this task rather than waiting for the idle task,
+ *        as test_tickless_hooks() does for the sleep-bracket callbacks): arms a one-shot timer as
+ *        a horizon, calls os_tickless_idle_process() once, and checks the real elapsed time was
+ *        measured accurately - proving actual SysTick suppression, not just that the call is
+ *        safe. Fails against a plain-WFI (un-suppressed) OS_ARCH_SLEEP, since the CPU would then
+ *        wake at the very next real tick regardless of the requested horizon.
+ */
+static void test_tickless_sleep(void);
+
+/******************************************************************************************************/
+/**
+ * @brief The tick really STOPS, and a refused window really is a no-op.
+ */
+static void test_tickless_suppression(void);
+#else
+/******************************************************************************************************/
+/**
+ * @brief End-to-end tickless sleep, driven from this task rather than waiting for the idle task, as
+ *        test_tickless_hooks() does for the sleep-bracket callbacks): arms a one-shot timer as a
+ *        horizon, calls os_tickless_idle_process() once, and checks the real elapsed time was
+ *        measured accurately - proving actual SysTick suppression, not just that the call is safe.
+ *        Fails against a plain-WFI (un-suppressed) OS_ARCH_SLEEP, since the CPU would then wake at
+ *        the very next real tick regardless of the requested horizon.
+ */
+static void test_tickless_sleep(void);
+
+/******************************************************************************************************/
+/**
+ * @brief The window must never outlast the nearest deadline the kernel already knows about.
+ */
+static void test_tickless_bounds(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Many windows back to back: does the kernel clock keep up with a counter that never stops?
+ */
+static void test_tickless_drift(void);
+
+/******************************************************************************************************/
+/**
+ * @brief The tick really STOPS, and a refused window really is a no-op.
+ */
+static void test_tickless_suppression(void);
+#endif /* OS_CONFIG_TICKLESS_ENABLE && OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Never actually reached - the benchmark timer's period outlives the measurement.
+ */
+static void test_bench_sleeper_entry(void *context);
+#endif
+
+/******************************************************************************************************/
+/**
+ * @brief Benchmark timer: does nothing but be dispatched.
+ */
+static void test_bench_timer_cb(void *context, uint32_t value);
+#endif
+
+/******************************************************************************************************/
+/**
+ * @brief Benchmark partner: hand the CPU straight back, until told to stop.
+ */
+static void test_bench_partner_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Print one benchmark row: the best and worst samples, each with its time in parentheses.
+ */
+static void test_bench_row(const char *name, uint32_t best, uint32_t worst, uint32_t clock_hz);
+
+/******************************************************************************************************/
+/**
+ * @brief Timed cost of every hot kernel path, printed as a table at the end of the run.
+ */
+static void test_benchmarks(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Intrusive list: insert, remove, iterate.
+ */
+static void test_list(void);
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/******************************************************************************************************/
+/**
+ * @brief Body of both multi-core workers: report which core we are on, then hammer the shared
+ *        counter under the kernel lock.
+ */
+static void test_mc_worker_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Exercise what a dual-core SoC package has to get right: that the second core starts at
+ *        all, that each core reports its own id, that affinity pins a task where it was asked to
+ *        go, and that the kernel spinlock really excludes across cores.
+ */
+static void test_multicore(void);
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/******************************************************************************************************/
+/**
+ * @brief Re-check, at the very end of the run, that both cores are still alive.
+ */
+static void test_multicore_watch(uint32_t watch_ms, const char *when);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: nest critical sections on whichever core this runs.
+ */
+static void test_smp_nested_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: nested critical sections taken on both cores at once.
+ */
+static void test_smp_critical_nested(void);
+
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief SMP: hammer the shared atomic counter from this core.
+ */
+static void test_smp_atomic_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: one atomic counter under contention from both cores.
+ */
+static void test_smp_atomic_contention(void);
+#endif /* OS_CONFIG_ATOMIC_ENABLE */
+
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief SMP ping-pong: notify the partner, then wait for its answer.
+ */
+static void test_smp_notify_a_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP ping-pong: wait for the partner, then notify it back.
+ */
+static void test_smp_notify_b_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: task notifications bounce between the cores.
+ */
+static void test_smp_notify_pingpong(void);
+#endif /* OS_CONFIG_NOTIFY_ENABLE */
+
+#if (OS_CONFIG_SEM_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief SMP ping-pong: hand the semaphore token to the partner.
+ */
+static void test_smp_sem_a_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP ping-pong: take the token and hand it straight back.
+ */
+static void test_smp_sem_b_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: semaphore tokens bounce between the cores.
+ */
+static void test_smp_semaphore_pingpong(void);
+#endif /* OS_CONFIG_SEM_ENABLE */
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief SMP: produce this producer numbered run of items.
+ */
+static void test_smp_queue_producer_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: consume every item both producers sent.
+ */
+static void test_smp_queue_consumer_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: two producers, one consumer, and the item count has to add up.
+ */
+static void test_smp_queue_accounting(void);
+#endif /* OS_CONFIG_QUEUE_ENABLE */
+
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief SMP: wait for this round event bit.
+ */
+static void test_smp_event_waiter_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: set the event bit the waiter is blocked on.
+ */
+static void test_smp_event_setter_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: event bits hand off between the cores.
+ */
+static void test_smp_event_pingpong(void);
+#endif /* OS_CONFIG_EVENT_ENABLE */
+
+/******************************************************************************************************/
+/**
+ * @brief Count work while the scheduler is free to move this task.
+ */
+static void test_smp_migration_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: a task that may migrate keeps its own stack and its own count.
+ */
+static void test_smp_migration(void);
+
+/******************************************************************************************************/
+/**
+ * @brief os_kernel_lock is per-core by design: core 0 holding it must not delay core 1's own
+ *        scheduler by one tick. The heartbeat workers parked by test_multicore() are the witness.
+ */
+static void test_smp_lock_independent(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Transient task body: count one run and exit.
+ */
+static void test_smp_churn_worker_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: create, start and outlive transient tasks in a loop.
+ */
+static void test_smp_churn_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: task create/start/exit churn on both cores at once.
+ */
+static void test_smp_task_churn(void);
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Deferred call: check which core dispatched it.
+ */
+static void test_smp_submit_cb(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: submit deferred calls from this core.
+ */
+static void test_smp_submit_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: deferred calls submitted from both cores at once.
+ */
+static void test_smp_deferred_submit(void);
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ATOMIC_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief SMP soak worker: mixed queue, mutex and notify traffic.
+ */
+static void test_smp_soak_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief One unpinned worker: note the core, count once under the lock, then yield and check
+ *        that this task's own stack is still its own.
+ */
+static void test_any_worker_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Four OS_TASK_CORE_ANY workers at once: does unpinned scheduling hold together?
+ */
+static void test_smp_core_any(void);
+
+/******************************************************************************************************/
+/**
+ * @brief SMP: mixed IPC soak run across both cores.
+ */
+static void test_smp_soak_mixed(void);
+#endif /* SEM && QUEUE && ATOMIC */
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+/******************************************************************************************************/
+/**
+ * @brief Report what this configuration leaves out (informational only).
+ */
+static void test_unsupported_features(void);
+
+#if (OS_CONFIG_SEM_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Regression: the second waiter on the semaphore.
+ */
+static void test_reg_waiter_b(void *context);
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Regression: the low-priority task that holds the mutex while boosted.
+ */
+static void test_reg_boosted_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Regression: the high-priority task whose wait does the boosting.
+ */
+static void test_reg_booster_entry(void *context);
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+#endif /* OS_CONFIG_SEM_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Regression timer: does nothing but be dispatched.
+ */
+static void test_reg_timer_cb(void *context, uint32_t value);
+#endif
+
+/******************************************************************************************************/
+/**
+ * @brief Regression: count one run at the priority under test.
+ */
+static void test_prio_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief The public priority API: read back what was set, refuse what is out of range, and take
+ *        effect immediately.
+ */
+static void test_priority_api(void);
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief What a waiter does: block on the mutex, record the order it was granted, release, exit.
+ */
+static void test_requeue_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief A waiter re-prioritised while it is ALREADY QUEUED gets its new place in the queue.
+ */
+static void test_priority_requeue(void);
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Queue occupancy accounting: count and free must always agree with the capacity.
+ */
+static void test_queue_accounting(void);
+#endif /* OS_CONFIG_QUEUE_ENABLE */
+
+#if defined(__ARM_FP)
+/******************************************************************************************************/
+/**
+ * @brief Hold a pattern in s16-s31 and yield, so the task under test has something to be confused
+ *        with. Counts its own losses too - either task noticing is a failure.
+ */
+static void test_fpu_partner_entry(void *context);
+#endif /* __ARM_FP */
+
+/******************************************************************************************************/
+/**
+ * @brief The port's half of the FPU context: s16-s31 survive a context switch intact.
+ */
+static void test_fpu_context(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Regression checks: tick saturation, wake handoff on pause, priority-boost re-ordering,
+ *        timer restart with an undrained expiry, and timer registry slot release.
+ */
+static void test_regressions(void);
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
+static uint32_t os_test_pass_count = 0U;
+static uint32_t os_test_fail_count = 0U;
+
+OS_TASK_DEFINE(worker, 512U);
+OS_TASK_DEFINE(helper, 512U);
+
+/* Two more concurrent task slots for the combined-scenario tests below, which run 3-4 tasks
+ * at once (single-primitive tests above only ever run one helper at a time). */
+OS_TASK_DEFINE(helper2, 512U);
+OS_TASK_DEFINE(helper3, 512U);
+
+static __IO uint32_t os_test_worker_counter    = 0U;
+static __IO bool     os_test_worker_should_run = true;
+
+/* Shared between test_priority_preemption() and test_cpu_usage(): a task that spins
+ * incrementing this counter, without ever yielding/delaying, so it only runs on ticks
+ * nothing higher-priority is ready for. */
+static __IO uint32_t os_test_busy_counter    = 0U;
+static __IO bool     os_test_busy_should_run = true;
+
+/* test_scheduler_lock(): set by a task that outranks the test task, so the flag can only
+ * turn true once the scheduler is actually allowed to switch. */
+static __IO bool     os_test_sched_lock_ran  = false;
+#if (OS_CONFIG_SEM_ENABLE == 1U)
+static os_sem_t os_test_sched_lock_sem;  /* left empty: a take would have to block */
+#endif
+
+/* Dedicated benchmark objects, kept separate from the functional tests' shared ones so a
+ * leftover count/item/waiter from an earlier section cannot skew a measurement. */
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+static os_mutex_t     os_test_bench_mutex;
+#endif
+
+#if (OS_CONFIG_SEM_ENABLE == 1U)
+static os_sem_t os_test_bench_sem;
+#endif
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+OS_QUEUE_DEFINE_ATTR(os_test_bench_queue, sizeof(uint32_t), 4, );
+#endif
+
+#if (OS_CONFIG_MSG_ENABLE == 1U)
+/* Room for one message of the longest size benchmarked below, header included - only one is
+ * ever in flight, since each sample sends and then receives. */
+OS_MSG_DEFINE_ATTR(os_test_bench_msg, OS_MSG_SPACE(64U), );
+#endif
+
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+static os_event_t os_test_bench_event;
+#endif
+
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+/* File scope, not a local: the port's operations want a naturally aligned 32-bit word, which a
+ * static of this type is by definition. */
+static os_atomic_t os_test_bench_atomic = OS_ATOMIC_INIT(0);
+#endif
 
 OS_TASK_DEFINE(os_test_bench_task_fill0, OS_CONFIG_MIN_STACK_SIZE);
 OS_TASK_DEFINE(os_test_bench_task_fill1, OS_CONFIG_MIN_STACK_SIZE);
@@ -235,21 +1919,9 @@ static os_task_t *os_test_bench_task_fill[TEST_BENCH_TASK_FILL] = {
 };
 
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
-static void test_bench_timer_cb(void *context, uint32_t value);
-
-/* Sits in the delay list for the whole deadline-scan measurement, then leaves. */
-#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
-static void test_bench_sleeper_entry(void *context);
-#endif
-
 /* A minute long, so it can be armed and cancelled 2000 times over without ever expiring: the
  * measurement sees the arm/cancel path alone, never a delivery. */
 OS_TIMER_DEFINE_ONESHOT(os_test_bench_timer, 60000U, test_bench_timer_cb);
-
-/* Filler for the second timer row: start and stop search the running list, so their cost depends
- * on how many timers are RUNNING. These sit in that list doing nothing, to make the slope visible
- * rather than leaving it to be reasoned about. */
-#define TEST_BENCH_TIMER_FILL  8U
 
 OS_TIMER_DEFINE_ONESHOT(os_test_bf0, 60000U, test_bench_timer_cb);
 OS_TIMER_DEFINE_ONESHOT(os_test_bf1, 60000U, test_bench_timer_cb);
@@ -276,19 +1948,6 @@ static __IO bool     os_test_switch_should_run = true;
 static os_mutex_t os_test_mutex;
 #endif
 
-/* test_spawn_helper has to exist whenever a section that CALLS it is compiled in, and no more.
- * Guarding it on a single feature left the others calling an undeclared function; listing a
- * feature that does not actually call it leaves the helper defined and unused, which is what
- * -Wunused-function reports (and -Werror fails on).
- *
- * OS_CONFIG_MUTEX_ENABLE is deliberately NOT here even though the mutex section contains a call:
- * that call sits inside a nested OS_CONFIG_SEM_ENABLE guard, since handing a mutex over
- * needs a semaphore to do it with. Mutexes alone never reach the helper, so the semaphore term
- * below already covers that case. */
-#define TEST_HELPER_NEEDED ((OS_CONFIG_SEM_ENABLE == 1U) || \
-                            (OS_CONFIG_QUEUE_ENABLE == 1U)     || \
-                            (OS_CONFIG_EVENT_ENABLE == 1U))
-
 #if (OS_CONFIG_SEM_ENABLE == 1U)
 static os_sem_t os_test_bin_sem;
 static os_sem_t os_test_count_sem;
@@ -314,10 +1973,6 @@ static os_event_t os_test_event;
 #endif
 
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
-static void timer_oneshot_cb(void *context, uint32_t value);
-static void timer_periodic_cb(void *context, uint32_t value);
-static void test_churn_timer_cb(void *context, uint32_t value);
-
 /* Set up where they are declared: the kernel has no init call, so period, mode and callback are
  * settled here and only the period is ever retuned (os_timer_period_set) at run time. */
 OS_TIMER_DEFINE_ONESHOT(os_test_timer_oneshot, 50U, timer_oneshot_cb);
@@ -330,20 +1985,7 @@ static __IO uint32_t os_test_oneshot_fired  = 0U;
 static __IO uint32_t os_test_periodic_fired = 0U;
 #endif
 
-
 #if (OS_CONFIG_LOG_ENABLE == 1U)
-/* Capture buffer for test_log(): this file supplies os_log_output_cb - the kernel declares it and
- * defines nothing - so the log task hands its bytes here instead of to a UART. Kept small on
- * purpose - only the most recent output needs inspecting. */
-/* Must hold everything a single drain can deliver after the capture is cleared: a full ring, plus
- * the dropped-lines notice tsk_log emits once that ring empties.
- *
- * Sized from the ring rather than fixed, because getting this wrong does not look like a capture
- * problem. At 512 bytes the flood test filled the capture with "flood ..." lines and silently
- * discarded the notice that arrived after them, so three checks failed as though the kernel had
- * never emitted it. */
-#define TEST_LOG_CAPTURE_SIZE (OS_CONFIG_LOG_BUFFER_SIZE + 128U)
-
 static char              os_test_log_capture[TEST_LOG_CAPTURE_SIZE];
 static __IO size_t   os_test_log_capture_len      = 0U;
 static __IO uint32_t os_test_log_capture_lines    = 0U;
@@ -359,53 +2001,13 @@ static __IO os_err_t os_test_notify_second_status;
 static uint32_t           os_test_notify_wait_timeout_ms; /* set by the test before starting the waiter */
 #endif
 
-typedef enum
-{
-    HELPER_NONE = 0,
-    HELPER_MUTEX_HOLD,
-    HELPER_SEM_GIVE_AFTER,
-    HELPER_EVENT_SET_AFTER,
-    HELPER_QUEUE_SEND_AFTER,
-
-} helper_role_t;
-
-typedef struct
-{
-    helper_role_t role;
-    uint32_t      hold_ms;
-    uint32_t      bits;
-    uint32_t      value;
-
-} helper_ctx_t;
-
 #if TEST_HELPER_NEEDED
 /* Only test_spawn_helper writes it and only test_helper_entry reads it, so it follows their guard
  * (an unused static is a -Werror build failure; the two typedefs above are harmless either way). */
 static helper_ctx_t os_test_helper_ctx;
 #endif
 
-/*
- * ***********************************************************************************************************
- * Combined-scenario context types and objects (see "Integration / Combined Scenarios" below)
- * ***********************************************************************************************************
- *
- * Unlike the single-primitive tests above (one helper task, one role at a time via
- * os_test_helper_ctx), these run several DIFFERENT tasks concurrently, each with its own behavior -
- * so each gets its own context struct, passed through OS_TASK_CONFIG's context pointer instead
- * of the shared dispatch-by-role pattern.
-*/
-
 #if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_MUTEX_ENABLE == 1U)
-#define TEST_PIPELINE_ITEMS_PER_PRODUCER 6U
-#define TEST_PIPELINE_TOTAL_ITEMS        (2U * TEST_PIPELINE_ITEMS_PER_PRODUCER)
-
-typedef struct
-{
-    uint32_t base_value;
-    uint32_t count;
-
-} test_producer_ctx_t;
-
 static test_producer_ctx_t os_test_producer_ctx[2];
 static os_mutex_t          os_test_pipeline_mutex;
 static __IO uint32_t   os_test_pipeline_total;
@@ -413,12 +2015,6 @@ static __IO uint32_t   os_test_pipeline_processed;
 #endif
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
-typedef struct
-{
-    uint32_t priority_tag;
-
-} test_prio_ctx_t;
-
 static test_prio_ctx_t   os_test_prio_ctx[3];
 static os_mutex_t        os_test_prio_mutex;
 static __IO uint32_t os_test_prio_order[3];
@@ -430,16 +2026,8 @@ static os_mutex_t        os_test_inherit_mutex;
 static __IO bool     os_test_inherit_high_done;
 static __IO uint32_t os_test_inherit_medium_counter;
 
-/* Two mutexes held at once by the same owner, each with its own higher-priority waiter -
- * see test_mutex_multi_inheritance(). */
-typedef struct
-{
-    os_mutex_t *mutex;
-    uint32_t   tag;   /* OR'd into os_test_inherit2_done_mask once this waiter is granted the mutex */
-
-} test_inherit2_ctx_t;
-
 static test_inherit2_ctx_t os_test_inherit2_ctx[2];
+
 /* A CHAIN of mutex ownership: HIGH waits on MED, MED waits on LOW, and SPIN sits between them
  * holding nothing - see test_mutex_transitive_inheritance(). */
 OS_TASK_DEFINE(os_test_inherit3_low_task,  512U);
@@ -470,39 +2058,11 @@ static __IO uint32_t   os_test_inherit2_done_mask;
 #endif
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
-typedef struct
-{
-    uint32_t bit;
-    uint32_t value;
-    uint32_t work_ms;
-
-} test_fanin_ctx_t;
-
 static test_fanin_ctx_t os_test_fanin_ctx[3];
 #endif
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U) && (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && \
     (OS_CONFIG_EVENT_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
-/* Concurrent multi-primitive stress/soak (see "Stress/Soak" below): unlike every scenario
- * above, which runs a small fixed handful of tasks each doing ONE thing, this runs
- * OS_TEST_STRESS_WORKER_COUNT tasks at distinct priorities that each hit a mutex, a
- * deliberately under-provisioned semaphore and queue, an event, and the kernel heap -
- * all at once, repeatedly, for many iterations, then check hard invariants instead of just
- * "the call returned OK". Bump OS_TEST_STRESS_ITERATIONS for a longer soak run; the default
- * is sized to add at most a couple of seconds to a boot-time log, not to replace a real
- * multi-hour soak. */
-#define OS_TEST_STRESS_WORKER_COUNT   4U
-#define OS_TEST_STRESS_ITERATIONS     300U
-#define OS_TEST_STRESS_SEM_MAX        2U    /* < worker count: forces real blocking/timeouts */
-#define OS_TEST_STRESS_QUEUE_CAPACITY 3U    /* < worker count: forces real FULL/EMPTY paths  */
-
-typedef struct
-{
-    uint32_t worker_id;
-    uint32_t prng_state; /* xorshift32 stream, seeded distinctly per worker; never 0 */
-
-} test_stress_ctx_t;
-
 static test_stress_ctx_t os_test_stress_ctx[OS_TEST_STRESS_WORKER_COUNT];
 static __IO uint32_t os_test_stress_done[OS_TEST_STRESS_WORKER_COUNT];        /* iterations completed   */
 static __IO uint32_t os_test_stress_mutex_hits[OS_TEST_STRESS_WORKER_COUNT];  /* successful mutex locks */
@@ -517,163 +2077,458 @@ static os_event_t  os_test_stress_event;
 OS_QUEUE_DEFINE_ATTR(os_test_stress_queue, sizeof(uint32_t), OS_TEST_STRESS_QUEUE_CAPACITY, );
 #endif
 
-/*
- * ***********************************************************************************************************
- * Private function prototypes
- * ***********************************************************************************************************
-*/
-
-static bool      test_wait_inactive(const os_task_t *task, uint32_t timeout_ms);
-static void      test_worker_entry(void *context);
-static void      test_self_pause_worker_entry(void *context);
-#if TEST_HELPER_NEEDED
-static void      test_helper_entry(void *context);
-static os_err_t test_spawn_helper(helper_role_t role, uint32_t hold_ms, uint32_t bits, uint32_t value);
-#endif
-
-static void test_kernel_core(void);
-static void test_delay(void);
-static void test_critical_section(void);
-static void test_task_lifecycle(void);
-static void test_task_identity(void);
-static void test_priority_preemption(void);
-static void test_sched_lock_entry(void *context);
-static void test_scheduler_lock(void);
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-static void test_mutex(void);
-#endif
-#if (OS_CONFIG_SEM_ENABLE == 1U)
-static void test_semaphore(void);
-#endif
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
-static void test_queue(void);
-static void test_queue_define_and_dynamic(void);
-static void test_queue_overwrite(void);
 #if (OS_CONFIG_ATOMIC_ENABLE == 1U)
-static void test_atomic(void);
-#endif
-#endif
+static os_atomic_t      os_test_atomic_counter = OS_ATOMIC_INIT(0);
+static __IO int32_t os_test_plain_counter  = 0;
+
+/* Declared as os_atomic_t rather than a volatile int, which is what the header asks for: casting
+ * some other type to os_atomic_t * to reach these calls is how a "volatile" counter quietly
+ * becomes one the compiler is free to cache again. */
+static os_atomic_t      os_test_atomic_done    = OS_ATOMIC_INIT(0);
+#endif /* OS_CONFIG_ATOMIC_ENABLE */
+
+OS_QUEUE_DEFINE(os_test_defined_queue, sizeof(test_queue_item_t), 4);
+
+/* Three slots, because three is the smallest capacity where "the oldest went and the rest kept
+ * their order" is a different statement from "something went". */
+OS_QUEUE_DEFINE(os_test_ow_queue, sizeof(uint32_t), 3);
+#endif /* OS_CONFIG_QUEUE_ENABLE */
+
 #if (OS_CONFIG_MSG_ENABLE == 1U)
-static void test_msg(void);
-#endif
-#if (OS_CONFIG_EVENT_ENABLE == 1U)
-static void test_event_group(void);
-#endif
+/* Deliberately not a round number of anything: 3 * OS_MSG_SPACE(16) is 54, so a run of 16-byte
+ * messages leaves head and tail at a different offset on every lap and the ring is forced to wrap
+ * mid-message rather than only at a tidy boundary. That wrap is the one thing a byte ring can get
+ * wrong that a slot queue cannot. */
+OS_MSG_DEFINE(os_test_msg, 3U * OS_MSG_SPACE(16U));
+#endif /* OS_CONFIG_MSG_ENABLE */
+
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
-static void test_timer(void);
-#endif
+/* This object must be startable straight from its definition - the kernel has no init call. */
+OS_TIMER_DEFINE_ONESHOT(os_test_defined_timer, 40U, timer_oneshot_cb);
+
+OS_TIMER_DEFINE_PERIODIC(os_test_args_timer, 20U, timer_args_cb);
+
+static __IO uint32_t os_test_args_runs    = 0U;
+static __IO bool     os_test_args_ok      = false;
+static uint32_t      os_test_args_marker  = 0x5EED5EEDUL;
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
-static void test_timer_retune(void);
-static void test_timer_isr(void);
-static void test_timer_pool(void);
-static void test_timer_real_world(void);
-#endif
-static void test_assert(void);
-static void test_log(void);
-#if (OS_CONFIG_LOG_ENABLE == 1U)
-static bool test_log_capture_contains(const char *needle);
-#endif
-#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
-static void test_notify_wait_entry(void *context);
-static void test_notify_unrelated_block_entry(void *context);
-static void test_notify_discard_entry(void *context);
-static void test_task_notify(void);
-#endif
-#if (OS_CONFIG_ALLOC_ENABLE == 1U)
-static void test_alloc(void);
-#endif
-#if (OS_CONFIG_STACK_WATERMARK_ENABLE == 1U)
-static void test_stack_watermark(void);
-#endif
-#if (OS_CONFIG_CPU_USAGE_ENABLE == 1U)
-static void test_cpu_usage(void);
-#endif
-static void test_task_footprint(void);
-static void test_context_switch_timing(void);
-static void test_bench_row(const char *name, uint32_t best, uint32_t worst, uint32_t clock_hz);
-static void test_benchmarks(void);
-static void test_tickless_hooks(void);
-static void test_tickless_sleep(void);
-static void test_tickless_bounds(void);
-static void test_tickless_drift(void);
-static void test_tickless_suppression(void);
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-static void test_priority_requeue(void);
-static void test_requeue_entry(void *context);
-#endif
-#if (OS_CONFIG_TICKLESS_ENABLE == 1U) && (OS_CONFIG_TIMER_ENABLE == 1U)
-static void test_tickless_sleeper_entry(void *context);
-#endif
-static void test_list(void);
-#if (OS_CONFIG_CORE_COUNT > 1U)
-static void test_multicore(void);
-static void test_multicore_watch(uint32_t watch_ms, const char *when);
-static void test_smp_core_any(void);
-static void test_smp_critical_nested(void);
-#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
-static void test_smp_atomic_contention(void);
-#endif
-#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
-static void test_smp_notify_pingpong(void);
-#endif
-#if (OS_CONFIG_SEM_ENABLE == 1U)
-static void test_smp_semaphore_pingpong(void);
-#endif
+/* One timer the ISR arms and later cancels, and one it uses as a deferred call - the "run this
+ * soon" case, which in this kernel is simply a one-shot with a one-tick period. */
+OS_TIMER_DEFINE_ONESHOT(os_test_isr_timer, 1000U, test_isr_timer_cb);
+OS_TIMER_DEFINE_ONESHOT(os_test_isr_defer, 1U, test_isr_defer_cb);
+
+static uint32_t       os_test_isr_marker        = 0xC0FFEEUL;
+
+static __IO uint32_t  os_test_isr_action        = TEST_ISR_ACTION_ARM;
+static __IO uint32_t  os_test_isr_entered       = 0U;
+static __IO bool      os_test_isr_was_isr       = false;
+static __IO os_err_t os_test_isr_period_status = OS_ERR_ERROR;
+static __IO os_err_t os_test_isr_start_status  = OS_ERR_ERROR;
+static __IO os_err_t os_test_isr_defer_status  = OS_ERR_ERROR;
+static __IO os_err_t os_test_isr_stop_status   = OS_ERR_ERROR;
+static __IO uint32_t  os_test_isr_timer_fired   = 0U;
+static __IO uint32_t  os_test_isr_defer_ran     = 0U;
+static __IO bool      os_test_isr_args_ok       = false;
+
+/* Its own object rather than a shared one: this section repoints the callback and moves the
+ * period a long way in both directions, and doing that to a timer another section also uses
+ * would leave that one's assumptions silently wrong. The declared period is overwritten
+ * before every start below, so the number here only has to be legal. */
+OS_TIMER_DEFINE_PERIODIC(os_test_retune_timer, 60U, timer_retune_a_cb);
+
+/* Only its ADDRESS is ever read; the contents mean nothing. */
+static uint32_t          os_test_retune_marker    = 0U;
+static __IO uint32_t     os_test_retune_a_runs    = 0U;
+static __IO uint32_t     os_test_retune_a_value   = 0U;
+static __IO uint32_t     os_test_retune_b_runs    = 0U;
+static __IO uint32_t     os_test_retune_b_value   = 0U;
+static void * __IO       os_test_retune_b_context = NULL;
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/* Three pools rather than three delays at the call site: the delay belongs to the definition now,
+ * so "same work, different timing" is a second pool. */
+OS_TIMER_DEFINE_SUBMIT(os_test_pool,      TEST_POOL_SIZE, 0U,  test_pool_cb);
+OS_TIMER_DEFINE_SUBMIT(os_test_pool_slow, TEST_POOL_SIZE, 60U, test_pool_cb);
+OS_TIMER_DEFINE_SUBMIT(os_test_pool_b,    2U,             0U,  test_pool_other_cb);
+
+/* The DECLARE macros, exercised the only way a declaration can be: by compiling. Each names an
+ * object this file also DEFINES, so the compiler sees both and rejects any disagreement about the
+ * type. Nothing at run time depends on these lines - if one of the object types ever changes and
+ * its DECLARE is not changed with it, the build stops here rather than in somebody's project. */
+OS_TASK_DECLARE(worker);
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
-static void test_smp_queue_accounting(void);
+OS_QUEUE_DECLARE(os_test_queue);
 #endif
+
+#if (OS_CONFIG_MSG_ENABLE == 1U)
+OS_MSG_DECLARE(os_test_msg);
+#endif
+
+OS_TIMER_DECLARE(os_test_timer_periodic);
+OS_TIMER_POOL_DECLARE(os_test_pool);
+
+/* The contrast case: one ordinary one-shot, started twice. */
+OS_TIMER_DEFINE_ONESHOT(os_test_coalesce, 30U, test_coalesce_cb);
+
+static uint32_t      os_test_pool_marker = 0xFEEDU;
+static __IO uint32_t os_test_pool_log[TEST_POOL_LOG_MAX];
+static __IO uint32_t os_test_pool_runs  = 0U;
+static __IO bool     os_test_pool_ctx_ok = true;
+static __IO uint32_t os_test_pool_b_runs = 0U;
+static __IO uint32_t os_test_coalesce_runs = 0U;
+static __IO uint32_t os_test_coalesce_last = 0U;
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+OS_TIMER_DEFINE_ONESHOT(os_test_rw_rearm,    20U, test_rw_rearm_cb);
+OS_TIMER_DEFINE_PERIODIC(os_test_rw_selfstop, 20U, test_rw_selfstop_cb);
+OS_TIMER_DEFINE_PERIODIC(os_test_rw_slow,     10U, test_rw_slow_cb);
+OS_TIMER_DEFINE_ONESHOT(os_test_rw_owed,     20U, test_rw_owed_cb);
+OS_TIMER_DEFINE_PERIODIC(os_test_rw_retune,   40U, test_rw_retune_cb);
+OS_TIMER_DEFINE_ONESHOT(os_test_rw_chain,    15U, test_rw_chain_cb);
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+OS_TIMER_DEFINE_ONESHOT(os_test_rw_block,    20U, test_rw_block_cb);
+#endif
+
+OS_TIMER_DEFINE_PERIODIC(os_test_rw_same0, 30U, test_rw_same_cb);
+OS_TIMER_DEFINE_PERIODIC(os_test_rw_same1, 30U, test_rw_same_cb);
+OS_TIMER_DEFINE_PERIODIC(os_test_rw_same2, 30U, test_rw_same_cb);
+OS_TIMER_DEFINE_PERIODIC(os_test_rw_same3, 30U, test_rw_same_cb);
+
+static os_timer_t *os_test_rw_same[TEST_RW_SAME_PERIOD] = {
+    &os_test_rw_same0, &os_test_rw_same1, &os_test_rw_same2, &os_test_rw_same3,
+};
+
+/* Two pools sharing ONE callback, to prove their values cannot cross. */
+OS_TIMER_DEFINE_SUBMIT(os_test_rw_pool_a, 3U, 0U, test_rw_pool_cb);
+OS_TIMER_DEFINE_SUBMIT(os_test_rw_pool_b, 3U, 0U, test_rw_pool_cb);
+
+/* ONE entry, deliberately: a callback that submits again can only succeed if the entry it is being
+ * delivered on is already back in the pool. Depth 1 makes that the only way the chain can run. */
+OS_TIMER_DEFINE_SUBMIT(os_test_rw_chain_pool, 1U, 0U, test_rw_chain_cb);
+
+static __IO uint32_t os_test_rw_rearm_runs   = 0U;
+static __IO uint32_t os_test_rw_selfstop_runs = 0U;
+static __IO uint32_t os_test_rw_slow_runs    = 0U;
+static __IO uint32_t os_test_rw_owed_runs    = 0U;
+static __IO uint32_t os_test_rw_same_seen[TEST_RW_SAME_PERIOD];
+static __IO uint32_t os_test_rw_retune_runs  = 0U;
+static __IO uint32_t os_test_rw_chain_runs   = 0U;
+static __IO uint32_t os_test_rw_chain_fails  = 0U;
+static __IO uint32_t os_test_rw_pool_a_sum   = 0U;
+static __IO uint32_t os_test_rw_pool_b_sum   = 0U;
+static uint32_t      os_test_rw_marker_a     = 0xAAU;
+static uint32_t      os_test_rw_marker_b     = 0xBBU;
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+static os_mutex_t    os_test_rw_mutex;
+static __IO bool     os_test_rw_block_done = false;
+#endif
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+static __IO uint32_t os_test_churn_counter = 0U;
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+static __IO uint32_t os_test_churn_timer_fired = 0U;
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/* Enough timers to fill the registry, plus one more that must therefore be refused.
+ *
+ * Defined out here, ahead of the OS_TEST_STRESS_EXTENDED block below, because BOTH the extended
+ * timer-flood stress test (inside that block, so compiled out in unoptimized builds) and
+ * test_regressions() (which runs in every build) fill the registry with them. Declaring them
+ * inside the block made the whole suite fail to compile at -O0 - precisely the build a board
+ * bring-up uses.
+ *
+ * The CALLBACK has to come out with them, not just a forward declaration of it. An
+ * OS_TIMER_DEFINE_PERIODIC stores the function pointer in the timer object itself, so every one of
+ * these definitions is a use: leaving the body inside the block satisfied the compiler and then
+ * failed at link with "undefined reference to test_tflood_cb" in exactly the -O0 build this comment
+ * was written to protect. The counter it writes moves with it for the same reason. */
+static __IO uint32_t os_test_tflood_fired[TEST_TIMER_SET];
+
+OS_TIMER_DEFINE_PERIODIC(os_test_tf0, 10U, test_tflood_cb);
+OS_TIMER_DEFINE_PERIODIC(os_test_tf1, 15U, test_tflood_cb);
+OS_TIMER_DEFINE_PERIODIC(os_test_tf2, 20U, test_tflood_cb);
+OS_TIMER_DEFINE_PERIODIC(os_test_tf3, 25U, test_tflood_cb);
+
+static os_timer_t *os_test_tflood[TEST_TIMER_SET] = {
+    &os_test_tf0,
+    &os_test_tf1,
+    &os_test_tf2,
+    &os_test_tf3,
+};
+
+OS_TIMER_DEFINE_PERIODIC(os_test_tflood_extra, 10U, test_tflood_cb);
+#endif
+
+#if (OS_TEST_STRESS_EXTENDED == 1U)
+#if TEST_STRESS_WORKERS_NEEDED
+/* The four concurrent task slots the multi-worker stress tests share, in priority order. */
+static os_task_t *const os_test_stress_tasks[4] = { &worker, &helper, &helper2, &helper3 };
+#endif /* TEST_STRESS_WORKERS_NEEDED */
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
+static test_qprod_ctx_t os_test_qprod_ctx[OS_TEST_QPROD_COUNT];
+static os_queue_t       os_test_qprod_queue;
+static __IO uint32_t    os_test_qprod_sent[OS_TEST_QPROD_COUNT];
+#endif /* OS_CONFIG_QUEUE_ENABLE && OS_CONFIG_ALLOC_ENABLE */
+
+#if (OS_CONFIG_SEM_ENABLE == 1U)
+static os_sem_t os_test_pp_ping;
+static os_sem_t os_test_pp_pong;
+static __IO uint32_t  os_test_pp_partner_rounds = 0U;
+#endif /* OS_CONFIG_SEM_ENABLE */
+
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
+static __IO uint32_t os_test_ns_received = 0U;
+static __IO uint32_t os_test_ns_last     = 0U;
+static __IO bool     os_test_ns_order_ok = true;
+static __IO bool     os_test_ns_run      = true;
+#endif /* OS_CONFIG_NOTIFY_ENABLE */
+
 #if (OS_CONFIG_EVENT_ENABLE == 1U)
-static void test_smp_event_pingpong(void);
-#endif
-static void test_smp_migration(void);
-static void test_smp_lock_independent(void);
-static void test_smp_task_churn(void);
+static test_ebs_ctx_t   os_test_ebs_ctx[OS_TEST_EBS_WORKERS];
+static os_event_t os_test_ebs_event;
+static __IO uint32_t    os_test_ebs_matched[OS_TEST_EBS_WORKERS];
+#endif /* OS_CONFIG_EVENT_ENABLE */
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+static test_convoy_ctx_t os_test_convoy_ctx[OS_TEST_CONVOY_WORKERS];
+static os_mutex_t        os_test_convoy_mutex;
+static __IO uint32_t     os_test_convoy_counter = 0U;
+static __IO uint32_t     os_test_convoy_locks[OS_TEST_CONVOY_WORKERS];
+static __IO bool         os_test_convoy_violation = false;
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+#endif /* OS_TEST_STRESS_EXTENDED */
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U) && (OS_CONFIG_TIMER_ENABLE == 1U)
+/** Holds a delay deadline for test_tickless_bounds. 40 ticks, deliberately unlike any other bound
+ *  the suite has in flight: a value that collides with one of those makes a wrong answer look
+ *  right, which is exactly how the first version of this check passed while proving nothing. */
+static __IO uint32_t os_test_tickless_helper_done = 0U;
+OS_TASK_DEFINE(os_test_tickless_task, 512U);
+#endif /* OS_CONFIG_TICKLESS_ENABLE && OS_CONFIG_TIMER_ENABLE */
+
+/* Runs while the switch benchmark below is sampling: equal priority to the measuring task, so a
+ * yield from either one rotates to the other. __IO because the two tasks take turns rather than
+ * running together - without it the compiler is entitled to hoist the load out of the loop and the
+ * partner would never see the stop. */
+static __IO bool os_test_bench_partner_run = false;
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+OS_TASK_DEFINE(test_mc_core0, 512U);
+OS_TASK_DEFINE(test_mc_core1, 512U);
+
+/* One slot per worker, indexed by the core it is PINNED to, so a worker writing the wrong slot is
+ * itself a detectable failure. __IO throughout: written on one core and read on the other, with
+ * no lock, so the compiler must not cache any of it in a register. */
+static __IO uint32_t test_mc_seen_core[2]  = { 0xFFFFFFFFU, 0xFFFFFFFFU };
+static __IO uint32_t test_mc_ready[2]      = { 0U, 0U };
+static __IO uint32_t test_mc_done[2]       = { 0U, 0U };
+static __IO uint32_t test_mc_begin_tick[2] = { 0U, 0U };
+static __IO uint32_t test_mc_end_tick[2]   = { 0U, 0U };
+
+/* Advanced by each parked worker, once per heartbeat, for the whole rest of the run. Read twice by
+ * the late check to see whether that core is still going. */
+static __IO uint32_t test_mc_alive[2]      = { 0U, 0U };
+
+/* The kernel tick at each core's most recent heartbeat. Whatever it holds at the end is the moment
+ * that core last ran. */
+static __IO uint32_t test_mc_last_tick[2]  = { 0U, 0U };
+
+/* Released by core 0 once BOTH workers have reported in, so the two hammer the shared counter at
+ * the same time. Without it one could finish before the other starts and the lock would never be
+ * contended - the test would pass on a lock that excludes nothing. */
+static __IO uint32_t test_mc_gate = 0U;
+
+/* The word the kernel spinlock is supposed to protect. Deliberately NOT atomic: the point is to
+ * test os_critical_enter/exit, so the increment must be a plain read-modify-write that interleaves
+ * destructively if the lock fails. */
+static __IO uint32_t test_mc_counter = 0U;
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/* Six dedicated task handles: every helper exits on its own (entry returns), so the handles come
+ * back INACTIVE between sections and are safe to re-create. Never deleted cross-core, which is
+ * OS_ERR_BUSY by design. */
+OS_TASK_DEFINE(test_smp_a, 512U);
+OS_TASK_DEFINE(test_smp_b, 512U);
+OS_TASK_DEFINE(test_smp_c, 512U);
+OS_TASK_DEFINE(test_smp_d, 512U);
+OS_TASK_DEFINE(test_smp_e, 256U);
+OS_TASK_DEFINE(test_smp_f, 256U);
+
+/**
+ * @brief Nested critical sections on both cores at once: the per-core nesting counters and the
+ *        single cross-core spinlock must agree, or the counter below loses updates.
+ */
+static __IO uint32_t test_smp_nested_counter = 0U;
+static __IO uint32_t test_smp_nested_seen[2] = { 0xFFFFFFFFU, 0xFFFFFFFFU };
+static __IO uint32_t test_smp_nested_done[2] = { 0U, 0U };
+static __IO uint32_t test_smp_nested_gate    = 0U;
+
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+/**
+ * @brief os_atomic_inc on one word from both cores at once. The port's atomics are LDREX/STREX,
+ *        so this also proves the GLOBAL exclusive monitor works on this part - a lost update
+ *        means the interconnect is not excluding between cores, which the kernel cannot fix.
+ */
+static os_atomic_t   test_smp_atomic_word   = OS_ATOMIC_INIT(0);
+static __IO uint32_t test_smp_atomic_done[2] = { 0U, 0U };
+static __IO uint32_t test_smp_atomic_gate    = 0U;
+#endif /* OS_CONFIG_ATOMIC_ENABLE */
+
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
+/**
+ * @brief Task notifications ping-pong between two pinned tasks, one per core. Each side waits for
+ *        its own next value before answering, so every cross-core wake must deliver exactly one
+ *        value: any lost or duplicated wake breaks the sequence the instant it happens.
+ */
+static __IO bool     test_smp_notify_ok     = true;
+static __IO uint32_t test_smp_notify_rounds = 0U;
+#endif /* OS_CONFIG_NOTIFY_ENABLE */
+
+#if (OS_CONFIG_SEM_ENABLE == 1U)
+/**
+ * @brief Binary-semaphore ping-pong between two pinned tasks, one per core. Each round is one
+ *        take/give on each side, so the token crosses the IPI path twice - and the final token
+ *        count proves the accounting exactly.
+ */
+static os_sem_t test_smp_sem_a;
+static os_sem_t test_smp_sem_b;
+static __IO uint32_t  test_smp_sem_rounds = 0U;
+#endif /* OS_CONFIG_SEM_ENABLE */
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+/**
+ * @brief Two producers (one per core) feed one consumer with exactly accounted items. Each item
+ *        carries its producer id and per-producer sequence, so the consumer can reject any loss,
+ *        duplication or reordering - and a capacity below the combined send rate forces the FULL
+ *        path and backpressure through the cross-core wake.
+ */
+OS_QUEUE_DEFINE_ATTR(test_smp_queue, sizeof(uint32_t), 4, );
+
+static __IO uint32_t test_smp_queue_expected[2] = { 1U, 1U };
+static __IO bool     test_smp_queue_ok          = true;
+static __IO uint32_t test_smp_queue_received    = 0U;
+#endif /* OS_CONFIG_QUEUE_ENABLE */
+
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+/**
+ * @brief Event-bit handshake across cores: the setter on core 1 sets bit 1 and waits for bit 2,
+ *        the waiter on core 0 consumes bit 1 and answers with bit 2. Clear-on-exit makes each
+ *        round 1:1, so a lost wake stalls and a duplicated one breaks the count.
+ */
+static os_event_t    test_smp_event;
+static __IO bool     test_smp_event_ok     = true;
+static __IO uint32_t test_smp_event_rounds = 0U;
+#endif /* OS_CONFIG_EVENT_ENABLE */
+
+/**
+ * @brief Affinity migration: a task created pinned to core 1 is re-pinned to core 0 while
+ *        BLOCKED, and its next wake must dispatch it on the core the new mask names.
+ */
+static __IO uint32_t test_smp_migration_phase[2][TEST_SMP_MIGRATION_SAMPLES];
+static __IO uint32_t test_smp_migration_done[2]  = { 0U, 0U };
+
+/**
+ * @brief Both cores churn create/start/exit on their own worker tasks at once. Each helper exits
+ *        immediately, so every cycle exercises the shared task table and ready lists from two
+ *        cores against each other.
+ */
+static __IO uint32_t test_smp_churn_done[2] = { 0U, 0U };
+static __IO uint32_t test_smp_churn_errs[2] = { 0U, 0U };
+static __IO uint32_t test_smp_churn_runs    = 0U;
+
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
-static void test_smp_deferred_submit(void);
-#endif
+OS_TIMER_DEFINE_SUBMIT(test_smp_pool, 24U, 0U, test_smp_submit_cb);
+
+static __IO uint32_t test_smp_submit_runs       = 0U;
+static __IO bool     test_smp_submit_ok         = true;
+static __IO uint32_t test_smp_submit_done[2]    = { 0U, 0U };
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
 #if (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ATOMIC_ENABLE == 1U)
-static void test_smp_soak_mixed(void);
-#endif
-#endif
-static void test_unsupported_features(void);
-#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_MUTEX_ENABLE == 1U)
-static void test_pipeline_producer_entry(void *context);
-static void test_pipeline_consumer_entry(void *context);
-static void test_pipeline(void);
-#endif
+/**
+ * @brief A mixed workload from four tasks, two per core: guarded increments, atomic increments,
+ *        a semaphore give/take pair and a queue round-trip every iteration, with hard exact
+ *        accounting at the end.
+ */
+static __IO uint32_t test_smp_soak_guarded = 0U;
+static os_atomic_t  test_smp_soak_atomic   = OS_ATOMIC_INIT(0);
+
+/* One per worker, not one shared between them. A shared max-count-1 semaphore returns FULL to the
+ * second of four concurrent givers, and a shared queue cannot promise a sender its own item back -
+ * both were the test racing itself rather than anything the kernel got wrong. */
+static os_sem_t test_smp_soak_sem[4];
+
+OS_QUEUE_DEFINE_ATTR(test_smp_soak_q0, sizeof(uint32_t), 1, );
+OS_QUEUE_DEFINE_ATTR(test_smp_soak_q1, sizeof(uint32_t), 1, );
+OS_QUEUE_DEFINE_ATTR(test_smp_soak_q2, sizeof(uint32_t), 1, );
+OS_QUEUE_DEFINE_ATTR(test_smp_soak_q3, sizeof(uint32_t), 1, );
+
+static os_queue_t *const test_smp_soak_queue[4] =
+{
+    &test_smp_soak_q0, &test_smp_soak_q1, &test_smp_soak_q2, &test_smp_soak_q3
+};
+static __IO uint32_t test_smp_soak_done[4] = { 0U, 0U, 0U, 0U };
+static __IO uint32_t test_smp_soak_seen[4] = { 0xFFFFFFFFU, 0xFFFFFFFFU, 0xFFFFFFFFU, 0xFFFFFFFFU };
+static __IO bool     test_smp_soak_ok      = true;
+
+static __IO uint32_t test_any_gate    = 0U;
+static __IO uint32_t test_any_done[TEST_ANY_WORKERS];
+static __IO uint32_t test_any_cores[TEST_ANY_WORKERS];   /* bitmask of cores this worker ran on */
+static __IO uint32_t test_any_smashed = 0U;
+static __IO uint32_t test_any_guarded = 0U;              /* plain RMW under os_critical_enter */
+#endif /* SEM && QUEUE && ATOMIC */
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+#if (OS_CONFIG_SEM_ENABLE == 1U)
+/* Regressions for fixed defects.
+ *
+ * What these share is a method rather than a subsystem: each needs an interleaving the scheduler
+ * would not normally produce, and os_kernel_lock is what makes those reachable on target - it
+ * holds a woken task in READY, with the tick and every interrupt still running, for as long as
+ * the test needs. Messages are kept short here: this suite is already close to the flash limit.
+ */
+
+static os_sem_t os_test_reg_sem;
+static __IO uint32_t  os_test_reg_order   = 0U;
+static __IO uint32_t  os_test_reg_a_order = 0U;
+static __IO os_err_t os_test_reg_a_st    = OS_ERR_ERROR;
+static __IO os_err_t os_test_reg_b_st    = OS_ERR_ERROR;
+
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
-static void test_prio_waiter_entry(void *context);
-static void test_mutex_priority_ordering(void);
-#endif
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-static void test_inherit_high_entry(void *context);
-static void test_inherit_medium_entry(void *context);
-static void test_mutex_priority_inheritance(void);
-static void test_inherit2_waiter_entry(void *context);
-static void test_mutex_multi_inheritance(void);
-#endif
-#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
-static void test_fanin_worker_entry(void *context);
-static void test_event_queue_fanin(void);
-#endif
-#if (OS_CONFIG_MUTEX_ENABLE == 1U) && (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && \
-    (OS_CONFIG_EVENT_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
-static uint32_t  test_stress_prng_next(uint32_t *state);
-static void      test_stress_worker_entry(void *context);
-static void      test_stress_soak(void);
-#endif
-static void      test_stress_task_churn(void);
-#if (OS_CONFIG_TIMER_ENABLE == 1U)
-static void      test_stress_timer_churn(void);
-#endif
+static os_mutex_t os_test_reg_mutex;
+#endif /* OS_CONFIG_MUTEX_ENABLE */
+#endif /* OS_CONFIG_SEM_ENABLE */
+
+/**
+ * @brief Helper for the priority test: records that it ran, then returns. Deliberately has no
+ *        loop - a spinning helper raised above the suite's own task would never hand the CPU
+ *        back, whatever it yielded.
+ */
+static __IO uint32_t os_test_prio_ran = 0U;
+
+#if defined(__ARM_FP)
+OS_TASK_DEFINE(fpu_partner, 512U);
+
+static __IO uint32_t os_test_fpu_partner_bad   = 0U;
+static __IO uint32_t os_test_fpu_partner_laps  = 0U;
+static __IO bool     os_test_fpu_partner_stop  = false;
+#endif /* __ARM_FP */
 
 /*
  * ***********************************************************************************************************
- * Shared helpers
+ * Public function implementations
  * ***********************************************************************************************************
 */
 
-/******************************************************************************************************/
 /**
  * @brief Poll (bounded) until a task reports INACTIVE, i.e. it has fully self-terminated
  *        and its stack is free to reuse for the next helper.
@@ -693,6 +2548,9 @@ static void      test_stress_timer_churn(void);
  * Note this captures only. The suite's own PASS/FAIL report goes to printf, not through here.
  *
  * Runs on tsk_log, outside any critical section, exactly as a real transport would.
+ *
+ * @param[in] data         Bytes to write.
+ * @param[in] length       How many bytes.
  */
 void os_log_output_cb(const uint8_t *data, size_t length)
 {
@@ -725,10 +2583,266 @@ void os_log_output_cb(const uint8_t *data, size_t length)
 
     os_test_log_capture[os_test_log_capture_len] = '\0';
 }
+#endif /* OS_CONFIG_LOG_ENABLE */
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief The interrupt under test: it does nothing but call the timer API and record what came
+ *        back. Reached with "svc #0" from the test task below.
+ *
+ * Separated from the vector below so the suite can be reached from an SVC handler the APPLICATION
+ * owns, rather than insisting on owning the vector itself. See OS_CONFIG_TEST_SVC_VECTOR.
+ */
+void os_test_isr_entry(void)
+{
+    os_test_isr_entered++;
+    os_test_isr_was_isr = os_arch_in_isr();
+
+    if (os_test_isr_action == TEST_ISR_ACTION_ARM)
+    {
+        os_test_isr_period_status = os_timer_period_set(&os_test_isr_timer, 40U);
+        os_test_isr_start_status  = os_timer_start(&os_test_isr_timer, NULL, 0U);
+
+        /* Deferred work, scheduled from an interrupt, carrying its own data - one call, no pool. */
+        os_test_isr_defer_status  = os_timer_start(&os_test_isr_defer, &os_test_isr_marker,
+                                                   0x0DEFU);
+    }
+    else
+    {
+        os_test_isr_stop_status = os_timer_stop(&os_test_isr_timer);
+    }
+}
+
+#if (OS_CONFIG_TEST_SVC_VECTOR != 0U)
+/******************************************************************************************************/
+/**
+ * @brief The SVC vector, when the suite owns it. Strong, for the reason above.
+ */
+void OS_CONFIG_ARCH_SVC_HANDLER(void)
+{
+    os_test_isr_entry();
+}
+#endif
+#endif /* OS_CONFIG_TIMER_ENABLE */
 
 /******************************************************************************************************/
 /**
+ * @brief Kernel self-test suite entry point, supplying the os_test() declared in ahura.h.
+ *        os_kernel.c creates a task that calls this automatically when OS_CONFIG_TEST_ENABLE
+ *        is 1 - nothing else to call.
+ */
+void os_test(void)
+{
+    /* Version first: a log pasted into a bug report has to say which kernel produced it, and the
+     * banner is the one line that always survives the copy/paste. OS_VERSION_STRING is a string
+     * literal, so it concatenates here rather than costing a format argument. */
+    printf("\r\n========================================\r\n");
+    printf(" Ahura RTOS v" OS_VERSION_STRING " self-test starting...\r\n");
+    printf("========================================\r\n");
+
+    test_kernel_core();
+    test_delay();
+    test_critical_section();
+    test_task_lifecycle();
+    test_task_identity();
+    test_priority_preemption();
+    test_scheduler_lock();
+
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+    test_mutex();
+#endif
+#if (OS_CONFIG_SEM_ENABLE == 1U)
+    test_semaphore();
+#endif
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+    test_queue();
+    test_queue_define_and_dynamic();
+    test_queue_overwrite();
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+    test_atomic();
+#endif
+#endif
+#if (OS_CONFIG_MSG_ENABLE == 1U)
+    test_msg();
+#endif
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+    test_event_group();
+#endif
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+    test_timer();
+#endif
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+    test_timer_retune();
+    test_timer_isr();
+    test_timer_pool();
+    test_timer_real_world();
+#endif
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
+    test_task_notify();
+#endif
+    test_assert();
+    test_log();
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+    test_alloc();
+#endif
+#if (OS_CONFIG_STACK_WATERMARK_ENABLE == 1U)
+    test_stack_watermark();
+#endif
+#if (OS_CONFIG_CPU_USAGE_ENABLE == 1U)
+    test_cpu_usage();
+#endif
+
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_MUTEX_ENABLE == 1U)
+    test_pipeline();
+#endif
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+    test_mutex_priority_ordering();
+#endif
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+    test_mutex_priority_inheritance();
+    test_mutex_multi_inheritance();
+    test_mutex_transitive_inheritance();
+#endif
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
+    test_event_queue_fanin();
+#endif
+#if (OS_CONFIG_MUTEX_ENABLE == 1U) && (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && \
+    (OS_CONFIG_EVENT_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
+    test_stress_soak();
+#endif
+    test_stress_task_churn();
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+    test_stress_timer_churn();
+#endif
+
+    /* Extended per-subsystem stress: each drives one subsystem at high volume with exact
+     * accounting (see the OS_TEST_STRESS_EXTENDED section header). */
+#if (OS_TEST_STRESS_EXTENDED == 1U)
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
+    test_stress_queue_dynamic_churn();
+    test_stress_queue_dynamic_concurrent();
+#endif
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+    test_stress_heap_fragmentation();
+#endif
+#if (OS_CONFIG_SEM_ENABLE == 1U)
+    test_stress_semaphore_pingpong();
+#endif
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
+    test_stress_notify_storm();
+#endif
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+    test_stress_event_bit_storm();
+#endif
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+    test_stress_timer_flood();
+#endif
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+    test_stress_mutex_convoy();
+#endif
+#else
+    test_print_section("Extended per-subsystem stress");
+    printf("  [SKIP] OS_TEST_STRESS_EXTENDED=0: needs ~15 KB of flash this unoptimized build does\r\n"
+           "         not have, and stress timings at -O0 do not reflect shipped firmware.\r\n"
+           "         Build Release (-Os) to run them, or define OS_TEST_STRESS_EXTENDED=1.\r\n");
+#endif /* OS_TEST_STRESS_EXTENDED */
+
+    test_task_footprint();
+    test_context_switch_timing();
+    test_tickless_hooks();
+    test_tickless_bounds();
+    test_tickless_sleep();
+    test_tickless_drift();
+    test_tickless_suppression();
+    test_list();
+    test_priority_api();
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
+    test_priority_requeue();
+#endif
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+    test_queue_accounting();
+#endif
+    test_fpu_context();
+    test_regressions();
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    /* Multi-core comes LAST, on purpose. Every section above exercises the kernel one subsystem
+     * at a time, and that is the foundation the SMP questions stand on: once the whole
+     * single-core surface has passed, the suite asks whether a second core starts, reports its
+     * own id, honours affinity and shares the spinlock correctly - and then drives the cross-core
+     * seams hard (contention, wake integrity, migration, churn, a mixed soak) before watching
+     * both parked workers for several heartbeats to prove the second core SURVIVED the whole
+     * run, not just its own section. */
+    test_multicore();
+    test_smp_critical_nested();
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+    test_smp_atomic_contention();
+#endif
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
+    test_smp_notify_pingpong();
+#endif
+#if (OS_CONFIG_SEM_ENABLE == 1U)
+    test_smp_semaphore_pingpong();
+#endif
+#if (OS_CONFIG_QUEUE_ENABLE == 1U)
+    test_smp_queue_accounting();
+#endif
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+    test_smp_event_pingpong();
+#endif
+    test_smp_migration();
+    test_smp_lock_independent();
+    test_smp_task_churn();
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+    test_smp_deferred_submit();
+#endif
+#if (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ATOMIC_ENABLE == 1U)
+    test_smp_soak_mixed();
+#endif
+    test_smp_core_any();
+    test_multicore_watch(TEST_MC_WATCH_MS, "at the end of the whole run");
+#endif
+    test_unsupported_features();
+
+    /* Repeated from the banner on purpose: the result block is what gets screenshotted or pasted
+     * on its own, and a pass count means nothing without the version that produced it. */
+    printf("\r\n========================================\r\n");
+    printf(" Ahura RTOS v" OS_VERSION_STRING "\r\n");
+    printf(" RESULT: %lu passed, %lu failed (of %lu checks)\r\n", (unsigned long)os_test_pass_count,
+           (unsigned long)os_test_fail_count, (unsigned long)(os_test_pass_count + os_test_fail_count));
+    printf("%s\r\n", (os_test_fail_count == 0U) ? " ALL RTOS FEATURES VERIFIED OK" : " SOME CHECKS FAILED - see log above");
+    printf("========================================\r\n");
+
+    /* Last, so the timings are the final thing on the console and are not interleaved with
+     * PASS/FAIL lines: benchmarks report numbers, they do not pass or fail. */
+    test_benchmarks();
+    printf("\r\n");
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Print a section heading on the test console.
+ *
+ * @param[in] title        Section heading to print.
+ */
+static void test_print_section(const char *title)
+{
+    printf("\r\n--- %s ---\r\n", title);
+}
+
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
  * @brief Whether the captured log output contains the given text.
+ *
+ * @param[in] needle       Text to look for.
+ * @return True when the captured log holds that text.
  */
 static bool test_log_capture_contains(const char *needle)
 {
@@ -771,6 +2885,10 @@ static bool test_log_capture_contains(const char *needle)
 /**
  * @brief Poll (bounded) until a task reports INACTIVE, i.e. it has fully self-terminated
  *        and its stack is free to reuse for the next helper.
+ *
+ * @param[in] task         Task handle.
+ * @param[in] timeout_ms   Timeout in milliseconds, or OS_WAIT_FOREVER.
+ * @return True when the task reached INACTIVE before the timeout.
  */
 static bool test_wait_inactive(const os_task_t *task, uint32_t timeout_ms)
 {
@@ -790,6 +2908,11 @@ static bool test_wait_inactive(const os_task_t *task, uint32_t timeout_ms)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Generic helper task: spin until the suite clears its run flag.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_worker_entry(void *context)
 {
     (void)context;
@@ -803,9 +2926,12 @@ static void test_worker_entry(void *context)
 
 /******************************************************************************************************/
 /**
- * @brief Busy-spins incrementing os_test_busy_counter until told to stop - never yields or delays, so
+ * @brief Busy-spins incrementing os_test_busy_counter until told to stop - never yields or delays,
+ *        so
  *        it only gets CPU time on ticks nothing higher-priority is ready for. Shared by
  *        test_priority_preemption() and test_cpu_usage().
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_busy_spin_entry(void *context)
 {
@@ -823,6 +2949,8 @@ static void test_busy_spin_entry(void *context)
  *        calls any blocking kernel API, so for its whole run nothing at an equal or lower
  *        priority can execute. Used by test_priority_preemption() to prove strict priority
  *        ordering, not just "eventually runs".
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_burst_spin_entry(void *context)
 {
@@ -842,6 +2970,8 @@ static void test_burst_spin_entry(void *context)
  *        Run on two equal-priority tasks at once (see test_context_switch_timing()), they
  *        ping-pong the CPU between them - each turn is one context switch in, so the total
  *        count over a fixed window approximates how many switches occurred.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_switch_ping_entry(void *context)
 {
@@ -858,6 +2988,8 @@ static void test_switch_ping_entry(void *context)
 /**
  * @brief Worker body for the self-pause test: waits briefly, pauses itself (NULL means the
  *        calling task), then - once resumed by another task - proves it by setting a sentinel.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_self_pause_worker_entry(void *context)
 {
@@ -872,12 +3004,15 @@ static void test_self_pause_worker_entry(void *context)
 #if TEST_HELPER_NEEDED
 /******************************************************************************************************/
 /**
- * @brief Generic helper task body: reads os_test_helper_ctx (set by test_spawn_helper before create)
+ * @brief Generic helper task body: reads os_test_helper_ctx (set by test_spawn_helper before
+ *        create)
  *        to decide what to do, then returns - the port auto-deletes the task on return.
  *
  * Guarded like test_spawn_helper, its only caller: with every one of mutex/semaphore/queue/event
  * compiled out, all four of its cases vanish and nothing references it, so an unguarded definition
  * is an unused function - which a -Werror build rejects.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_helper_entry(void *context)
 {
@@ -886,44 +3021,56 @@ static void test_helper_entry(void *context)
     switch (os_test_helper_ctx.role)
     {
 #if (OS_CONFIG_MUTEX_ENABLE == 1U) && (OS_CONFIG_SEM_ENABLE == 1U)
-    case HELPER_MUTEX_HOLD:
-        (void)os_mutex_lock(&os_test_mutex, OS_WAIT_FOREVER);
-        (void)os_sem_give(&os_test_sync_sem);
-        os_delay_ms(os_test_helper_ctx.hold_ms);
-        (void)os_mutex_unlock(&os_test_mutex);
-        break;
+        case HELPER_MUTEX_HOLD:
+            (void)os_mutex_lock(&os_test_mutex, OS_WAIT_FOREVER);
+            (void)os_sem_give(&os_test_sync_sem);
+            os_delay_ms(os_test_helper_ctx.hold_ms);
+            (void)os_mutex_unlock(&os_test_mutex);
+            break;
 #endif
 
 #if (OS_CONFIG_SEM_ENABLE == 1U)
-    case HELPER_SEM_GIVE_AFTER:
-        os_delay_ms(os_test_helper_ctx.hold_ms);
-        (void)os_sem_give(&os_test_count_sem);
-        break;
+        case HELPER_SEM_GIVE_AFTER:
+            os_delay_ms(os_test_helper_ctx.hold_ms);
+            (void)os_sem_give(&os_test_count_sem);
+            break;
 #endif
 
 #if (OS_CONFIG_EVENT_ENABLE == 1U)
-    case HELPER_EVENT_SET_AFTER:
-        os_delay_ms(os_test_helper_ctx.hold_ms);
-        (void)os_event_set_bits(&os_test_event, os_test_helper_ctx.bits);
-        break;
+        case HELPER_EVENT_SET_AFTER:
+            os_delay_ms(os_test_helper_ctx.hold_ms);
+            (void)os_event_set_bits(&os_test_event, os_test_helper_ctx.bits);
+            break;
 #endif
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
-    case HELPER_QUEUE_SEND_AFTER:
-        os_delay_ms(os_test_helper_ctx.hold_ms);
-        (void)os_queue_send(&os_test_queue, &os_test_helper_ctx.value, OS_WAIT_FOREVER);
-        break;
+        case HELPER_QUEUE_SEND_AFTER:
+            os_delay_ms(os_test_helper_ctx.hold_ms);
+            (void)os_queue_send(&os_test_queue, &os_test_helper_ctx.value, OS_WAIT_FOREVER);
+            break;
 #endif
 
-    default:
-        break;
+        default:
+            break;
     }
 }
 #endif /* TEST_HELPER_NEEDED */
 
 #if TEST_HELPER_NEEDED
 /******************************************************************************************************/
-static os_err_t test_spawn_helper(helper_role_t role, uint32_t hold_ms, uint32_t bits, uint32_t value)
+/**
+ * @brief Create and start the shared helper task in the requested role.
+ *
+ * @param[in] value        Value to apply.
+ *
+ * @param[in] role         What the helper task should do once started.
+ * @param[in] hold_ms      How long the helper holds what it takes, in milliseconds.
+ * @param[in] bits         Event bits the helper works with.
+ *
+ * @return OS_ERR_NONE when the helper task started.
+ */
+static os_err_t test_spawn_helper(helper_role_t role, uint32_t hold_ms, uint32_t bits,
+                                  uint32_t value)
 {
     os_err_t status;
 
@@ -942,13 +3089,10 @@ static os_err_t test_spawn_helper(helper_role_t role, uint32_t hold_ms, uint32_t
 }
 #endif /* OS_CONFIG_SEM_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Kernel core: lifecycle, tick, delay, critical sections
- * ***********************************************************************************************************
-*/
-
 /******************************************************************************************************/
+/**
+ * @brief Kernel and tick basics: the scheduler reports running, the tick advances.
+ */
 static void test_kernel_core(void)
 {
     uint32_t t0;
@@ -956,16 +3100,21 @@ static void test_kernel_core(void)
 
     test_print_section("Kernel / Tick");
 
-    AHURA_TEST_CHECK(os_kernel_is_running(), "os_kernel_is_running() is true once a task is executing");
+    AHURA_TEST_CHECK(os_kernel_is_running(),
+                     "os_kernel_is_running() is true once a task is executing");
 
     t0 = os_tick_get();
     os_delay_ms(20U);
     t1 = os_tick_get();
-    AHURA_TEST_CHECK((t1 - t0) >= OS_TICKS_FROM_MS(20U), "os_tick_get() advances with time (delta=%lu ticks)",
+    AHURA_TEST_CHECK((t1 - t0) >= OS_TICKS_FROM_MS(20U),
+                     "os_tick_get() advances with time (delta=%lu ticks)",
                       (unsigned long)(t1 - t0));
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Blocking delays: os_delay_ms lands on time, os_delay_us busy-waits.
+ */
 static void test_delay(void)
 {
     uint32_t  t0;
@@ -981,7 +3130,8 @@ static void test_delay(void)
     os_delay_ms(50U);
     t1    = os_tick_get();
     delta = t1 - t0;
-    AHURA_TEST_CHECK((delta >= 50U) && (delta <= 65U), "os_delay_ms(50) elapsed %lu ticks (expected ~50)",
+    AHURA_TEST_CHECK((delta >= 50U) && (delta <= 65U),
+                     "os_delay_ms(50) elapsed %lu ticks (expected ~50)",
                       (unsigned long)delta);
 
     t0    = os_tick_get();
@@ -996,18 +3146,23 @@ static void test_delay(void)
      * that took TWICE as long pass as healthy - which is how a cycle counter running at half the
      * rate os_delay_us assumed went unreported on a new part. 4 rejects that and still accepts
      * every legitimate sampling outcome. */
-    AHURA_TEST_CHECK((delta >= 2U) && (delta <= 4U), "os_delay_us(3000) elapsed %lu ticks (expected ~3)",
+    AHURA_TEST_CHECK((delta >= 2U) && (delta <= 4U),
+                     "os_delay_us(3000) elapsed %lu ticks (expected ~3)",
                       (unsigned long)delta);
 
     t0    = os_tick_get();
     os_delay_ms(1000U);
     t1    = os_tick_get();
     delta = t1 - t0;
-    AHURA_TEST_CHECK((delta >= 1000U) && (delta <= 1060U), "os_delay_ms(1000) elapsed %lu ticks (expected ~1000)",
+    AHURA_TEST_CHECK((delta >= 1000U) && (delta <= 1060U),
+                     "os_delay_ms(1000) elapsed %lu ticks (expected ~1000)",
                       (unsigned long)delta);
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Critical sections: nesting, and interrupts really masked inside.
+ */
 static void test_critical_section(void)
 {
     test_print_section("Critical Sections");
@@ -1049,11 +3204,15 @@ static void test_critical_section(void)
     AHURA_TEST_CHECK(before, "the kernel mask is lowered before entering a critical section");
     AHURA_TEST_CHECK(outer, "os_critical_enter() raises the kernel mask");
     AHURA_TEST_CHECK(nested, "a nested os_critical_enter() keeps the kernel mask raised");
-    AHURA_TEST_CHECK(inner_exit, "exiting the inner level keeps the kernel mask raised (nesting works)");
+    AHURA_TEST_CHECK(inner_exit,
+                     "exiting the inner level keeps the kernel mask raised (nesting works)");
     AHURA_TEST_CHECK(after, "the matching outer os_critical_exit() lowers the kernel mask");
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Task create, start, pause, resume, delete, and the states between.
+ */
 static void test_task_lifecycle(void)
 {
     os_task_config_t cfg;
@@ -1144,29 +3303,37 @@ static void test_task_lifecycle(void)
         }
     }
 
-    AHURA_TEST_CHECK(os_task_start(&worker) == OS_ERR_NONE, "os_task_start() starts the worker task");
+    AHURA_TEST_CHECK(os_task_start(&worker) == OS_ERR_NONE,
+                     "os_task_start() starts the worker task");
     os_delay_ms(20U);
     AHURA_TEST_CHECK(os_test_worker_counter > 0U, "worker task actually executed (counter=%lu)",
                       (unsigned long)os_test_worker_counter);
     AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_READY,
                       "a lower-priority runnable task reports READY while this task runs");
 
-    AHURA_TEST_CHECK(os_task_pause(&worker) == OS_ERR_NONE, "os_task_pause() suspends the worker task");
-    AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_SUSPENDED, "paused task reports SUSPENDED");
+    AHURA_TEST_CHECK(os_task_pause(&worker) == OS_ERR_NONE,
+                     "os_task_pause() suspends the worker task");
+    AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_SUSPENDED,
+                     "paused task reports SUSPENDED");
     snapshot = os_test_worker_counter;
     os_delay_ms(20U);
-    AHURA_TEST_CHECK(os_test_worker_counter == snapshot, "counter is frozen while the worker is paused");
+    AHURA_TEST_CHECK(os_test_worker_counter == snapshot,
+                     "counter is frozen while the worker is paused");
 
-    AHURA_TEST_CHECK(os_task_start(&worker) == OS_ERR_NONE, "os_task_start() resumes a paused task");
+    AHURA_TEST_CHECK(os_task_start(&worker) == OS_ERR_NONE,
+                     "os_task_start() resumes a paused task");
     os_delay_ms(20U);
-    AHURA_TEST_CHECK(os_test_worker_counter > snapshot, "counter resumes advancing after os_task_start()");
+    AHURA_TEST_CHECK(os_test_worker_counter > snapshot,
+                     "counter resumes advancing after os_task_start()");
 
-    AHURA_TEST_CHECK(os_task_delete(&worker) == OS_ERR_NONE, "os_task_delete() deletes the live worker task");
+    AHURA_TEST_CHECK(os_task_delete(&worker) == OS_ERR_NONE,
+                     "os_task_delete() deletes the live worker task");
     AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_INACTIVE,
                       "a deleted task's handle reports INACTIVE");
     snapshot = os_test_worker_counter;
     os_delay_ms(20U);
-    AHURA_TEST_CHECK(os_test_worker_counter == snapshot, "counter is frozen after deletion (worker truly stopped)");
+    AHURA_TEST_CHECK(os_test_worker_counter == snapshot,
+                     "counter is frozen after deletion (worker truly stopped)");
 
     /* --- NULL means "current task": the worker pauses itself; we resume it. --- */
     os_test_worker_counter = 0U;
@@ -1181,19 +3348,15 @@ static void test_task_lifecycle(void)
     AHURA_TEST_CHECK(os_task_start(&worker) == OS_ERR_NONE,
                       "os_task_start() resumes a task that paused itself");
     os_delay_ms(20U);
-    AHURA_TEST_CHECK(os_test_worker_counter == 42U, "the resumed task continued executing past its self-pause point");
+    AHURA_TEST_CHECK(os_test_worker_counter == 42U,
+                     "the resumed task continued executing past its self-pause point");
 
     /* test_self_pause_worker_entry() already returned above (auto-exiting via the arch port's
      * os_task_exit() trampoline) - no explicit os_task_delete() here, that would fail with
      * INVALID_ARG since the slot is already freed. Just confirm the self-exit completed. */
-    AHURA_TEST_CHECK(test_wait_inactive(&worker, 200U), "the resumed worker terminates cleanly on its own");
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 200U),
+                     "the resumed worker terminates cleanly on its own");
 }
-
-/*
- * ***********************************************************************************************************
- * Task identity (id allocation)
- * ***********************************************************************************************************
-*/
 
 /******************************************************************************************************/
 /**
@@ -1237,7 +3400,8 @@ static void test_task_identity(void)
     stale_handle = helper;
     stale_id     = helper.id;
 
-    AHURA_TEST_CHECK(os_task_delete(&helper) == OS_ERR_NONE, "identity task B deleted, freeing its slot");
+    AHURA_TEST_CHECK(os_task_delete(&helper) == OS_ERR_NONE,
+                     "identity task B deleted, freeing its slot");
     AHURA_TEST_CHECK(os_task_state_get(&stale_handle) == OS_TASK_STATE_INACTIVE,
                       "a stale handle to the deleted task reports INACTIVE");
 
@@ -1255,14 +3419,9 @@ static void test_task_identity(void)
     (void)os_task_delete(&helper2);
     (void)os_task_delete(&helper3);
 
-    AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_INACTIVE, "identity tasks cleaned up");
+    AHURA_TEST_CHECK(os_task_state_get(&worker) == OS_TASK_STATE_INACTIVE,
+                     "identity tasks cleaned up");
 }
-
-/*
- * ***********************************************************************************************************
- * Priority-based preemption
- * ***********************************************************************************************************
-*/
 
 /******************************************************************************************************/
 /**
@@ -1342,16 +3501,12 @@ static void test_priority_preemption(void)
     AHURA_TEST_CHECK(test_wait_inactive(&worker, 200U), "low-priority spinner stops cleanly");
 }
 
-/*
- * ***********************************************************************************************************
- * Scheduler lock
- * ***********************************************************************************************************
-*/
-
 /******************************************************************************************************/
 /**
  * @brief Runs at TEST_PRIO_HIGH, so it outranks the test task and would preempt it the instant it
  *        is started - unless the scheduler is locked.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_sched_lock_entry(void *context)
 {
@@ -1417,7 +3572,8 @@ static void test_scheduler_lock(void)
                       "higher-priority task held back for 200 us of live-interrupt time");
     AHURA_TEST_CHECK(os_test_sched_lock_ran, "os_kernel_unlock() took the deferred switch at once");
     AHURA_TEST_CHECK(!os_kernel_is_locked(), "os_kernel_unlock() released the lock");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "the higher-priority task ran to completion");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U),
+                     "the higher-priority task ran to completion");
 
 #if (OS_CONFIG_SEM_ENABLE == 1U)
     /* Blocking under the lock would park a task the lock then refuses to switch away from, so
@@ -1444,18 +3600,16 @@ static void test_scheduler_lock(void)
     status = os_task_pause(NULL);
     os_kernel_unlock();
 
-    AHURA_TEST_CHECK(status == OS_ERR_BUSY, "os_task_pause(self) is refused under the lock (status=%d)",
+    AHURA_TEST_CHECK(status == OS_ERR_BUSY,
+                     "os_task_pause(self) is refused under the lock (status=%d)",
                       (int)status);
 }
 
-/*
- * ***********************************************************************************************************
- * Mutex
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
 /******************************************************************************************************/
+/**
+ * @brief Mutex ownership, timeouts and the priority a waiter lends its owner.
+ */
 static void test_mutex(void)
 {
 #if (OS_CONFIG_SEM_ENABLE == 1U)
@@ -1471,20 +3625,23 @@ static void test_mutex(void)
     test_print_section("Mutex");
 
     AHURA_TEST_CHECK(os_mutex_init(&os_test_mutex) == OS_ERR_NONE, "os_mutex_init() succeeds");
-    AHURA_TEST_CHECK(os_mutex_unlock(&os_test_mutex) == OS_ERR_ERROR, "unlocking a free mutex returns ERROR");
+    AHURA_TEST_CHECK(os_mutex_unlock(&os_test_mutex) == OS_ERR_ERROR,
+                     "unlocking a free mutex returns ERROR");
 
     AHURA_TEST_CHECK(os_mutex_lock(&os_test_mutex, OS_WAIT_NOTHING) == OS_ERR_NONE,
                       "os_mutex_lock() acquires a free mutex");
     AHURA_TEST_CHECK(os_mutex_lock(&os_test_mutex, OS_WAIT_NOTHING) == OS_ERR_BUSY,
                       "re-locking from the owner fails BUSY (not recursive)");
-    AHURA_TEST_CHECK(os_mutex_unlock(&os_test_mutex) == OS_ERR_NONE, "owner os_mutex_unlock() releases the mutex");
+    AHURA_TEST_CHECK(os_mutex_unlock(&os_test_mutex) == OS_ERR_NONE,
+                     "owner os_mutex_unlock() releases the mutex");
 
 #if (OS_CONFIG_SEM_ENABLE == 1U)
     /* Contention: a helper task holds the mutex for 150 ms. */
     (void)os_sem_init(&os_test_sync_sem, 0U, 1U);
     AHURA_TEST_CHECK(test_spawn_helper(HELPER_MUTEX_HOLD, 150U, 0U, 0U) == OS_ERR_NONE,
                       "helper task spawned to hold the mutex");
-    AHURA_TEST_CHECK(os_sem_take(&os_test_sync_sem, 200U) == OS_ERR_NONE, "helper signals once it holds the mutex");
+    AHURA_TEST_CHECK(os_sem_take(&os_test_sync_sem, 200U) == OS_ERR_NONE,
+                     "helper signals once it holds the mutex");
 
     AHURA_TEST_CHECK(os_mutex_lock(&os_test_mutex, OS_WAIT_NOTHING) == OS_ERR_BUSY,
                       "os_mutex_lock(OS_WAIT_NOTHING) fails while another task holds the mutex");
@@ -1495,24 +3652,25 @@ static void test_mutex(void)
     status = os_mutex_lock(&os_test_mutex, 500U);
     t1     = os_tick_get();
     delta  = t1 - t0;
-    AHURA_TEST_CHECK(status == OS_ERR_NONE, "blocking os_mutex_lock() succeeds once the holder releases it");
-    AHURA_TEST_CHECK((delta >= 100U) && (delta <= 250U), "blocking lock woke ~when the holder unlocked (%lu ticks)",
+    AHURA_TEST_CHECK(status == OS_ERR_NONE,
+                     "blocking os_mutex_lock() succeeds once the holder releases it");
+    AHURA_TEST_CHECK((delta >= 100U) && (delta <= 250U),
+                     "blocking lock woke ~when the holder unlocked (%lu ticks)",
                       (unsigned long)delta);
 
-    AHURA_TEST_CHECK(os_mutex_unlock(&os_test_mutex) == OS_ERR_NONE, "final os_mutex_unlock() releases the mutex");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "mutex-holder helper task terminated cleanly");
+    AHURA_TEST_CHECK(os_mutex_unlock(&os_test_mutex) == OS_ERR_NONE,
+                     "final os_mutex_unlock() releases the mutex");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U),
+                     "mutex-holder helper task terminated cleanly");
 #endif
 }
 #endif /* OS_CONFIG_MUTEX_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Semaphore
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_SEM_ENABLE == 1U)
 /******************************************************************************************************/
+/**
+ * @brief Counting semaphore: take, give, and what a timeout does.
+ */
 static void test_semaphore(void)
 {
     uint32_t  t0;
@@ -1527,7 +3685,8 @@ static void test_semaphore(void)
     AHURA_TEST_CHECK(os_sem_take(&os_test_bin_sem, OS_WAIT_NOTHING) == OS_ERR_EMPTY,
                       "take on an empty semaphore with OS_WAIT_NOTHING returns EMPTY");
     AHURA_TEST_CHECK(os_sem_give(&os_test_bin_sem) == OS_ERR_NONE, "os_sem_give() adds a token");
-    AHURA_TEST_CHECK(os_sem_give(&os_test_bin_sem) == OS_ERR_FULL, "giving beyond max_count returns FULL");
+    AHURA_TEST_CHECK(os_sem_give(&os_test_bin_sem) == OS_ERR_FULL,
+                     "giving beyond max_count returns FULL");
     AHURA_TEST_CHECK(os_sem_take(&os_test_bin_sem, OS_WAIT_NOTHING) == OS_ERR_NONE,
                       "take succeeds once a token is available");
 
@@ -1536,7 +3695,8 @@ static void test_semaphore(void)
     t1     = os_tick_get();
     delta  = t1 - t0;
     AHURA_TEST_CHECK(status == OS_ERR_TIMEOUT, "take on an empty semaphore times out");
-    AHURA_TEST_CHECK((delta >= 95U) && (delta <= 150U), "timeout elapsed ~100 ticks (%lu)", (unsigned long)delta);
+    AHURA_TEST_CHECK((delta >= 95U) && (delta <= 150U), "timeout elapsed ~100 ticks (%lu)",
+                     (unsigned long)delta);
 
     AHURA_TEST_CHECK(os_sem_init(&os_test_count_sem, 0U, 3U) == OS_ERR_NONE,
                       "os_sem_init() creates a counting semaphore (0/3)");
@@ -1548,34 +3708,22 @@ static void test_semaphore(void)
     t1     = os_tick_get();
     delta  = t1 - t0;
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "blocking take succeeds once the helper gives");
-    AHURA_TEST_CHECK((delta >= 70U) && (delta <= 200U), "take woke ~when the helper gave (%lu ticks)",
+    AHURA_TEST_CHECK((delta >= 70U) && (delta <= 200U),
+                     "take woke ~when the helper gave (%lu ticks)",
                       (unsigned long)delta);
-    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "semaphore-giver helper task terminated cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U),
+                     "semaphore-giver helper task terminated cleanly");
 }
 #endif /* OS_CONFIG_SEM_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Queue
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
-/******************************************************************************************************/
 #if (OS_CONFIG_ATOMIC_ENABLE == 1U)
-/* Shared between the two contenders in test_atomic(): both hammer the same counters, one through
- * os_atomic_inc and one with a plain read-modify-write, so the two can be compared directly. */
-#define TEST_ATOMIC_ITERATIONS 20000UL
-
-static os_atomic_t      os_test_atomic_counter = OS_ATOMIC_INIT(0);
-static __IO int32_t os_test_plain_counter  = 0;
-
-/* Declared as os_atomic_t rather than a volatile int, which is what the header asks for: casting
- * some other type to os_atomic_t * to reach these calls is how a "volatile" counter quietly
- * becomes one the compiler is free to cache again. */
-static os_atomic_t      os_test_atomic_done    = OS_ATOMIC_INIT(0);
-
 /******************************************************************************************************/
+/**
+ * @brief Hammer the shared atomic counter from a second task.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_atomic_hammer_entry(void *context)
 {
     uint32_t i;
@@ -1583,7 +3731,7 @@ static void test_atomic_hammer_entry(void *context)
     (void)context;
 
     for (i = 0U; i < TEST_ATOMIC_ITERATIONS; i++)
-    { 
+    {
         (void)os_atomic_inc(&os_test_atomic_counter);
 
         /* Deliberately NOT atomic, as the control case: load, add, store, with a preemption point
@@ -1618,7 +3766,8 @@ static void test_atomic(void)
     ok &= (os_atomic_inc(&value)    == 20) && (os_atomic_get(&value) == 21);
     ok &= (os_atomic_dec(&value)    == 21) && (os_atomic_get(&value) == 20);
     ok &= (os_atomic_clear(&value)  == 20) && (os_atomic_get(&value) == 0);
-    AHURA_TEST_CHECK(ok, "set/add/sub/inc/dec/clear all return the value from before the operation");
+    AHURA_TEST_CHECK(ok,
+                     "set/add/sub/inc/dec/clear all return the value from before the operation");
 
     (void)os_atomic_set(&value, 0x0F0F);
     ok  = (os_atomic_or(&value, 0xF000) == 0x0F0F) && (os_atomic_get(&value) == 0xFF0F);
@@ -1700,19 +3849,7 @@ static void test_atomic(void)
         printf("  [SKIP] could not create the two contending tasks\r\n");
     }
 }
-
 #endif /* OS_CONFIG_ATOMIC_ENABLE */
-
-/* Statically defined queue used by test_queue_define_and_dynamic(): the whole point of the macro
- * pair is that the geometry is stated once, here, and never repeated at the init call. */
-typedef struct
-{
-    uint32_t id;
-    uint8_t  payload[6];
-
-} test_queue_item_t;
-
-OS_QUEUE_DEFINE(os_test_defined_queue, sizeof(test_queue_item_t), 4);
 
 /******************************************************************************************************/
 /**
@@ -1795,13 +3932,15 @@ static void test_queue_define_and_dynamic(void)
     value = 0U;
     AHURA_TEST_CHECK(os_queue_receive(&dynamic, &value, OS_WAIT_NOTHING) == OS_ERR_NONE,
                       "the dynamic queue returns it");
-    AHURA_TEST_CHECK(value == 0xDEADBEEFUL, "with the value intact (0x%08lX)", (unsigned long)value);
+    AHURA_TEST_CHECK(value == 0xDEADBEEFUL, "with the value intact (0x%08lX)",
+                     (unsigned long)value);
 
     AHURA_TEST_CHECK(os_queue_cleanup(&dynamic) == OS_ERR_NONE, "os_queue_cleanup() tears it down");
     AHURA_TEST_CHECK(os_mem_free_get() == heap_before,
                       "and returned every byte it took to the heap (%u bytes free)",
                       (unsigned)os_mem_free_get());
-    AHURA_TEST_CHECK(dynamic.buffer == NULL, "the torn-down queue no longer points at freed memory");
+    AHURA_TEST_CHECK(dynamic.buffer == NULL,
+                     "the torn-down queue no longer points at freed memory");
 
     /* A zero or overflowing geometry must be refused rather than wrapped into a small allocation
      * that every later send would index past. */
@@ -1861,19 +4000,11 @@ static void test_queue_define_and_dynamic(void)
     (void)os_queue_receive(&os_test_defined_queue, &got, OS_WAIT_NOTHING);
 }
 
-/*
- * ***********************************************************************************************************
- * Queue overwrite mode
- * ***********************************************************************************************************
-*/
-
-/* Three slots, because three is the smallest capacity where "the oldest went and the rest kept
- * their order" is a different statement from "something went". */
-OS_QUEUE_DEFINE(os_test_ow_queue, sizeof(uint32_t), 3);
-
 /******************************************************************************************************/
 /**
  * @brief Fill os_test_ow_queue with 1, 2, 3 and report whether all three were accepted.
+ *
+ * @return True when the queue filled as expected.
  */
 static bool test_ow_fill(void)
 {
@@ -1891,6 +4022,9 @@ static bool test_ow_fill(void)
 /******************************************************************************************************/
 /**
  * @brief Drain three items and report whether they came out as first, first+1, first+2.
+ *
+ * @param[in] first        Value the drain is expected to start at.
+ * @return True when the queue drained from the expected first value.
  */
 static bool test_ow_drain_is(uint32_t first)
 {
@@ -2001,6 +4135,9 @@ static void test_queue_overwrite(void)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Queue FIFO order, item accounting and overwrite mode.
+ */
 static void test_queue(void)
 {
     uint32_t  items[3] = { 0 };
@@ -2014,9 +4151,9 @@ static void test_queue(void)
 
     test_print_section("Queue");
 
-    /* No init call: OS_QUEUE_DEFINE_ATTR initialized os_test_queue over its own array at compile time.
-     * The item size is the byte count the macro was given; the capacity is still divided back out of
-     * the array, so it cannot disagree with the storage that actually exists. */
+    /* No init call: OS_QUEUE_DEFINE_ATTR initialized os_test_queue over its own array at compile
+     * time. The item size is the byte count the macro was given; the capacity is still divided back
+     * out of the array, so it cannot disagree with the storage that actually exists. */
     AHURA_TEST_CHECK((os_test_queue.buffer == os_test_queue_queue_buf) &&
                       (os_test_queue.item_size == sizeof(uint32_t)) &&
                       (os_test_queue.capacity == (sizeof(os_test_queue_queue_buf) / sizeof(uint32_t))),
@@ -2056,7 +4193,8 @@ static void test_queue(void)
     t1     = os_tick_get();
     delta  = t1 - t0;
     AHURA_TEST_CHECK(status == OS_ERR_TIMEOUT, "receive on an empty queue times out");
-    AHURA_TEST_CHECK((delta >= 95U) && (delta <= 150U), "timeout elapsed ~100 ticks (%lu)", (unsigned long)delta);
+    AHURA_TEST_CHECK((delta >= 95U) && (delta <= 150U), "timeout elapsed ~100 ticks (%lu)",
+                     (unsigned long)delta);
 
     AHURA_TEST_CHECK(test_spawn_helper(HELPER_QUEUE_SEND_AFTER, 80U, 0U, 42U) == OS_ERR_NONE,
                       "helper spawned to send item 42 after 80 ms");
@@ -2066,26 +4204,15 @@ static void test_queue(void)
     delta  = t1 - t0;
     AHURA_TEST_CHECK((status == OS_ERR_NONE) && (value == 42U),
                       "blocking receive gets the helper's item (value=%lu)", (unsigned long)value);
-    AHURA_TEST_CHECK((delta >= 70U) && (delta <= 200U), "receive woke ~when the helper sent (%lu ticks)",
+    AHURA_TEST_CHECK((delta >= 70U) && (delta <= 200U),
+                     "receive woke ~when the helper sent (%lu ticks)",
                       (unsigned long)delta);
-    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "queue-sender helper task terminated cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U),
+                     "queue-sender helper task terminated cleanly");
 }
 #endif /* OS_CONFIG_QUEUE_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Message buffer
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_MSG_ENABLE == 1U)
-
-/* Deliberately not a round number of anything: 3 * OS_MSG_SPACE(16) is 54, so a run of 16-byte
- * messages leaves head and tail at a different offset on every lap and the ring is forced to wrap
- * mid-message rather than only at a tidy boundary. That wrap is the one thing a byte ring can get
- * wrong that a slot queue cannot. */
-OS_MSG_DEFINE(os_test_msg, 3U * OS_MSG_SPACE(16U));
-
 /******************************************************************************************************/
 /**
  * @brief Variable-length messages: whole-message delivery, byte accounting, the wrap, and the
@@ -2116,7 +4243,8 @@ static void test_msg(void)
     AHURA_TEST_CHECK(capacity == (3U * OS_MSG_SPACE(16U)),
                       "OS_MSG_DEFINE() sized the buffer in bytes (%lu)", (unsigned long)capacity);
     AHURA_TEST_CHECK(os_msg_count_get(&os_test_msg) == 0U, "a fresh buffer holds 0 messages");
-    AHURA_TEST_CHECK(os_msg_free_get(&os_test_msg) == capacity, "a fresh buffer reports every byte free");
+    AHURA_TEST_CHECK(os_msg_free_get(&os_test_msg) == capacity,
+                     "a fresh buffer reports every byte free");
     AHURA_TEST_CHECK(os_msg_peek_size(&os_test_msg) == 0U, "peek on an empty buffer reports 0");
     AHURA_TEST_CHECK(os_msg_receive(&os_test_msg, rx, sizeof(rx), &rx_len, OS_WAIT_NOTHING) == OS_ERR_EMPTY,
                       "receive on an empty buffer with OS_WAIT_NOTHING returns EMPTY");
@@ -2177,9 +4305,12 @@ static void test_msg(void)
 
     rx_len = 0U;
     status = os_msg_receive(&os_test_msg, rx, 8U, &rx_len, OS_WAIT_NOTHING);
-    AHURA_TEST_CHECK(status == OS_ERR_INVALID_ARG, "an 8-byte destination refuses it rather than truncating");
-    AHURA_TEST_CHECK(rx_len == 24U, "and reports the size it would have needed (%lu)", (unsigned long)rx_len);
-    AHURA_TEST_CHECK(os_msg_count_get(&os_test_msg) == 1U, "the message is still there after the refusal");
+    AHURA_TEST_CHECK(status == OS_ERR_INVALID_ARG,
+                     "an 8-byte destination refuses it rather than truncating");
+    AHURA_TEST_CHECK(rx_len == 24U, "and reports the size it would have needed (%lu)",
+                     (unsigned long)rx_len);
+    AHURA_TEST_CHECK(os_msg_count_get(&os_test_msg) == 1U,
+                     "the message is still there after the refusal");
 
     (void)memset(rx, 0, sizeof(rx));
     status = os_msg_receive(&os_test_msg, rx, sizeof(rx), &rx_len, OS_WAIT_NOTHING);
@@ -2229,7 +4360,8 @@ static void test_msg(void)
     AHURA_TEST_CHECK(os_test_msg.buffer != NULL,
                       "a compile-time buffer survives cleanup - there is nothing to release");
 
-    /* --- os_msg_init_dynamic / os_msg_cleanup -------------------------------------------------- */
+    /* --- os_msg_init_dynamic / os_msg_cleanup --------------------------------------------------
+     */
 
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
     {
@@ -2289,7 +4421,6 @@ static void test_msg(void)
     }
 #endif /* OS_CONFIG_ALLOC_ENABLE */
 
-
     t0     = os_tick_get();
     status = os_msg_receive(&os_test_msg, rx, sizeof(rx), &rx_len, 100U);
     t1     = os_tick_get();
@@ -2300,14 +4431,11 @@ static void test_msg(void)
 }
 #endif /* OS_CONFIG_MSG_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Event
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_EVENT_ENABLE == 1U)
 /******************************************************************************************************/
+/**
+ * @brief Event bits: wait for any or all, timeouts, and clear-on-exit.
+ */
 static void test_event_group(void)
 {
     uint32_t  matched;
@@ -2348,34 +4476,22 @@ static void test_event_group(void)
     delta  = t1 - t0;
     AHURA_TEST_CHECK((status == OS_ERR_NONE) && (matched == 0x06U),
                       "wait-all matches once the helper sets both bits (matched=0x%02lx)", (unsigned long)matched);
-    AHURA_TEST_CHECK((delta >= 70U) && (delta <= 200U), "wait woke ~when the helper set the bits (%lu ticks)",
+    AHURA_TEST_CHECK((delta >= 70U) && (delta <= 200U),
+                     "wait woke ~when the helper set the bits (%lu ticks)",
                       (unsigned long)delta);
-    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "event-setter helper task terminated cleanly");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U),
+                     "event-setter helper task terminated cleanly");
 }
 #endif /* OS_CONFIG_EVENT_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Software timer
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
 /******************************************************************************************************/
-static void timer_oneshot_cb(void *context, uint32_t value);
-
-/* This object must be startable straight from its definition - the kernel has no init call. */
-OS_TIMER_DEFINE_ONESHOT(os_test_defined_timer, 40U, timer_oneshot_cb);
-
-static void timer_args_cb(void *context, uint32_t value);
-
-OS_TIMER_DEFINE_PERIODIC(os_test_args_timer, 20U, timer_args_cb);
-
-static __IO uint32_t os_test_args_runs    = 0U;
-static __IO bool     os_test_args_ok      = false;
-static uint32_t      os_test_args_marker  = 0x5EED5EEDUL;
-
-/******************************************************************************************************/
+/**
+ * @brief One-shot timer callback: count the firing.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void timer_oneshot_cb(void *context, uint32_t value)
 {
     (void)value;
@@ -2384,6 +4500,12 @@ static void timer_oneshot_cb(void *context, uint32_t value)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Periodic timer callback: count the firings.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void timer_periodic_cb(void *context, uint32_t value)
 {
     (void)value;
@@ -2394,6 +4516,9 @@ static void timer_periodic_cb(void *context, uint32_t value)
 /******************************************************************************************************/
 /**
  * @brief Records whether both arguments arrived exactly as os_timer_start was given them.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
  */
 static void timer_args_cb(void *context, uint32_t value)
 {
@@ -2402,6 +4527,9 @@ static void timer_args_cb(void *context, uint32_t value)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Software timers: one-shot, periodic, stop, restart.
+ */
 static void test_timer(void)
 {
     uint32_t snapshot;
@@ -2411,10 +4539,12 @@ static void test_timer(void)
     os_test_oneshot_fired = 0U;
     AHURA_TEST_CHECK(os_timer_period_set(&os_test_timer_oneshot, 50U) == OS_ERR_NONE,
                       "the one-shot timer is defined at compile time and retuned to 50 ms");
-    AHURA_TEST_CHECK(os_timer_start(&os_test_timer_oneshot, NULL, 0U) == OS_ERR_NONE, "os_timer_start() arms the one-shot timer");
+    AHURA_TEST_CHECK(os_timer_start(&os_test_timer_oneshot, NULL, 0U) == OS_ERR_NONE,
+                     "os_timer_start() arms the one-shot timer");
 
     os_delay_ms(30U);
-    AHURA_TEST_CHECK(os_test_oneshot_fired == 0U, "one-shot timer has not fired before its period elapses");
+    AHURA_TEST_CHECK(os_test_oneshot_fired == 0U,
+                     "one-shot timer has not fired before its period elapses");
     os_delay_ms(50U);
     AHURA_TEST_CHECK(os_test_oneshot_fired == 1U, "one-shot timer fires exactly once (fired=%lu)",
                       (unsigned long)os_test_oneshot_fired);
@@ -2424,13 +4554,15 @@ static void test_timer(void)
     os_test_periodic_fired = 0U;
     AHURA_TEST_CHECK(os_timer_period_set(&os_test_timer_periodic, 30U) == OS_ERR_NONE,
                       "the periodic timer is defined at compile time and retuned to 30 ms");
-    AHURA_TEST_CHECK(os_timer_start(&os_test_timer_periodic, NULL, 0U) == OS_ERR_NONE, "os_timer_start() arms the periodic timer");
+    AHURA_TEST_CHECK(os_timer_start(&os_test_timer_periodic, NULL, 0U) == OS_ERR_NONE,
+                     "os_timer_start() arms the periodic timer");
     os_delay_ms(160U);
     AHURA_TEST_CHECK((os_test_periodic_fired >= 4U) && (os_test_periodic_fired <= 7U),
                       "periodic timer fires repeatedly (~5x expected in 160 ms, fired=%lu)",
                       (unsigned long)os_test_periodic_fired);
 
-    AHURA_TEST_CHECK(os_timer_stop(&os_test_timer_periodic) == OS_ERR_NONE, "os_timer_stop() disarms the periodic timer");
+    AHURA_TEST_CHECK(os_timer_stop(&os_test_timer_periodic) == OS_ERR_NONE,
+                     "os_timer_stop() disarms the periodic timer");
     snapshot = os_test_periodic_fired;
     os_delay_ms(90U);
     AHURA_TEST_CHECK(os_test_periodic_fired == snapshot, "no further fires after os_timer_stop()");
@@ -2444,23 +4576,27 @@ static void test_timer(void)
     (void)os_timer_start(&os_test_timer_oneshot, NULL, 0U);
     os_delay_ms(40U);
 
-    AHURA_TEST_CHECK(os_timer_pause(&os_test_timer_oneshot) == OS_ERR_NONE, "os_timer_pause() halts a running timer");
+    AHURA_TEST_CHECK(os_timer_pause(&os_test_timer_oneshot) == OS_ERR_NONE,
+                     "os_timer_pause() halts a running timer");
     os_delay_ms(150U);
     AHURA_TEST_CHECK(os_test_oneshot_fired == 0U, "a paused timer does not fire");
 
     (void)os_timer_start(&os_test_timer_oneshot, NULL, 0U);
     os_delay_ms(40U);
-    AHURA_TEST_CHECK(os_test_oneshot_fired == 0U, "start() resumes the time left, not a full period");
+    AHURA_TEST_CHECK(os_test_oneshot_fired == 0U,
+                     "start() resumes the time left, not a full period");
     os_delay_ms(50U);
     AHURA_TEST_CHECK(os_test_oneshot_fired == 1U, "the resumed timer expires");
-    AHURA_TEST_CHECK(os_timer_pause(&os_test_timer_oneshot) == OS_ERR_ERROR, "pausing a stopped timer is an error");
+    AHURA_TEST_CHECK(os_timer_pause(&os_test_timer_oneshot) == OS_ERR_ERROR,
+                     "pausing a stopped timer is an error");
 
     /* Restart 70 ms into a 100 ms period: the deadline moves out a whole period from now. */
     os_test_oneshot_fired = 0U;
     (void)os_timer_period_set(&os_test_timer_oneshot, 100U);
     (void)os_timer_start(&os_test_timer_oneshot, NULL, 0U);
     os_delay_ms(70U);
-    AHURA_TEST_CHECK(os_timer_restart(&os_test_timer_oneshot, NULL, 0U) == OS_ERR_NONE, "os_timer_restart() re-arms 70 ms in");
+    AHURA_TEST_CHECK(os_timer_restart(&os_test_timer_oneshot, NULL, 0U) == OS_ERR_NONE,
+                     "os_timer_restart() re-arms 70 ms in");
     os_delay_ms(50U);
     AHURA_TEST_CHECK(os_test_oneshot_fired == 0U, "restart moved the deadline");
     os_delay_ms(70U);
@@ -2471,7 +4607,8 @@ static void test_timer(void)
     (void)os_timer_start(&os_test_timer_periodic, NULL, 0U);
     os_delay_ms(50U);
 
-    AHURA_TEST_CHECK(os_timer_stop(&os_test_timer_periodic) == OS_ERR_NONE, "os_timer_stop() tears it down");
+    AHURA_TEST_CHECK(os_timer_stop(&os_test_timer_periodic) == OS_ERR_NONE,
+                     "os_timer_stop() tears it down");
     snapshot = os_test_periodic_fired;
     os_delay_ms(90U);
     AHURA_TEST_CHECK(os_test_periodic_fired == snapshot, "no further fires after os_timer_stop()");
@@ -2612,47 +4749,14 @@ static void test_timer(void)
 }
 #endif /* OS_CONFIG_TIMER_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * The timer API from an ISR
- * ***********************************************************************************************************
- *
- * Everything above calls the timer API from a task. This section calls it from a real exception
- * handler, because "ISR-safe" is a claim worth executing rather than reasoning about.
- *
- * SVC is the vehicle. It exists on every Cortex-M, it is synchronous - so the test knows exactly
- * when the handler ran, with no peripheral to configure and no vendor header to include - and the
- * kernel deliberately claims no SVC handler of its own. An application that defines one cannot link
- * this suite: a duplicate symbol, which is the loudest way for that clash to be noticed.
-*/
-
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
-
-#define TEST_ISR_ACTION_ARM   0U
-#define TEST_ISR_ACTION_STOP  1U
-
-static void test_isr_timer_cb(void *context, uint32_t value);
-static void test_isr_defer_cb(void *context, uint32_t value);
-
-/* One timer the ISR arms and later cancels, and one it uses as a deferred call - the "run this
- * soon" case, which in this kernel is simply a one-shot with a one-tick period. */
-OS_TIMER_DEFINE_ONESHOT(os_test_isr_timer, 1000U, test_isr_timer_cb);
-OS_TIMER_DEFINE_ONESHOT(os_test_isr_defer, 1U, test_isr_defer_cb);
-
-static uint32_t       os_test_isr_marker        = 0xC0FFEEUL;
-
-static __IO uint32_t  os_test_isr_action        = TEST_ISR_ACTION_ARM;
-static __IO uint32_t  os_test_isr_entered       = 0U;
-static __IO bool      os_test_isr_was_isr       = false;
-static __IO os_err_t os_test_isr_period_status = OS_ERR_ERROR;
-static __IO os_err_t os_test_isr_start_status  = OS_ERR_ERROR;
-static __IO os_err_t os_test_isr_defer_status  = OS_ERR_ERROR;
-static __IO os_err_t os_test_isr_stop_status   = OS_ERR_ERROR;
-static __IO uint32_t  os_test_isr_timer_fired   = 0U;
-static __IO uint32_t  os_test_isr_defer_ran     = 0U;
-static __IO bool      os_test_isr_args_ok       = false;
-
 /******************************************************************************************************/
+/**
+ * @brief Timer callback for the ISR-context checks: count the firing.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void test_isr_timer_cb(void *context, uint32_t value)
 {
     (void)context;
@@ -2664,6 +4768,9 @@ static void test_isr_timer_cb(void *context, uint32_t value)
 /**
  * @brief The deferred call the ISR scheduled. Both of its arguments came from the os_timer_start
  *        the ISR made, which is the whole point of the check.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
  */
 static void test_isr_defer_cb(void *context, uint32_t value)
 {
@@ -2673,94 +4780,11 @@ static void test_isr_defer_cb(void *context, uint32_t value)
 
 /******************************************************************************************************/
 /**
- * @brief The interrupt under test: it does nothing but call the timer API and record what came
- *        back. Reached with "svc #0" from the test task below.
+ * @brief Retune check: record the value this timer was given.
  *
- * Separated from the vector below so the suite can be reached from an SVC handler the APPLICATION
- * owns, rather than insisting on owning the vector itself. See OS_CONFIG_TEST_SVC_VECTOR.
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
  */
-void os_test_isr_entry(void)
-{
-    os_test_isr_entered++;
-    os_test_isr_was_isr = os_arch_in_isr();
-
-    if (os_test_isr_action == TEST_ISR_ACTION_ARM)
-    {
-        os_test_isr_period_status = os_timer_period_set(&os_test_isr_timer, 40U);
-        os_test_isr_start_status  = os_timer_start(&os_test_isr_timer, NULL, 0U);
-
-        /* Deferred work, scheduled from an interrupt, carrying its own data - one call, no pool. */
-        os_test_isr_defer_status  = os_timer_start(&os_test_isr_defer, &os_test_isr_marker, 0x0DEFU);
-    }
-    else
-    {
-        os_test_isr_stop_status = os_timer_stop(&os_test_isr_timer);
-    }
-}
-
-/* Whether this suite claims the SVC vector for itself (1, the default) or leaves it to the
- * application (0).
- *
- * The kernel never uses SVC and says so - it folds starting the first task into PendSV precisely to
- * leave SVC alone. The SUITE is the only part that wants it, and only to reach interrupt context so
- * the ISR-safe APIs can be tested from a real ISR rather than from a task pretending to be one.
- *
- * Claiming it has to be a STRONG definition: CMSIS-Pack startup files declare SVC_Handler weak and
- * alias it to Default_Handler, and between two weak definitions the linker keeps the startup file's -
- * so a weak one here would leave `svc #0` branching into an infinite loop. That is the same
- * mechanism that cost the ST package its SysTick vector.
- *
- * But strong collides with an application that generates its own SVC_Handler, which CubeMX does by
- * default - and it collides as a bare "multiple definition of SVC_Handler" from the linker, which
- * says nothing about why a test suite wants that symbol. Making the application delete a handler it
- * owns, on every regeneration, to accommodate a test, is the wrong way round.
- *
- * So: leave this at 1 and the suite works out of the box on a project with no SVC handler of its own
- * (the Pico SDK, a CubeMX project with SVC unticked). Set it to 0 when the application owns SVC, and
- * call os_test_isr_entry() from that handler instead - one line, and on CubeMX it goes in a USER CODE
- * block, which survives regeneration. Nothing is deleted and nothing collides.
- *
- * Same convention, and the same spelling, as SOC_CONFIG_SYSTICK_VECTOR in the ST package. Defaulted
- * here rather than required in os_config.h so that existing projects keep building untouched. */
-#ifndef OS_CONFIG_TEST_SVC_VECTOR
-#define OS_CONFIG_TEST_SVC_VECTOR       1U
-#endif
-
-#if (OS_CONFIG_TEST_SVC_VECTOR != 0U)
-/******************************************************************************************************/
-/**
- * @brief The SVC vector, when the suite owns it. Strong, for the reason above.
- */
-void OS_CONFIG_ARCH_SVC_HANDLER(void)
-{
-    os_test_isr_entry();
-}
-#endif
-
-/*
- * ***********************************************************************************************************
- * Timer retune: what os_timer_value_set, os_timer_callback_set and os_timer_period_set DO
- * ***********************************************************************************************************
-*/
-
-static void timer_retune_a_cb(void *context, uint32_t value);
-static void timer_retune_b_cb(void *context, uint32_t value);
-
-/* Its own object rather than a shared one: this section repoints the callback and moves the
- * period a long way in both directions, and doing that to a timer another section also uses
- * would leave that one's assumptions silently wrong. The declared period is overwritten
- * before every start below, so the number here only has to be legal. */
-OS_TIMER_DEFINE_PERIODIC(os_test_retune_timer, 60U, timer_retune_a_cb);
-
-/* Only its ADDRESS is ever read; the contents mean nothing. */
-static uint32_t          os_test_retune_marker    = 0U;
-static __IO uint32_t     os_test_retune_a_runs    = 0U;
-static __IO uint32_t     os_test_retune_a_value   = 0U;
-static __IO uint32_t     os_test_retune_b_runs    = 0U;
-static __IO uint32_t     os_test_retune_b_value   = 0U;
-static void * volatile   os_test_retune_b_context = NULL;
-
-/******************************************************************************************************/
 static void timer_retune_a_cb(void *context, uint32_t value)
 {
     (void)context;
@@ -2769,6 +4793,12 @@ static void timer_retune_a_cb(void *context, uint32_t value)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Retune check: record the context and value this timer was given.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void timer_retune_b_cb(void *context, uint32_t value)
 {
     os_test_retune_b_context = context;
@@ -2883,6 +4913,9 @@ static void test_timer_retune(void)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief The timer API called from interrupt context.
+ */
 static void test_timer_isr(void)
 {
     /* This section synthesises ISR context with `svc #0`, and confirms the vector first by
@@ -2978,8 +5011,10 @@ static void test_timer_isr(void)
     AHURA_TEST_CHECK(os_test_isr_entered == 1U, "the SVC handler ran once (%lu)",
                       (unsigned long)os_test_isr_entered);
     AHURA_TEST_CHECK(os_test_isr_was_isr, "and the kernel agrees that was ISR context");
-    AHURA_TEST_CHECK(os_test_isr_period_status == OS_ERR_NONE, "os_timer_period_set() from an ISR returns OK");
-    AHURA_TEST_CHECK(os_test_isr_start_status == OS_ERR_NONE, "os_timer_start() from an ISR returns OK");
+    AHURA_TEST_CHECK(os_test_isr_period_status == OS_ERR_NONE,
+                     "os_timer_period_set() from an ISR returns OK");
+    AHURA_TEST_CHECK(os_test_isr_start_status == OS_ERR_NONE,
+                     "os_timer_start() from an ISR returns OK");
     AHURA_TEST_CHECK(os_test_isr_defer_status == OS_ERR_NONE,
                       "and deferring work from an ISR is the same call, which cannot be refused");
 
@@ -3002,7 +5037,8 @@ static void test_timer_isr(void)
     os_test_isr_action = TEST_ISR_ACTION_STOP;
     __asm volatile("svc #0" ::: "memory");
 
-    AHURA_TEST_CHECK(os_test_isr_stop_status == OS_ERR_NONE, "os_timer_stop() from an ISR returns OK");
+    AHURA_TEST_CHECK(os_test_isr_stop_status == OS_ERR_NONE,
+                     "os_timer_stop() from an ISR returns OK");
     os_delay_ms(80U);
     AHURA_TEST_CHECK(os_test_isr_timer_fired == 0U,
                       "and the timer it cancelled never fired (%lu)",
@@ -3013,61 +5049,14 @@ static void test_timer_isr(void)
 }
 #endif /* OS_CONFIG_TIMER_ENABLE */
 
-
-/*
- * ***********************************************************************************************************
- * Deferred calls - os_timer_submit and its pool
- * ***********************************************************************************************************
- *
- * The property that separates a submission from a start, and the reason both exist: os_timer_start
- * on a pending timer RESCHEDULES it, so an interrupt firing twice produces one callback carrying
- * only the second event. os_timer_submit takes a fresh slot each time, so both events arrive.
- *
- * The tests below assert both halves - the coalescing AND the non-coalescing - because either one
- * alone would leave the difference undocumented by anything executable.
-*/
-
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
-
-#define TEST_POOL_SIZE     4U
-#define TEST_POOL_LOG_MAX  8U
-
-static void test_pool_cb(void *context, uint32_t value);
-static void test_pool_other_cb(void *context, uint32_t value);
-static void test_coalesce_cb(void *context, uint32_t value);
-
-/* Three pools rather than three delays at the call site: the delay belongs to the definition now,
- * so "same work, different timing" is a second pool. */
-OS_TIMER_DEFINE_SUBMIT(os_test_pool,      TEST_POOL_SIZE, 0U,  test_pool_cb);
-OS_TIMER_DEFINE_SUBMIT(os_test_pool_slow, TEST_POOL_SIZE, 60U, test_pool_cb);
-OS_TIMER_DEFINE_SUBMIT(os_test_pool_b,    2U,             0U,  test_pool_other_cb);
-
-/* The DECLARE macros, exercised the only way a declaration can be: by compiling. Each names an
- * object this file also DEFINES, so the compiler sees both and rejects any disagreement about the
- * type. Nothing at run time depends on these lines - if one of the object types ever changes and
- * its DECLARE is not changed with it, the build stops here rather than in somebody's project. */
-OS_TASK_DECLARE(worker);
-#if (OS_CONFIG_QUEUE_ENABLE == 1U)
-OS_QUEUE_DECLARE(os_test_queue);
-#endif
-#if (OS_CONFIG_MSG_ENABLE == 1U)
-OS_MSG_DECLARE(os_test_msg);
-#endif
-OS_TIMER_DECLARE(os_test_timer_periodic);
-OS_TIMER_POOL_DECLARE(os_test_pool);
-
-/* The contrast case: one ordinary one-shot, started twice. */
-OS_TIMER_DEFINE_ONESHOT(os_test_coalesce, 30U, test_coalesce_cb);
-
-static uint32_t      os_test_pool_marker = 0xFEEDU;
-static __IO uint32_t os_test_pool_log[TEST_POOL_LOG_MAX];
-static __IO uint32_t os_test_pool_runs  = 0U;
-static __IO bool     os_test_pool_ctx_ok = true;
-static __IO uint32_t os_test_pool_b_runs = 0U;
-static __IO uint32_t os_test_coalesce_runs = 0U;
-static __IO uint32_t os_test_coalesce_last = 0U;
-
 /******************************************************************************************************/
+/**
+ * @brief Pool timer: check the context it was handed, and log the run.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void test_pool_cb(void *context, uint32_t value)
 {
     if (context != &os_test_pool_marker) { os_test_pool_ctx_ok = false; }
@@ -3078,6 +5067,12 @@ static void test_pool_cb(void *context, uint32_t value)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Second pool timer: count its runs.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void test_pool_other_cb(void *context, uint32_t value)
 {
     (void)context;
@@ -3086,6 +5081,12 @@ static void test_pool_other_cb(void *context, uint32_t value)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Coalescing check: remember the last value delivered.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void test_coalesce_cb(void *context, uint32_t value)
 {
     (void)context;
@@ -3094,6 +5095,9 @@ static void test_coalesce_cb(void *context, uint32_t value)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Deferred-call pool: fill it, exhaust it, and watch slots come back.
+ */
 static void test_timer_pool(void)
 {
     uint32_t filled;
@@ -3198,7 +5202,8 @@ static void test_timer_pool(void)
     ok &= (os_timer_period_set(&os_test_pool_timer_buf[0].timer, 10U) == OS_ERR_INVALID_ARG);
     ok &= (os_timer_callback_set(&os_test_pool_timer_buf[0].timer, test_pool_cb) == OS_ERR_INVALID_ARG);
     ok &= (os_timer_value_set(&os_test_pool_timer_buf[0].timer, 1U) == OS_ERR_INVALID_ARG);
-    AHURA_TEST_CHECK(ok, "every os_timer_* call refuses a pool entry - it belongs to os_timer_submit");
+    AHURA_TEST_CHECK(ok,
+                     "every os_timer_* call refuses a pool entry - it belongs to os_timer_submit");
 
     /* Filling THIS pool needs the kernel lock: its delay is 0, so without it the timer task -
      * which outranks this one - would deliver and free each entry before the loop asked for the
@@ -3232,82 +5237,15 @@ static void test_timer_pool(void)
 }
 #endif /* OS_CONFIG_TIMER_ENABLE */
 
-
-/*
- * ***********************************************************************************************************
- * Timers under real-project conditions
- * ***********************************************************************************************************
- *
- * The sections above check one property at a time. These are the situations an application actually
- * produces: callbacks that re-arm or cancel themselves, a callback that blocks, work that outruns
- * its own period, a cancel that races the expiry it is cancelling, and an interrupt burst deeper
- * than the pool it feeds. Each is a place where a plausible implementation passes every test above
- * and still fails in the field.
-*/
-
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
-
-#define TEST_RW_CHAIN_TARGET   5U
-#define TEST_RW_SAME_PERIOD    4U
-
-static void test_rw_rearm_cb(void *context, uint32_t value);
-static void test_rw_selfstop_cb(void *context, uint32_t value);
-static void test_rw_slow_cb(void *context, uint32_t value);
-static void test_rw_owed_cb(void *context, uint32_t value);
-static void test_rw_same_cb(void *context, uint32_t value);
-static void test_rw_retune_cb(void *context, uint32_t value);
-static void test_rw_chain_cb(void *context, uint32_t value);
-static void test_rw_pool_cb(void *context, uint32_t value);
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-static void test_rw_block_cb(void *context, uint32_t value);
-#endif
-
-OS_TIMER_DEFINE_ONESHOT(os_test_rw_rearm,    20U, test_rw_rearm_cb);
-OS_TIMER_DEFINE_PERIODIC(os_test_rw_selfstop, 20U, test_rw_selfstop_cb);
-OS_TIMER_DEFINE_PERIODIC(os_test_rw_slow,     10U, test_rw_slow_cb);
-OS_TIMER_DEFINE_ONESHOT(os_test_rw_owed,     20U, test_rw_owed_cb);
-OS_TIMER_DEFINE_PERIODIC(os_test_rw_retune,   40U, test_rw_retune_cb);
-OS_TIMER_DEFINE_ONESHOT(os_test_rw_chain,    15U, test_rw_chain_cb);
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-OS_TIMER_DEFINE_ONESHOT(os_test_rw_block,    20U, test_rw_block_cb);
-#endif
-
-OS_TIMER_DEFINE_PERIODIC(os_test_rw_same0, 30U, test_rw_same_cb);
-OS_TIMER_DEFINE_PERIODIC(os_test_rw_same1, 30U, test_rw_same_cb);
-OS_TIMER_DEFINE_PERIODIC(os_test_rw_same2, 30U, test_rw_same_cb);
-OS_TIMER_DEFINE_PERIODIC(os_test_rw_same3, 30U, test_rw_same_cb);
-
-static os_timer_t *os_test_rw_same[TEST_RW_SAME_PERIOD] = {
-    &os_test_rw_same0, &os_test_rw_same1, &os_test_rw_same2, &os_test_rw_same3,
-};
-
-/* Two pools sharing ONE callback, to prove their values cannot cross. */
-OS_TIMER_DEFINE_SUBMIT(os_test_rw_pool_a, 3U, 0U, test_rw_pool_cb);
-OS_TIMER_DEFINE_SUBMIT(os_test_rw_pool_b, 3U, 0U, test_rw_pool_cb);
-
-/* ONE entry, deliberately: a callback that submits again can only succeed if the entry it is being
- * delivered on is already back in the pool. Depth 1 makes that the only way the chain can run. */
-OS_TIMER_DEFINE_SUBMIT(os_test_rw_chain_pool, 1U, 0U, test_rw_chain_cb);
-
-static __IO uint32_t os_test_rw_rearm_runs   = 0U;
-static __IO uint32_t os_test_rw_selfstop_runs = 0U;
-static __IO uint32_t os_test_rw_slow_runs    = 0U;
-static __IO uint32_t os_test_rw_owed_runs    = 0U;
-static __IO uint32_t os_test_rw_same_seen[TEST_RW_SAME_PERIOD];
-static __IO uint32_t os_test_rw_retune_runs  = 0U;
-static __IO uint32_t os_test_rw_chain_runs   = 0U;
-static __IO uint32_t os_test_rw_chain_fails  = 0U;
-static __IO uint32_t os_test_rw_pool_a_sum   = 0U;
-static __IO uint32_t os_test_rw_pool_b_sum   = 0U;
-static uint32_t      os_test_rw_marker_a     = 0xAAU;
-static uint32_t      os_test_rw_marker_b     = 0xBBU;
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-static os_mutex_t    os_test_rw_mutex;
-static __IO bool     os_test_rw_block_done = false;
-#endif
-
 /******************************************************************************************************/
-/** A one-shot that re-arms itself: the classic self-chaining timer. */
+/**
+ * @brief A one-shot that re-arms itself: the classic self-chaining timer.
+ *
+ * @param[in] context   The context the timer carries.
+ * @param[in] value     The value the timer delivered.
+ * @return None.
+ */
 static void test_rw_rearm_cb(void *context, uint32_t value)
 {
     os_test_rw_rearm_runs++;
@@ -3321,7 +5259,13 @@ static void test_rw_rearm_cb(void *context, uint32_t value)
 }
 
 /******************************************************************************************************/
-/** A periodic timer that cancels itself once its job is done. */
+/**
+ * @brief A periodic timer that cancels itself once its job is done.
+ *
+ * @param[in] context   The context the timer carries.
+ * @param[in] value     The value the timer delivered.
+ * @return None.
+ */
 static void test_rw_selfstop_cb(void *context, uint32_t value)
 {
     (void)context;
@@ -3334,7 +5278,13 @@ static void test_rw_selfstop_cb(void *context, uint32_t value)
 }
 
 /******************************************************************************************************/
-/** Work that takes far longer than the period that scheduled it. */
+/**
+ * @brief Work that takes far longer than the period that scheduled it.
+ *
+ * @param[in] context   The context the timer carries.
+ * @param[in] value     The value the timer delivered.
+ * @return None.
+ */
 static void test_rw_slow_cb(void *context, uint32_t value)
 {
     (void)context;
@@ -3344,6 +5294,12 @@ static void test_rw_slow_cb(void *context, uint32_t value)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Real-world timer: count the runs owed after a late drain.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void test_rw_owed_cb(void *context, uint32_t value)
 {
     (void)context;
@@ -3352,6 +5308,12 @@ static void test_rw_owed_cb(void *context, uint32_t value)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Real-world timer: record which period each firing landed in.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void test_rw_same_cb(void *context, uint32_t value)
 {
     (void)context;
@@ -3359,7 +5321,13 @@ static void test_rw_same_cb(void *context, uint32_t value)
 }
 
 /******************************************************************************************************/
-/** Retunes its own period from inside itself. */
+/**
+ * @brief Retunes its own period from inside itself.
+ *
+ * @param[in] context   The context the timer carries.
+ * @param[in] value     The value the timer delivered.
+ * @return None.
+ */
 static void test_rw_retune_cb(void *context, uint32_t value)
 {
     (void)context;
@@ -3373,7 +5341,13 @@ static void test_rw_retune_cb(void *context, uint32_t value)
 }
 
 /******************************************************************************************************/
-/** Defers more work from inside a deferred call. */
+/**
+ * @brief Defers more work from inside a deferred call.
+ *
+ * @param[in] context   The context the timer carries.
+ * @param[in] value     The value the timer delivered.
+ * @return None.
+ */
 static void test_rw_chain_cb(void *context, uint32_t value)
 {
     os_test_rw_chain_runs++;
@@ -3388,6 +5362,12 @@ static void test_rw_chain_cb(void *context, uint32_t value)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Real-world timer: sum the values delivered per context out of the pool.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void test_rw_pool_cb(void *context, uint32_t value)
 {
     if (context == &os_test_rw_marker_a)      { os_test_rw_pool_a_sum += value; }
@@ -3396,7 +5376,13 @@ static void test_rw_pool_cb(void *context, uint32_t value)
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
 /******************************************************************************************************/
-/** Blocks on a mutex - legal only because the callback runs on a task, not in the tick ISR. */
+/**
+ * @brief Blocks on a mutex - legal only because the callback runs on a task, not in the tick ISR.
+ *
+ * @param[in] context   The context the timer carries.
+ * @param[in] value     The value the timer delivered.
+ * @return None.
+ */
 static void test_rw_block_cb(void *context, uint32_t value)
 {
     (void)context;
@@ -3411,6 +5397,9 @@ static void test_rw_block_cb(void *context, uint32_t value)
 #endif
 
 /******************************************************************************************************/
+/**
+ * @brief Timer behaviour under the awkward patterns applications actually use.
+ */
 static void test_timer_real_world(void)
 {
     uint32_t index;
@@ -3448,7 +5437,8 @@ static void test_timer_real_world(void)
     index = os_test_rw_slow_runs;
     os_delay_ms(120U);
     AHURA_TEST_CHECK((os_test_rw_slow_runs <= (index + 1U)) && (os_test_rw_slow_runs <= 9U),
-                      "a callback slower than its period coalesces, no backlog (%lu runs, %lu after stop)",
+                      "a callback slower than its period coalesces, no backlog "
+                      "(%lu runs, %lu after stop)",
                       (unsigned long)index, (unsigned long)os_test_rw_slow_runs);
 
     /* ---- stop discards an expiry the tick already queued; pause keeps it ---- */
@@ -3587,12 +5577,6 @@ static void test_timer_real_world(void)
 }
 #endif /* OS_CONFIG_TIMER_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Task notifications
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_NOTIFY_ENABLE == 1U)
 /******************************************************************************************************/
 /**
@@ -3600,6 +5584,8 @@ static void test_timer_real_world(void)
  *        delivered value, and the elapsed ticks - shared body for the give-before-wait,
  *        wait-then-give, and timeout cases below (each just sets the timeout and interleaves
  *        os_notify_give differently around starting this task).
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_notify_wait_entry(void *context)
 {
@@ -3621,6 +5607,8 @@ static void test_notify_wait_entry(void *context)
  * @brief Blocks in an unrelated os_delay_ms (not a notification wait), then does a
  *        non-blocking os_notify_wait - proves a give() that arrives during the delay
  *        neither cuts it short nor is lost.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_notify_unrelated_block_entry(void *context)
 {
@@ -3636,10 +5624,14 @@ static void test_notify_unrelated_block_entry(void *context)
     os_test_notify_wait_value  = value;
 }
 
-/******************************************************************************************************/
 /* Waits with value_out = NULL, then immediately re-checks the mailbox: the delivery must be
  * reported AND consumed, or the second wait would find it still full. */
 /******************************************************************************************************/
+/**
+ * @brief Wait for a notification, then check the second one is not lost.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_notify_discard_entry(void *context)
 {
     (void)context;
@@ -3649,6 +5641,9 @@ static void test_notify_discard_entry(void *context)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Task notifications: send, wait, time out, and stale handles.
+ */
 static void test_task_notify(void)
 {
     os_err_t status;
@@ -3688,10 +5683,12 @@ static void test_task_notify(void)
     AHURA_TEST_CHECK(os_task_start(&helper) == OS_ERR_NONE, "give-before-wait helper started");
     AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "give-before-wait helper finished");
     t1 = os_tick_get();
-    AHURA_TEST_CHECK(os_test_notify_wait_status == OS_ERR_NONE, "the latched value was delivered without blocking");
+    AHURA_TEST_CHECK(os_test_notify_wait_status == OS_ERR_NONE,
+                     "the latched value was delivered without blocking");
     AHURA_TEST_CHECK(os_test_notify_wait_value == 111U, "the delivered value matches (got %lu)",
                       (unsigned long)os_test_notify_wait_value);
-    AHURA_TEST_CHECK((t1 - t0) < OS_TICKS_FROM_MS(100U), "delivery was immediate (elapsed=%lu ticks)",
+    AHURA_TEST_CHECK((t1 - t0) < OS_TICKS_FROM_MS(100U),
+                     "delivery was immediate (elapsed=%lu ticks)",
                       (unsigned long)(t1 - t0));
 
     /* Wait-then-give: blocks, then wakes promptly once given. */
@@ -3704,7 +5701,8 @@ static void test_task_notify(void)
                       "wait-then-give helper is blocked in os_notify_wait");
     AHURA_TEST_CHECK(os_notify_give(&worker, 222U) == OS_ERR_NONE, "os_notify_give() wakes it");
     AHURA_TEST_CHECK(test_wait_inactive(&worker, 200U), "wait-then-give helper finished");
-    AHURA_TEST_CHECK(os_test_notify_wait_status == OS_ERR_NONE, "the wait reports delivery, not timeout");
+    AHURA_TEST_CHECK(os_test_notify_wait_status == OS_ERR_NONE,
+                     "the wait reports delivery, not timeout");
     AHURA_TEST_CHECK(os_test_notify_wait_value == 222U, "the delivered value matches (got %lu)",
                       (unsigned long)os_test_notify_wait_value);
     AHURA_TEST_CHECK(os_test_notify_wait_ticks < OS_TICKS_FROM_MS(200U),
@@ -3727,7 +5725,8 @@ static void test_task_notify(void)
     status = os_task_create(&worker, TEST_TASK_CONFIG(test_notify_unrelated_block_entry, NULL, 3U));
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "unrelated-block helper created");
     t0 = os_tick_get();
-    AHURA_TEST_CHECK(os_task_start(&worker) == OS_ERR_NONE, "unrelated-block helper started (delaying 80ms)");
+    AHURA_TEST_CHECK(os_task_start(&worker) == OS_ERR_NONE,
+                     "unrelated-block helper started (delaying 80ms)");
     os_delay_ms(20U);
     AHURA_TEST_CHECK(os_notify_give(&worker, 333U) == OS_ERR_NONE,
                       "os_notify_give() during the unrelated delay succeeds");
@@ -3747,16 +5746,11 @@ static void test_task_notify(void)
     os_delay_ms(20U);
     (void)os_notify_give(&helper, 444U);
     (void)test_wait_inactive(&helper, 200U);
-    AHURA_TEST_CHECK(os_test_notify_wait_status == OS_ERR_NONE, "notify_wait(NULL) reports the delivery");
+    AHURA_TEST_CHECK(os_test_notify_wait_status == OS_ERR_NONE,
+                     "notify_wait(NULL) reports the delivery");
     AHURA_TEST_CHECK(os_test_notify_second_status == OS_ERR_EMPTY, "and still consumed it");
 }
 #endif /* OS_CONFIG_NOTIFY_ENABLE */
-
-/*
- * ***********************************************************************************************************
- * Assertions and buffered logging
- * ***********************************************************************************************************
-*/
 
 /******************************************************************************************************/
 /**
@@ -3824,7 +5818,8 @@ static void test_log(void)
     OS_LOG_INFO("selftest marker %lu", 12345UL);
     os_delay_ms(50U);
 
-    AHURA_TEST_CHECK(os_test_log_capture_lines > 0U, "a logged line reached os_log_output_cb (%lu lines)",
+    AHURA_TEST_CHECK(os_test_log_capture_lines > 0U,
+                     "a logged line reached os_log_output_cb (%lu lines)",
                       (unsigned long)os_test_log_capture_lines);
     AHURA_TEST_CHECK(test_log_capture_contains("selftest marker 12345"),
                       "the formatted text arrived intact");
@@ -3906,6 +5901,10 @@ static void test_log(void)
 }
 #else
 /******************************************************************************************************/
+/**
+ * @brief Exercises the log ring end to end: delivery through the output hook, formatting, the
+ *        level filter, and the drop-and-count behavior when the buffer overruns.
+ */
 static void test_log(void)
 {
     test_print_section("Buffered Logging");
@@ -3913,14 +5912,11 @@ static void test_log(void)
 }
 #endif /* OS_CONFIG_LOG_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Kernel heap (os_mem_alloc / os_mem_free)
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
 /******************************************************************************************************/
+/**
+ * @brief Kernel heap: allocate, free, and the free-space accounting.
+ */
 static void test_alloc(void)
 {
     size_t free0;
@@ -3938,7 +5934,8 @@ static void test_alloc(void)
     p1 = os_mem_alloc(128U);
     AHURA_TEST_CHECK(p1 != NULL, "os_mem_alloc(128) succeeds");
     free1 = os_mem_free_get();
-    AHURA_TEST_CHECK(free1 < free0, "free bytes decreased after alloc (%lu -> %lu)", (unsigned long)free0,
+    AHURA_TEST_CHECK(free1 < free0, "free bytes decreased after alloc (%lu -> %lu)",
+                     (unsigned long)free0,
                       (unsigned long)free1);
 
     p2 = os_mem_alloc(64U);
@@ -3951,7 +5948,8 @@ static void test_alloc(void)
     AHURA_TEST_CHECK(free2 == free0, "freeing both blocks restores the original free-byte count (coalescing works)");
 
     min_free = os_mem_watermark_get();
-    AHURA_TEST_CHECK(min_free <= free0, "watermark min-free (%lu) never exceeds the current free count (%lu)",
+    AHURA_TEST_CHECK(min_free <= free0,
+                     "watermark min-free (%lu) never exceeds the current free count (%lu)",
                       (unsigned long)min_free, (unsigned long)free0);
 
     AHURA_TEST_CHECK(os_mem_alloc((size_t)OS_CONFIG_HEAP_SIZE * 2U) == NULL,
@@ -3962,14 +5960,11 @@ static void test_alloc(void)
 }
 #endif /* OS_CONFIG_ALLOC_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Stack watermark
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_STACK_WATERMARK_ENABLE == 1U)
 /******************************************************************************************************/
+/**
+ * @brief Task stack watermark reporting.
+ */
 static void test_stack_watermark(void)
 {
     size_t min_free;
@@ -3995,14 +5990,11 @@ static void test_stack_watermark(void)
 }
 #endif /* OS_CONFIG_STACK_WATERMARK_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * CPU usage
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_CPU_USAGE_ENABLE == 1U)
 /******************************************************************************************************/
+/**
+ * @brief CPU-load sampling, idle and busy.
+ */
 static void test_cpu_usage(void)
 {
     uint32_t  idle_usage;
@@ -4026,15 +6018,18 @@ static void test_cpu_usage(void)
     os_test_busy_counter    = 0U;
     os_test_busy_should_run = true;
     status = os_task_create(&worker, TEST_TASK_CONFIG(test_busy_spin_entry, NULL, TEST_PRIO_LOW));
-    AHURA_TEST_CHECK(status == OS_ERR_NONE, "busy worker task created to load the CPU (priority 1)");
+    AHURA_TEST_CHECK(status == OS_ERR_NONE,
+                     "busy worker task created to load the CPU (priority 1)");
     AHURA_TEST_CHECK(os_task_start(&worker) == OS_ERR_NONE, "busy worker task started");
 
     (void)os_cpu_usage_get(); /* reset the sampling window right before the load starts */
     os_delay_ms(300U);
     busy_usage = os_cpu_usage_get();
-    AHURA_TEST_CHECK(busy_usage >= 90U, "usage rises sharply under a busy lower-priority task (%lu%%)",
+    AHURA_TEST_CHECK(busy_usage >= 90U,
+                     "usage rises sharply under a busy lower-priority task (%lu%%)",
                       (unsigned long)busy_usage);
-    AHURA_TEST_CHECK(os_test_busy_counter > 0U, "the busy worker actually made progress (count=%lu)",
+    AHURA_TEST_CHECK(os_test_busy_counter > 0U,
+                     "the busy worker actually made progress (count=%lu)",
                       (unsigned long)os_test_busy_counter);
 
     os_test_busy_should_run = false;
@@ -4042,19 +6037,19 @@ static void test_cpu_usage(void)
 }
 #endif /* OS_CONFIG_CPU_USAGE_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Integration / Combined Scenarios: several primitives at once, driven by several concurrent
+#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_MUTEX_ENABLE == 1U)
+/* Integration / Combined Scenarios: several primitives at once, driven by several concurrent.
+ *
  * tasks - the single-primitive tests above each involve at most one helper task; these prove
  * the primitives compose correctly under real multi-task contention, not just in isolation.
- * ***********************************************************************************************************
-*/
+ */
 
-#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_MUTEX_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Sends ctx->count items (ctx->base_value .. +count-1) into the shared pipeline queue,
  *        blocking whenever it is full - one of two producers running concurrently.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_pipeline_producer_entry(void *context)
 {
@@ -4076,6 +6071,8 @@ static void test_pipeline_producer_entry(void *context)
  *        if it ever failed to serialize the read-modify-write, the total would come out wrong.
  *        Stops once the known total item count has been processed (by either consumer), or
  *        after a receive timeout (the other consumer got the last item).
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_pipeline_consumer_entry(void *context)
 {
@@ -4124,7 +6121,8 @@ static void test_pipeline(void)
     AHURA_TEST_CHECK(os_queue_cleanup(&os_test_queue) == OS_ERR_NONE,
                       "pipeline queue emptied and reused (capacity %u, %u items will be produced)",
                       (unsigned)os_test_queue.capacity, (unsigned)TEST_PIPELINE_TOTAL_ITEMS);
-    AHURA_TEST_CHECK(os_mutex_init(&os_test_pipeline_mutex) == OS_ERR_NONE, "pipeline mutex initialized");
+    AHURA_TEST_CHECK(os_mutex_init(&os_test_pipeline_mutex) == OS_ERR_NONE,
+                     "pipeline mutex initialized");
 
     os_test_pipeline_total     = 0U;
     os_test_pipeline_processed = 0U;
@@ -4175,6 +6173,8 @@ static void test_pipeline(void)
 /**
  * @brief Locks os_test_prio_mutex (blocking until granted), records ctx->priority_tag as the next
  *        entry in the shared wake-order log, then unlocks and exits.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_prio_waiter_entry(void *context)
 {
@@ -4200,7 +6200,8 @@ static void test_mutex_priority_ordering(void)
 
     test_print_section("Combined: Mutex + Priority, ordered contention across 3 tasks");
 
-    AHURA_TEST_CHECK(os_mutex_init(&os_test_prio_mutex) == OS_ERR_NONE, "priority-contention mutex initialized");
+    AHURA_TEST_CHECK(os_mutex_init(&os_test_prio_mutex) == OS_ERR_NONE,
+                     "priority-contention mutex initialized");
     AHURA_TEST_CHECK(os_mutex_lock(&os_test_prio_mutex, OS_WAIT_NOTHING) == OS_ERR_NONE,
                       "test task takes the mutex first, so all 3 waiters below must block");
 
@@ -4209,11 +6210,14 @@ static void test_mutex_priority_ordering(void)
     os_test_prio_ctx[1].priority_tag = 5U;
     os_test_prio_ctx[2].priority_tag = 6U;
 
-    status = os_task_create(&worker, TEST_TASK_CONFIG(test_prio_waiter_entry, &os_test_prio_ctx[0], 4U));
+    status = os_task_create(&worker,
+                            TEST_TASK_CONFIG(test_prio_waiter_entry, &os_test_prio_ctx[0], 4U));
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "low-priority waiter created (priority 4)");
-    status = os_task_create(&helper, TEST_TASK_CONFIG(test_prio_waiter_entry, &os_test_prio_ctx[1], 5U));
+    status = os_task_create(&helper,
+                            TEST_TASK_CONFIG(test_prio_waiter_entry, &os_test_prio_ctx[1], 5U));
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "medium-priority waiter created (priority 5)");
-    status = os_task_create(&helper2, TEST_TASK_CONFIG(test_prio_waiter_entry, &os_test_prio_ctx[2], 6U));
+    status = os_task_create(&helper2,
+                            TEST_TASK_CONFIG(test_prio_waiter_entry, &os_test_prio_ctx[2], 6U));
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "high-priority waiter created (priority 6)");
 
     /* Start low first, high last: if the wake order below still comes out high-to-low, that
@@ -4231,7 +6235,8 @@ static void test_mutex_priority_ordering(void)
     AHURA_TEST_CHECK(test_wait_inactive(&helper, 300U), "medium-priority waiter finished");
     AHURA_TEST_CHECK(test_wait_inactive(&helper2, 300U), "high-priority waiter finished");
 
-    AHURA_TEST_CHECK(os_test_prio_order_count == 3U, "all 3 waiters recorded their turn (count=%lu)",
+    AHURA_TEST_CHECK(os_test_prio_order_count == 3U,
+                     "all 3 waiters recorded their turn (count=%lu)",
                       (unsigned long)os_test_prio_order_count);
     AHURA_TEST_CHECK((os_test_prio_order[0] == 6U) && (os_test_prio_order[1] == 5U) && (os_test_prio_order[2] == 4U),
                       "mutex was granted highest-priority-first, not arrival order (got %lu,%lu,%lu)",
@@ -4245,6 +6250,8 @@ static void test_mutex_priority_ordering(void)
 /**
  * @brief Blocks on os_test_inherit_mutex (held by the test task), which boosts the test task's
  *        effective priority; once granted, records completion and releases it.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_inherit_high_entry(void *context)
 {
@@ -4260,6 +6267,8 @@ static void test_inherit_high_entry(void *context)
  * @brief Burns a fixed number of cycles incrementing os_test_inherit_medium_counter then returns -
  *        same shape as test_burst_spin_entry, but exposes its progress through a shared counter
  *        so test_mutex_priority_inheritance() can prove it got zero CPU time while boosted.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_inherit_medium_entry(void *context)
 {
@@ -4286,7 +6295,8 @@ static void test_mutex_priority_inheritance(void)
 
     test_print_section("Combined: Mutex Priority Inheritance");
 
-    AHURA_TEST_CHECK(os_mutex_init(&os_test_inherit_mutex) == OS_ERR_NONE, "priority-inheritance mutex initialized");
+    AHURA_TEST_CHECK(os_mutex_init(&os_test_inherit_mutex) == OS_ERR_NONE,
+                     "priority-inheritance mutex initialized");
     AHURA_TEST_CHECK(os_mutex_lock(&os_test_inherit_mutex, OS_WAIT_NOTHING) == OS_ERR_NONE,
                       "test task takes the mutex first (at its own priority %u)",
                       (unsigned)OS_CONFIG_TEST_PRIORITY);
@@ -4335,6 +6345,8 @@ static void test_mutex_priority_inheritance(void)
  * @brief Blocks on the mutex named by its context, records its tag once granted, releases it.
  *        Two of these run at different priorities against two different mutexes held by the same
  *        owner - see test_mutex_multi_inheritance().
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_inherit2_waiter_entry(void *context)
 {
@@ -4363,8 +6375,10 @@ static void test_mutex_multi_inheritance(void)
 
     test_print_section("Combined: Mutex Priority Inheritance across TWO held mutexes");
 
-    AHURA_TEST_CHECK(os_mutex_init(&os_test_inherit2_mutex_a) == OS_ERR_NONE, "mutex A initialized");
-    AHURA_TEST_CHECK(os_mutex_init(&os_test_inherit2_mutex_b) == OS_ERR_NONE, "mutex B initialized");
+    AHURA_TEST_CHECK(os_mutex_init(&os_test_inherit2_mutex_a) == OS_ERR_NONE,
+                     "mutex A initialized");
+    AHURA_TEST_CHECK(os_mutex_init(&os_test_inherit2_mutex_b) == OS_ERR_NONE,
+                     "mutex B initialized");
 
     AHURA_TEST_CHECK(os_mutex_lock(&os_test_inherit2_mutex_a, OS_WAIT_NOTHING) == OS_ERR_NONE,
                       "test task takes mutex A (at its own priority %u)", (unsigned)OS_CONFIG_TEST_PRIORITY);
@@ -4380,14 +6394,16 @@ static void test_mutex_multi_inheritance(void)
     os_test_inherit2_ctx[1].tag   = 2U;
 
     /* HIGH blocks on A: boosts the owner to +2 (synchronously, inside os_task_start). */
-    status = os_task_create(&helper, TEST_TASK_CONFIG(test_inherit2_waiter_entry, &os_test_inherit2_ctx[0],
+    status = os_task_create(&helper,
+                            TEST_TASK_CONFIG(test_inherit2_waiter_entry, &os_test_inherit2_ctx[0],
                                                             OS_CONFIG_TEST_PRIORITY + 2U));
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "waiter HIGH created for mutex A (priority %u)",
                       (unsigned)(OS_CONFIG_TEST_PRIORITY + 2U));
     AHURA_TEST_CHECK(os_task_start(&helper) == OS_ERR_NONE, "waiter HIGH started");
 
     /* HIGHER blocks on B: boosts the owner again, to +3. */
-    status = os_task_create(&helper2, TEST_TASK_CONFIG(test_inherit2_waiter_entry, &os_test_inherit2_ctx[1],
+    status = os_task_create(&helper2,
+                            TEST_TASK_CONFIG(test_inherit2_waiter_entry, &os_test_inherit2_ctx[1],
                                                              OS_CONFIG_TEST_PRIORITY + 3U));
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "waiter HIGHER created for mutex B (priority %u)",
                       (unsigned)(OS_CONFIG_TEST_PRIORITY + 3U));
@@ -4409,9 +6425,12 @@ static void test_mutex_multi_inheritance(void)
 
     /* Release B only. HIGHER wakes, takes B and finishes; the owner must settle at +2 (still
      * owed to A's waiter), so medium STILL must not run. */
-    AHURA_TEST_CHECK(os_mutex_unlock(&os_test_inherit2_mutex_b) == OS_ERR_NONE, "test task releases mutex B");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper2, 300U), "waiter HIGHER finished after B was released");
-    AHURA_TEST_CHECK((os_test_inherit2_done_mask & 2U) != 0U, "waiter HIGHER actually acquired mutex B");
+    AHURA_TEST_CHECK(os_mutex_unlock(&os_test_inherit2_mutex_b) == OS_ERR_NONE,
+                     "test task releases mutex B");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper2, 300U),
+                     "waiter HIGHER finished after B was released");
+    AHURA_TEST_CHECK((os_test_inherit2_done_mask & 2U) != 0U,
+                     "waiter HIGHER actually acquired mutex B");
 
     AHURA_TEST_CHECK((os_test_inherit2_done_mask & 1U) == 0U,
                       "waiter HIGH is still blocked - mutex A was never released");
@@ -4423,8 +6442,10 @@ static void test_mutex_multi_inheritance(void)
     /* Release A: no held mutex left, so the owner finally drops to base and medium is free. */
     AHURA_TEST_CHECK(os_mutex_unlock(&os_test_inherit2_mutex_a) == OS_ERR_NONE,
                       "test task releases mutex A, dropping the last boost to base priority");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper, 300U), "waiter HIGH finished after A was released");
-    AHURA_TEST_CHECK((os_test_inherit2_done_mask & 1U) != 0U, "waiter HIGH actually acquired mutex A");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 300U),
+                     "waiter HIGH finished after A was released");
+    AHURA_TEST_CHECK((os_test_inherit2_done_mask & 1U) != 0U,
+                     "waiter HIGH actually acquired mutex A");
 
     AHURA_TEST_CHECK(test_wait_inactive(&worker, 300U), "medium-priority task finished");
     AHURA_TEST_CHECK(os_test_inherit_medium_counter == TEST_BURST_ITERATIONS,
@@ -4457,6 +6478,8 @@ static void test_mutex_multi_inheritance(void)
  * Every loop here is bounded, so a kernel WITHOUT the chain still finishes the test and reports a
  * failure rather than hanging the board - which matters, since that is the state this test was
  * written against.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_inherit3_low_entry(void *context)
 {
@@ -4490,6 +6513,8 @@ static void test_inherit3_low_entry(void *context)
 /******************************************************************************************************/
 /**
  * @brief The middle link: takes the mutex HIGH wants, then blocks on the one LOW holds.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_inherit3_med_entry(void *context)
 {
@@ -4508,6 +6533,8 @@ static void test_inherit3_med_entry(void *context)
 /******************************************************************************************************/
 /**
  * @brief The top of the chain. Its acquisition is the moment the whole test turns on.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_inherit3_high_entry(void *context)
 {
@@ -4526,6 +6553,8 @@ static void test_inherit3_high_entry(void *context)
 /**
  * @brief Holds nothing, wants nothing, and sits between MED and HIGH. Its only job is to be
  *        runnable, so that a LOW which was not boosted loses the CPU to it.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_inherit3_spin_entry(void *context)
 {
@@ -4540,14 +6569,19 @@ static void test_inherit3_spin_entry(void *context)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Priority inheritance followed along a chain of mutex owners.
+ */
 static void test_mutex_transitive_inheritance(void)
 {
     os_err_t status;
 
     test_print_section("Combined: Mutex Priority Inheritance along a CHAIN (transitive)");
 
-    AHURA_TEST_CHECK(os_mutex_init(&os_test_inherit3_mutex_high) == OS_ERR_NONE, "chain mutex HIGH-side initialized");
-    AHURA_TEST_CHECK(os_mutex_init(&os_test_inherit3_mutex_low) == OS_ERR_NONE, "chain mutex LOW-side initialized");
+    AHURA_TEST_CHECK(os_mutex_init(&os_test_inherit3_mutex_high) == OS_ERR_NONE,
+                     "chain mutex HIGH-side initialized");
+    AHURA_TEST_CHECK(os_mutex_init(&os_test_inherit3_mutex_low) == OS_ERR_NONE,
+                     "chain mutex LOW-side initialized");
 
     os_test_inherit3_low_holds     = false;
     os_test_inherit3_med_holds     = false;
@@ -4559,31 +6593,41 @@ static void test_mutex_transitive_inheritance(void)
 
     /* LOW first: it takes the mutex the middle of the chain will want, then parks. */
     status = os_task_create(&os_test_inherit3_low_task,
-                            TEST_TASK_CONFIG(test_inherit3_low_entry, NULL, (OS_CONFIG_TEST_PRIORITY + 1U)));
-    AHURA_TEST_CHECK(status == OS_ERR_NONE, "chain LOW task created (priority %u)", (unsigned)(OS_CONFIG_TEST_PRIORITY + 1U));
+                            TEST_TASK_CONFIG(test_inherit3_low_entry, NULL,
+                                             (OS_CONFIG_TEST_PRIORITY + 1U)));
+    AHURA_TEST_CHECK(status == OS_ERR_NONE, "chain LOW task created (priority %u)",
+                     (unsigned)(OS_CONFIG_TEST_PRIORITY + 1U));
     AHURA_TEST_CHECK(os_task_start(&os_test_inherit3_low_task) == OS_ERR_NONE, "chain LOW started");
     AHURA_TEST_CHECK(os_test_inherit3_low_holds, "LOW holds its mutex and has parked");
 
     /* SPIN is created now but deliberately NOT started - LOW starts it, see the entry above. */
     status = os_task_create(&os_test_inherit3_spin_task,
-                            TEST_TASK_CONFIG(test_inherit3_spin_entry, NULL, (OS_CONFIG_TEST_PRIORITY + 3U)));
-    AHURA_TEST_CHECK(status == OS_ERR_NONE, "SPIN task created between the two (priority %u), not yet started",
+                            TEST_TASK_CONFIG(test_inherit3_spin_entry, NULL,
+                                             (OS_CONFIG_TEST_PRIORITY + 3U)));
+    AHURA_TEST_CHECK(status == OS_ERR_NONE,
+                     "SPIN task created between the two (priority %u), not yet started",
                       (unsigned)(OS_CONFIG_TEST_PRIORITY + 3U));
 
     /* MED takes the mutex HIGH wants, then blocks on LOW's. */
     status = os_task_create(&os_test_inherit3_med_task,
-                            TEST_TASK_CONFIG(test_inherit3_med_entry, NULL, (OS_CONFIG_TEST_PRIORITY + 2U)));
-    AHURA_TEST_CHECK(status == OS_ERR_NONE, "chain MED task created (priority %u)", (unsigned)(OS_CONFIG_TEST_PRIORITY + 2U));
+                            TEST_TASK_CONFIG(test_inherit3_med_entry, NULL,
+                                             (OS_CONFIG_TEST_PRIORITY + 2U)));
+    AHURA_TEST_CHECK(status == OS_ERR_NONE, "chain MED task created (priority %u)",
+                     (unsigned)(OS_CONFIG_TEST_PRIORITY + 2U));
     AHURA_TEST_CHECK(os_task_start(&os_test_inherit3_med_task) == OS_ERR_NONE, "chain MED started");
     AHURA_TEST_CHECK(os_test_inherit3_med_holds && !os_test_inherit3_med_done,
                       "MED holds one mutex and is blocked on the other - the chain has a middle");
 
     /* HIGH closes the chain and boosts it. */
     status = os_task_create(&os_test_inherit3_high_task,
-                            TEST_TASK_CONFIG(test_inherit3_high_entry, NULL, (OS_CONFIG_TEST_PRIORITY + 4U)));
-    AHURA_TEST_CHECK(status == OS_ERR_NONE, "chain HIGH task created (priority %u)", (unsigned)(OS_CONFIG_TEST_PRIORITY + 4U));
-    AHURA_TEST_CHECK(os_task_start(&os_test_inherit3_high_task) == OS_ERR_NONE, "chain HIGH started");
-    AHURA_TEST_CHECK(!os_test_inherit3_high_done, "HIGH is blocked behind MED, which is blocked behind LOW");
+                            TEST_TASK_CONFIG(test_inherit3_high_entry, NULL,
+                                             (OS_CONFIG_TEST_PRIORITY + 4U)));
+    AHURA_TEST_CHECK(status == OS_ERR_NONE, "chain HIGH task created (priority %u)",
+                     (unsigned)(OS_CONFIG_TEST_PRIORITY + 4U));
+    AHURA_TEST_CHECK(os_task_start(&os_test_inherit3_high_task) == OS_ERR_NONE,
+                     "chain HIGH started");
+    AHURA_TEST_CHECK(!os_test_inherit3_high_done,
+                     "HIGH is blocked behind MED, which is blocked behind LOW");
 
     /* Release the bottom of the chain and let the whole thing unwind. */
     AHURA_TEST_CHECK(os_task_start(&os_test_inherit3_low_task) == OS_ERR_NONE,
@@ -4621,6 +6665,8 @@ static void test_mutex_transitive_inheritance(void)
  * @brief Waits ctx->work_ms (staggered per task so completion order is not predictable), sends
  *        ctx->value into the shared queue, then sets ctx->bit in the shared event - one
  *        of three independent workers in a fan-out/fan-in pattern.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_fanin_worker_entry(void *context)
 {
@@ -4661,11 +6707,14 @@ static void test_event_queue_fanin(void)
     os_test_fanin_ctx[2].bit = 0x04U; os_test_fanin_ctx[2].value = 30U; os_test_fanin_ctx[2].work_ms = 40U;
     expected_sum = os_test_fanin_ctx[0].value + os_test_fanin_ctx[1].value + os_test_fanin_ctx[2].value;
 
-    status = os_task_create(&worker, TEST_TASK_CONFIG(test_fanin_worker_entry, &os_test_fanin_ctx[0], 3U));
+    status = os_task_create(&worker,
+                            TEST_TASK_CONFIG(test_fanin_worker_entry, &os_test_fanin_ctx[0], 3U));
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "fan-in worker 1 created (bit 0x01, 60 ms work)");
-    status = os_task_create(&helper, TEST_TASK_CONFIG(test_fanin_worker_entry, &os_test_fanin_ctx[1], 3U));
+    status = os_task_create(&helper,
+                            TEST_TASK_CONFIG(test_fanin_worker_entry, &os_test_fanin_ctx[1], 3U));
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "fan-in worker 2 created (bit 0x02, 20 ms work)");
-    status = os_task_create(&helper2, TEST_TASK_CONFIG(test_fanin_worker_entry, &os_test_fanin_ctx[2], 3U));
+    status = os_task_create(&helper2,
+                            TEST_TASK_CONFIG(test_fanin_worker_entry, &os_test_fanin_ctx[2], 3U));
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "fan-in worker 3 created (bit 0x04, 40 ms work)");
 
     (void)os_task_start(&worker);
@@ -4677,7 +6726,8 @@ static void test_event_queue_fanin(void)
                       "wait-all sees all 3 workers' bits despite different finish times (matched=0x%02lx)",
                       (unsigned long)matched);
 
-    AHURA_TEST_CHECK(os_queue_count_get(&os_test_queue) == 3U, "queue holds exactly the 3 workers' results");
+    AHURA_TEST_CHECK(os_queue_count_get(&os_test_queue) == 3U,
+                     "queue holds exactly the 3 workers' results");
 
     for (i = 0U; i < 3U; i++)
     {
@@ -4690,7 +6740,8 @@ static void test_event_queue_fanin(void)
         if (received[i] == 30U) { saw[2] = true; }
     }
 
-    AHURA_TEST_CHECK(sum == expected_sum, "the 3 delivered values sum correctly (got=%lu expected=%lu)",
+    AHURA_TEST_CHECK(sum == expected_sum,
+                     "the 3 delivered values sum correctly (got=%lu expected=%lu)",
                       (unsigned long)sum, (unsigned long)expected_sum);
     AHURA_TEST_CHECK(saw[0] && saw[1] && saw[2],
                       "all 3 distinct worker values arrived exactly once each, in any order");
@@ -4703,17 +6754,18 @@ static void test_event_queue_fanin(void)
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U) && (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && \
     (OS_CONFIG_EVENT_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
-/*
- * ***********************************************************************************************************
- * Stress/Soak: several tasks contend on every primitive at once (see the type/object block near
+/* Stress/Soak: several tasks contend on every primitive at once (see the type/object block near.
+ *
  * the top of this file for OS_TEST_STRESS_* and the rationale)
- * ***********************************************************************************************************
-*/
+ */
 
 /******************************************************************************************************/
 /**
  * @brief Small, fast xorshift32 PRNG - just enough spread to pick different operations and
  *        sizes per worker per iteration; not meant to be statistically strong.
+ *
+ * @param[in] state        State to name.
+ * @return The next pseudo-random value.
  */
 static uint32_t test_stress_prng_next(uint32_t *state)
 {
@@ -4734,6 +6786,8 @@ static uint32_t test_stress_prng_next(uint32_t *state)
  *        read back unchanged, a received queue item decodes to a plausible sender/sequence) or
  *        feeds a counter the parent checks after every worker has finished (successful mutex
  *        locks vs. the shared counter they protect).
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_stress_worker_entry(void *context)
 {
@@ -4796,7 +6850,8 @@ static void test_stress_worker_entry(void *context)
             }
 
             case 3U: /* event: set a couple of bits, then a short bounded wait - mainly
-                      * here to add concurrent set/wait/clear-on-exit pressure on top of the rest. */
+                      * here to add concurrent set/wait/clear-on-exit pressure on top of the rest.
+                      */
             {
                 uint32_t bit     = 1UL << (test_stress_prng_next(&ctx->prng_state) % 4U);
                 uint32_t matched = 0U;
@@ -4865,11 +6920,13 @@ static void test_stress_soak(void)
 
     test_print_section("Stress/Soak: 4 tasks contend on mutex+semaphore+queue+event+heap at once");
 
-    AHURA_TEST_CHECK(os_mutex_init(&os_test_stress_mutex) == OS_ERR_NONE, "stress mutex initialized");
+    AHURA_TEST_CHECK(os_mutex_init(&os_test_stress_mutex) == OS_ERR_NONE,
+                     "stress mutex initialized");
     AHURA_TEST_CHECK(os_sem_init(&os_test_stress_sem, OS_TEST_STRESS_SEM_MAX, OS_TEST_STRESS_SEM_MAX) == OS_ERR_NONE,
                       "stress semaphore initialized (max=%u, deliberately < %u workers)",
                       (unsigned)OS_TEST_STRESS_SEM_MAX, (unsigned)OS_TEST_STRESS_WORKER_COUNT);
-    AHURA_TEST_CHECK(os_event_init(&os_test_stress_event) == OS_ERR_NONE, "stress event initialized");
+    AHURA_TEST_CHECK(os_event_init(&os_test_stress_event) == OS_ERR_NONE,
+                     "stress event initialized");
     AHURA_TEST_CHECK(os_queue_cleanup(&os_test_stress_queue) == OS_ERR_NONE,
                       "stress queue emptied and reused (capacity=%u, deliberately < %u workers)",
                       (unsigned)os_test_stress_queue.capacity, (unsigned)OS_TEST_STRESS_WORKER_COUNT);
@@ -4887,13 +6944,17 @@ static void test_stress_soak(void)
         os_test_stress_ctx[i].prng_state = 0x9E3779B9U ^ (i * 0x2545F491U) ^ (os_tick_get() | 1U);
     }
 
-    status = os_task_create(&worker, TEST_TASK_CONFIG(test_stress_worker_entry, &os_test_stress_ctx[0], 3U));
+    status = os_task_create(&worker,
+                            TEST_TASK_CONFIG(test_stress_worker_entry, &os_test_stress_ctx[0], 3U));
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "stress worker 0 created (priority 3)");
-    status = os_task_create(&helper, TEST_TASK_CONFIG(test_stress_worker_entry, &os_test_stress_ctx[1], 4U));
+    status = os_task_create(&helper,
+                            TEST_TASK_CONFIG(test_stress_worker_entry, &os_test_stress_ctx[1], 4U));
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "stress worker 1 created (priority 4)");
-    status = os_task_create(&helper2, TEST_TASK_CONFIG(test_stress_worker_entry, &os_test_stress_ctx[2], 5U));
+    status = os_task_create(&helper2,
+                            TEST_TASK_CONFIG(test_stress_worker_entry, &os_test_stress_ctx[2], 5U));
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "stress worker 2 created (priority 5)");
-    status = os_task_create(&helper3, TEST_TASK_CONFIG(test_stress_worker_entry, &os_test_stress_ctx[3], 6U));
+    status = os_task_create(&helper3,
+                            TEST_TASK_CONFIG(test_stress_worker_entry, &os_test_stress_ctx[3], 6U));
     AHURA_TEST_CHECK(status == OS_ERR_NONE, "stress worker 3 created (priority 6)");
 
     (void)os_task_start(&worker);
@@ -4901,10 +6962,14 @@ static void test_stress_soak(void)
     (void)os_task_start(&helper2);
     (void)os_task_start(&helper3);
 
-    AHURA_TEST_CHECK(test_wait_inactive(&worker, 15000U), "stress worker 0 terminated cleanly (no deadlock/hang)");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper, 15000U), "stress worker 1 terminated cleanly (no deadlock/hang)");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper2, 15000U), "stress worker 2 terminated cleanly (no deadlock/hang)");
-    AHURA_TEST_CHECK(test_wait_inactive(&helper3, 15000U), "stress worker 3 terminated cleanly (no deadlock/hang)");
+    AHURA_TEST_CHECK(test_wait_inactive(&worker, 15000U),
+                     "stress worker 0 terminated cleanly (no deadlock/hang)");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper, 15000U),
+                     "stress worker 1 terminated cleanly (no deadlock/hang)");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper2, 15000U),
+                     "stress worker 2 terminated cleanly (no deadlock/hang)");
+    AHURA_TEST_CHECK(test_wait_inactive(&helper3, 15000U),
+                     "stress worker 3 terminated cleanly (no deadlock/hang)");
 
     for (i = 0U; i < OS_TEST_STRESS_WORKER_COUNT; i++)
     {
@@ -4917,7 +6982,8 @@ static void test_stress_soak(void)
                       "all workers completed every iteration (%lu of %lu total)",
                       (unsigned long)total_iterations, (unsigned long)(OS_TEST_STRESS_WORKER_COUNT * OS_TEST_STRESS_ITERATIONS));
 
-    AHURA_TEST_CHECK(!any_corruption, "no worker observed corrupted heap memory or a malformed queue item");
+    AHURA_TEST_CHECK(!any_corruption,
+                     "no worker observed corrupted heap memory or a malformed queue item");
 
     AHURA_TEST_CHECK(os_test_stress_shared_counter == total_mutex_hits,
                       "mutex gave exclusive access every time (counter=%lu, successful locks=%lu - a mismatch would mean two tasks were inside at once)",
@@ -4946,7 +7012,8 @@ static void test_stress_soak(void)
     AHURA_TEST_CHECK(!any_corruption, "every leftover queue item (if any: %lu) still decoded to a valid sender/sequence",
                       (unsigned long)leftover_items);
 
-    AHURA_TEST_CHECK(os_mutex_lock(&os_test_stress_mutex, OS_WAIT_NOTHING) == OS_ERR_NONE, "stress mutex ended unlocked");
+    AHURA_TEST_CHECK(os_mutex_lock(&os_test_stress_mutex, OS_WAIT_NOTHING) == OS_ERR_NONE,
+                     "stress mutex ended unlocked");
     (void)os_mutex_unlock(&os_test_stress_mutex);
 
     heap_after = os_mem_free_get();
@@ -4967,22 +7034,12 @@ static void test_stress_soak(void)
 }
 #endif /* OS_CONFIG_MUTEX_ENABLE && OS_CONFIG_SEM_ENABLE && OS_CONFIG_QUEUE_ENABLE && OS_CONFIG_EVENT_ENABLE && OS_CONFIG_ALLOC_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Additional targeted churn/stress tests: unlike test_stress_soak() above (several DIFFERENT
- * primitives contended by several concurrent tasks), each of these hammers ONE subsystem's
- * create/destroy or alloc/free path back-to-back, many times, in a tight loop from a single task.
- * The single-primitive tests earlier in this file only exercise create/delete or alloc/free a
- * handful of times each - not nearly enough repetition to shake out a slot-reuse bug, a list-
- * corruption bug, or a leak that only shows up after hundreds of cycles.
- * ***********************************************************************************************************
-*/
-
-#define OS_TEST_CHURN_ITERATIONS 500U
-
-static __IO uint32_t os_test_churn_counter = 0U;
-
 /******************************************************************************************************/
+/**
+ * @brief Churn worker: count one run and exit.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_churn_worker_entry(void *context)
 {
     (void)context;
@@ -5036,7 +7093,8 @@ static void test_stress_task_churn(void)
     AHURA_TEST_CHECK(all_created, "task slot creates cleanly on every one of %u churn cycles",
                       (unsigned)OS_TEST_CHURN_ITERATIONS);
     AHURA_TEST_CHECK(all_started, "task starts cleanly on every churn cycle");
-    AHURA_TEST_CHECK(all_finished, "task self-exits and frees its slot on every churn cycle (no leak/hang)");
+    AHURA_TEST_CHECK(all_finished,
+                     "task self-exits and frees its slot on every churn cycle (no leak/hang)");
     AHURA_TEST_CHECK(os_test_churn_counter == OS_TEST_CHURN_ITERATIONS,
                       "each cycle's task body ran exactly once (counter=%lu of %lu)",
                       (unsigned long)os_test_churn_counter, (unsigned long)OS_TEST_CHURN_ITERATIONS);
@@ -5056,11 +7114,13 @@ static void test_stress_task_churn(void)
 }
 
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
-#define OS_TEST_TIMER_CHURN_ITERATIONS 500U
-
-static __IO uint32_t os_test_churn_timer_fired = 0U;
-
 /******************************************************************************************************/
+/**
+ * @brief Churn timer: count the firing.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void test_churn_timer_cb(void *context, uint32_t value)
 {
     (void)value;
@@ -5108,62 +7168,29 @@ static void test_stress_timer_churn(void)
 
     AHURA_TEST_CHECK(all_ok, "timer init/start/stop succeeds on every one of %u rapid churn cycles",
                       (unsigned)OS_TEST_TIMER_CHURN_ITERATIONS);
-    AHURA_TEST_CHECK(os_test_churn_timer_fired == 0U, "none of the stopped-before-expiry timers fired (fired=%lu)",
+    AHURA_TEST_CHECK(os_test_churn_timer_fired == 0U,
+                     "none of the stopped-before-expiry timers fired (fired=%lu)",
                       (unsigned long)os_test_churn_timer_fired);
 
     AHURA_TEST_CHECK(os_timer_period_set(&os_test_churn_timer, 30U) == OS_ERR_NONE,
                       "timer re-armed for a real run after the churn");
-    AHURA_TEST_CHECK(os_timer_start(&os_test_churn_timer, NULL, 0U) == OS_ERR_NONE, "timer starts normally after the churn");
+    AHURA_TEST_CHECK(os_timer_start(&os_test_churn_timer, NULL, 0U) == OS_ERR_NONE,
+                     "timer starts normally after the churn");
     os_delay_ms(60U);
-    AHURA_TEST_CHECK(os_test_churn_timer_fired == 1U, "the post-churn timer still fires correctly (fired=%lu)",
+    AHURA_TEST_CHECK(os_test_churn_timer_fired == 1U,
+                     "the post-churn timer still fires correctly (fired=%lu)",
                       (unsigned long)os_test_churn_timer_fired);
 }
 #endif /* OS_CONFIG_TIMER_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Extended per-subsystem stress tests - OS_TEST_STRESS_EXTENDED
- * ***********************************************************************************************************
- *
- * These cost roughly 15 KB of flash, most of it the .rodata for their PASS/FAIL messages, which is
- * more than an unoptimized build of this project has left over: -O0 already sits at ~97% of the
- * STM32H503's 128 KB, so linking them there overflows. They are therefore compiled in whenever the
- * build is optimized at all (__OPTIMIZE__, i.e. any -O above -O0) and left out otherwise, with a
- * SKIP line naming the reason at run time.
- *
- * Keyed on the optimization level rather than on a hand-set switch because that is the thing that
- * actually decides whether they fit, and because a stress test is close to meaningless at -O0
- * anyway: every timing margin and every contention window is distorted by unoptimized code, so a
- * -O0 run would report numbers that say nothing about the firmware anyone ships. Define
- * OS_TEST_STRESS_EXTENDED explicitly to override in either direction - to 0 to reclaim the flash
- * in an optimized build, or to 1 at -O0 on a part with room to spare.
-*/
-
-#ifndef OS_TEST_STRESS_EXTENDED
-#if defined(__OPTIMIZE__)
-#define OS_TEST_STRESS_EXTENDED 1U
-#else
-#define OS_TEST_STRESS_EXTENDED 0U
-#endif
-#endif
-
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
-/* Enough timers to fill the registry, plus one more that must therefore be refused.
- *
- * Defined out here, ahead of the OS_TEST_STRESS_EXTENDED block below, because BOTH the extended
- * timer-flood stress test (inside that block, so compiled out in unoptimized builds) and
- * test_regressions() (which runs in every build) fill the registry with them. Declaring them
- * inside the block made the whole suite fail to compile at -O0 - precisely the build a board
- * bring-up uses.
- *
- * The CALLBACK has to come out with them, not just a forward declaration of it. An
- * OS_TIMER_DEFINE_PERIODIC stores the function pointer in the timer object itself, so every one of
- * these definitions is a use: leaving the body inside the block satisfied the compiler and then
- * failed at link with "undefined reference to test_tflood_cb" in exactly the -O0 build this comment
- * was written to protect. The counter it writes moves with it for the same reason. */
-static __IO uint32_t os_test_tflood_fired[TEST_TIMER_SET];
-
 /******************************************************************************************************/
+/**
+ * @brief Timer-flood callback: count the firing.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void test_tflood_cb(void *context, uint32_t value)
 {
     (void)context;
@@ -5172,63 +7199,23 @@ static void test_tflood_cb(void *context, uint32_t value)
      * array's timers fired. */
     if (value < TEST_TIMER_SET) { os_test_tflood_fired[value]++; }
 }
-
-OS_TIMER_DEFINE_PERIODIC(os_test_tf0, 10U, test_tflood_cb);
-OS_TIMER_DEFINE_PERIODIC(os_test_tf1, 15U, test_tflood_cb);
-OS_TIMER_DEFINE_PERIODIC(os_test_tf2, 20U, test_tflood_cb);
-OS_TIMER_DEFINE_PERIODIC(os_test_tf3, 25U, test_tflood_cb);
-
-static os_timer_t *os_test_tflood[TEST_TIMER_SET] = {
-    &os_test_tf0,
-    &os_test_tf1,
-    &os_test_tf2,
-    &os_test_tf3,
-};
-
-OS_TIMER_DEFINE_PERIODIC(os_test_tflood_extra, 10U, test_tflood_cb);
 #endif
 
 #if (OS_TEST_STRESS_EXTENDED == 1U)
-
-/*
- * These sit between the two kinds of stress test above. test_stress_soak() contends several
- * DIFFERENT primitives from several tasks at once; the churn tests cycle ONE create/destroy path
- * repeatedly from a single task. Each test below drives one subsystem at high volume AND checks an
- * invariant strong enough to fail on a lost wakeup, a dropped or duplicated item, a leaked
- * registry slot, or a heap block handed out twice - failures a low-repetition functional check
- * cannot see, because the one interleaving it happens to produce is usually the easy one.
- *
- * Every count here is exact, not approximate: a test that only asserts "roughly the right number
- * of things happened" cannot distinguish a real dropped wakeup from scheduling jitter, so it would
- * have to be written loose enough to pass through the very bug it exists to catch. Where the
- * hardware genuinely cannot be pinned down (timer fire counts over a wall-clock window), the
- * tolerance is stated and bounded rather than left open.
- *
- * The multi-worker tests below start and join their tasks through os_test_stress_tasks[] rather than
- * repeating four near-identical lines each: one format string covers every worker, which keeps
- * per-worker failure attribution while costing a fraction of the .rodata that matters on a part
- * this close to full (see OS_TEST_STRESS_EXTENDED below).
-*/
-
-/* The two helpers below drive the queue-producer, event-bit-storm and mutex-convoy tests, so they
- * have to exist whenever ANY of those is compiled in: guarding them on a single feature would leave
- * the others calling an undeclared function, and leaving them unguarded breaks an
- * all-features-off build on -Wunused-function. Same reasoning as TEST_HELPER_NEEDED above. */
-#define TEST_STRESS_WORKERS_NEEDED                                        \
-    ((OS_CONFIG_MUTEX_ENABLE == 1U) || (OS_CONFIG_EVENT_ENABLE == 1U) ||  \
-     ((OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)))
-
 #if TEST_STRESS_WORKERS_NEEDED
-
-/* The four concurrent task slots the multi-worker stress tests share, in priority order. */
-static os_task_t *const os_test_stress_tasks[4] = { &worker, &helper, &helper2, &helper3 };
-
 /******************************************************************************************************/
 /**
  * @brief Start `count` of the shared task slots on the same entry point, each with its own context
  *        and a distinct priority (3, 4, 5, ...), and report how many actually started.
+ *
+ * @param[in] entry        Task body every worker runs.
+ * @param[in] contexts     Array of per-worker context objects.
+ * @param[in] context_size Size of one context object, in bytes.
+ * @param[in] count        How many workers.
+ * @return How many workers actually started.
  */
-static uint32_t test_stress_start_workers(os_task_entry_t entry, void *contexts, size_t context_size,
+static uint32_t test_stress_start_workers(os_task_entry_t entry, void *contexts,
+                                          size_t context_size,
                                           uint32_t count)
 {
     uint32_t started = 0U;
@@ -5259,6 +7246,9 @@ static uint32_t test_stress_start_workers(os_task_entry_t entry, void *contexts,
 /**
  * @brief Join `count` shared task slots, checking each one individually so a hang is attributed to
  *        the worker that hung rather than to the group.
+ *
+ * @param[in] count        How many workers.
+ * @param[in] timeout_ms   Timeout in milliseconds, or OS_WAIT_FOREVER.
  */
 static void test_stress_join_workers(uint32_t count, uint32_t timeout_ms)
 {
@@ -5273,9 +7263,6 @@ static void test_stress_join_workers(uint32_t count, uint32_t timeout_ms)
 #endif /* TEST_STRESS_WORKERS_NEEDED */
 
 #if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
-
-#define OS_TEST_QCHURN_ITERATIONS 200U
-
 /******************************************************************************************************/
 /**
  * @brief Creates, uses and deletes a HEAP-allocated queue back-to-back, with a different geometry
@@ -5355,20 +7342,12 @@ static void test_stress_queue_dynamic_churn(void)
                       (unsigned)OS_TEST_QCHURN_ITERATIONS, (unsigned long)os_mem_free_get());
 }
 
-#define OS_TEST_QPROD_COUNT 3U
-#define OS_TEST_QPROD_ITEMS 32U   /* 32 so one uint32_t mask tracks a producer's whole run */
-
-typedef struct
-{
-    uint32_t id;
-
-} test_qprod_ctx_t;
-
-static test_qprod_ctx_t os_test_qprod_ctx[OS_TEST_QPROD_COUNT];
-static os_queue_t       os_test_qprod_queue;
-static __IO uint32_t    os_test_qprod_sent[OS_TEST_QPROD_COUNT];
-
 /******************************************************************************************************/
+/**
+ * @brief Stress producer: push its whole run of items into the queue.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_qprod_entry(void *context)
 {
     test_qprod_ctx_t *ctx = (test_qprod_ctx_t *)context;
@@ -5463,7 +7442,8 @@ static void test_stress_queue_dynamic_concurrent(void)
 
     AHURA_TEST_CHECK(total_sent == expected, "every producer placed all its items (%lu of %lu)",
                       (unsigned long)total_sent, (unsigned long)expected);
-    AHURA_TEST_CHECK(received == expected, "the consumer took exactly as many as were sent (%lu of %lu)",
+    AHURA_TEST_CHECK(received == expected,
+                     "the consumer took exactly as many as were sent (%lu of %lu)",
                       (unsigned long)received, (unsigned long)expected);
     AHURA_TEST_CHECK(!malformed, "no delivered item decoded to an impossible producer/sequence");
     AHURA_TEST_CHECK(!duplicate, "no item was delivered twice");
@@ -5471,16 +7451,13 @@ static void test_stress_queue_dynamic_concurrent(void)
                       (unsigned)OS_TEST_QPROD_ITEMS);
 
     AHURA_TEST_CHECK(os_queue_count_get(&os_test_qprod_queue) == 0U, "the queue ended empty");
-    AHURA_TEST_CHECK(os_queue_cleanup(&os_test_qprod_queue) == OS_ERR_NONE, "the dynamic queue tears down cleanly");
+    AHURA_TEST_CHECK(os_queue_cleanup(&os_test_qprod_queue) == OS_ERR_NONE,
+                     "the dynamic queue tears down cleanly");
     AHURA_TEST_CHECK(os_mem_free_get() == heap_before, "and returned its buffer to the heap");
 }
 #endif /* OS_CONFIG_QUEUE_ENABLE && OS_CONFIG_ALLOC_ENABLE */
 
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
-
-#define OS_TEST_FRAG_BLOCKS 24U
-#define OS_TEST_FRAG_SIZE   32U
-
 /******************************************************************************************************/
 /**
  * @brief Fragments the heap deliberately, then checks the three things test_alloc() cannot: that
@@ -5533,7 +7510,8 @@ static void test_stress_heap_fragmentation(void)
         }
     }
 
-    AHURA_TEST_CHECK(pattern_ok, "every surviving block kept its contents through the interleaved frees");
+    AHURA_TEST_CHECK(pattern_ok,
+                     "every surviving block kept its contents through the interleaved frees");
 
     for (i = 0U; i < allocated; i += 2U)
     {
@@ -5580,14 +7558,12 @@ static void test_stress_heap_fragmentation(void)
 #endif /* OS_CONFIG_ALLOC_ENABLE */
 
 #if (OS_CONFIG_SEM_ENABLE == 1U)
-
-#define OS_TEST_PINGPONG_ROUNDS 1000U
-
-static os_sem_t os_test_pp_ping;
-static os_sem_t os_test_pp_pong;
-static __IO uint32_t  os_test_pp_partner_rounds = 0U;
-
 /******************************************************************************************************/
+/**
+ * @brief Stress ping-pong partner: hand the token straight back.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_pp_entry(void *context)
 {
     (void)context;
@@ -5620,8 +7596,10 @@ static void test_stress_semaphore_pingpong(void)
 
     os_test_pp_partner_rounds = 0U;
 
-    AHURA_TEST_CHECK(os_sem_init(&os_test_pp_ping, 0U, 1U) == OS_ERR_NONE, "ping semaphore initialized (binary, empty)");
-    AHURA_TEST_CHECK(os_sem_init(&os_test_pp_pong, 0U, 1U) == OS_ERR_NONE, "pong semaphore initialized (binary, empty)");
+    AHURA_TEST_CHECK(os_sem_init(&os_test_pp_ping, 0U, 1U) == OS_ERR_NONE,
+                     "ping semaphore initialized (binary, empty)");
+    AHURA_TEST_CHECK(os_sem_init(&os_test_pp_pong, 0U, 1U) == OS_ERR_NONE,
+                     "pong semaphore initialized (binary, empty)");
 
     if (os_task_create(&worker, TEST_TASK_CONFIG(test_pp_entry, NULL, TEST_PRIO_HIGH)) != OS_ERR_NONE)
     {
@@ -5660,15 +7638,12 @@ static void test_stress_semaphore_pingpong(void)
 #endif /* OS_CONFIG_SEM_ENABLE */
 
 #if (OS_CONFIG_NOTIFY_ENABLE == 1U)
-
-#define OS_TEST_NOTIFY_STORM_COUNT 1000U
-
-static __IO uint32_t os_test_ns_received = 0U;
-static __IO uint32_t os_test_ns_last     = 0U;
-static __IO bool     os_test_ns_order_ok = true;
-static __IO bool     os_test_ns_run      = true;
-
 /******************************************************************************************************/
+/**
+ * @brief Notify-storm partner: keep notifying until told to stop.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_ns_entry(void *context)
 {
     (void)context;
@@ -5740,22 +7715,12 @@ static void test_stress_notify_storm(void)
 #endif /* OS_CONFIG_NOTIFY_ENABLE */
 
 #if (OS_CONFIG_EVENT_ENABLE == 1U)
-
-#define OS_TEST_EBS_WORKERS 4U
-#define OS_TEST_EBS_ITERS   250U
-
-typedef struct
-{
-    uint32_t id;
-    uint32_t bit;
-
-} test_ebs_ctx_t;
-
-static test_ebs_ctx_t   os_test_ebs_ctx[OS_TEST_EBS_WORKERS];
-static os_event_t os_test_ebs_event;
-static __IO uint32_t    os_test_ebs_matched[OS_TEST_EBS_WORKERS];
-
 /******************************************************************************************************/
+/**
+ * @brief Event-bit storm worker: set its own bit and wait for the answer.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_ebs_entry(void *context)
 {
     test_ebs_ctx_t *ctx = (test_ebs_ctx_t *)context;
@@ -5792,7 +7757,8 @@ static void test_stress_event_bit_storm(void)
 
     test_print_section("Stress: 4 tasks set/wait/clear their own event bit concurrently");
 
-    AHURA_TEST_CHECK(os_event_init(&os_test_ebs_event) == OS_ERR_NONE, "bit-storm event initialized");
+    AHURA_TEST_CHECK(os_event_init(&os_test_ebs_event) == OS_ERR_NONE,
+                     "bit-storm event initialized");
 
     for (i = 0U; i < OS_TEST_EBS_WORKERS; i++)
     {
@@ -5821,9 +7787,6 @@ static void test_stress_event_bit_storm(void)
 #endif /* OS_CONFIG_EVENT_ENABLE */
 
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
-
-#define OS_TEST_TFLOOD_WINDOW 200U
-
 /* os_test_tflood[], os_test_tflood_extra, test_tflood_cb and os_test_tflood_fired all live
  * further up, outside this OS_TEST_STRESS_EXTENDED block: test_regressions() fills the timer
  * registry with them too, and that test always runs. */
@@ -5913,23 +7876,12 @@ static void test_stress_timer_flood(void)
 #endif /* OS_CONFIG_TIMER_ENABLE */
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
-
-#define OS_TEST_CONVOY_WORKERS 4U
-#define OS_TEST_CONVOY_ITERS   200U
-
-typedef struct
-{
-    uint32_t id;
-
-} test_convoy_ctx_t;
-
-static test_convoy_ctx_t os_test_convoy_ctx[OS_TEST_CONVOY_WORKERS];
-static os_mutex_t        os_test_convoy_mutex;
-static __IO uint32_t     os_test_convoy_counter = 0U;
-static __IO uint32_t     os_test_convoy_locks[OS_TEST_CONVOY_WORKERS];
-static __IO bool         os_test_convoy_violation = false;
-
 /******************************************************************************************************/
+/**
+ * @brief Mutex convoy worker: take and release the shared mutex, repeatedly.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_convoy_entry(void *context)
 {
     test_convoy_ctx_t *ctx = (test_convoy_ctx_t *)context;
@@ -5974,7 +7926,8 @@ static void test_stress_mutex_convoy(void)
 
     test_print_section("Stress: 4 tasks convoy on one mutex, yielding inside the section");
 
-    AHURA_TEST_CHECK(os_mutex_init(&os_test_convoy_mutex) == OS_ERR_NONE, "convoy mutex initialized");
+    AHURA_TEST_CHECK(os_mutex_init(&os_test_convoy_mutex) == OS_ERR_NONE,
+                     "convoy mutex initialized");
 
     os_test_convoy_counter   = 0U;
     os_test_convoy_violation = false;
@@ -6005,7 +7958,8 @@ static void test_stress_mutex_convoy(void)
                       "the protected counter equals the acquisition count (%lu vs %lu - a mismatch is a lost update)",
                       (unsigned long)os_test_convoy_counter, (unsigned long)total);
     AHURA_TEST_CHECK(no_starve, "no worker was starved out of the mutex entirely");
-    AHURA_TEST_CHECK(os_mutex_lock(&os_test_convoy_mutex, OS_WAIT_NOTHING) == OS_ERR_NONE, "the mutex ended unlocked");
+    AHURA_TEST_CHECK(os_mutex_lock(&os_test_convoy_mutex, OS_WAIT_NOTHING) == OS_ERR_NONE,
+                     "the mutex ended unlocked");
     (void)os_mutex_unlock(&os_test_convoy_mutex);
 
     for (i = 0U; i < OS_TEST_CONVOY_WORKERS; i++)
@@ -6015,14 +7969,7 @@ static void test_stress_mutex_convoy(void)
     }
 }
 #endif /* OS_CONFIG_MUTEX_ENABLE */
-
 #endif /* OS_TEST_STRESS_EXTENDED */
-
-/*
- * ***********************************************************************************************************
- * Task / stack footprint and context-switch timing (informational - no "correct" value to assert)
- * ***********************************************************************************************************
-*/
 
 /******************************************************************************************************/
 /**
@@ -6067,7 +8014,8 @@ static void test_task_footprint(void)
          * feature applied to a task other than "self". */
         os_test_busy_counter    = 0U;
         os_test_busy_should_run = true;
-        status = os_task_create(&worker, TEST_TASK_CONFIG(test_busy_spin_entry, NULL, TEST_PRIO_LOW));
+        status = os_task_create(&worker,
+                                TEST_TASK_CONFIG(test_busy_spin_entry, NULL, TEST_PRIO_LOW));
         if (status == OS_ERR_NONE)
         {
             (void)os_task_start(&worker);
@@ -6117,9 +8065,11 @@ static void test_context_switch_timing(void)
     os_test_switch_should_run = true;
 
     status = os_task_create(&worker, TEST_TASK_CONFIG(test_switch_ping_entry, NULL, 1U));
-    AHURA_TEST_CHECK(status == OS_ERR_NONE, "ping task created for the switch benchmark (priority 1)");
+    AHURA_TEST_CHECK(status == OS_ERR_NONE,
+                     "ping task created for the switch benchmark (priority 1)");
     status = os_task_create(&helper, TEST_TASK_CONFIG(test_switch_ping_entry, NULL, 1U));
-    AHURA_TEST_CHECK(status == OS_ERR_NONE, "pong task created for the switch benchmark (priority 1)");
+    AHURA_TEST_CHECK(status == OS_ERR_NONE,
+                     "pong task created for the switch benchmark (priority 1)");
 
     t0 = os_tick_get();
     (void)os_task_start(&worker);
@@ -6145,12 +8095,6 @@ static void test_context_switch_timing(void)
     AHURA_TEST_CHECK(test_wait_inactive(&worker, 200U), "ping task stops cleanly");
     AHURA_TEST_CHECK(test_wait_inactive(&helper, 200U), "pong task stops cleanly");
 }
-
-/*
- * ***********************************************************************************************************
- * Tickless sleep hooks (called directly, in isolation - see the caveat printed below)
- * ***********************************************************************************************************
-*/
 
 /******************************************************************************************************/
 /**
@@ -6190,7 +8134,8 @@ static void test_tickless_hooks(void)
     AHURA_TEST_CHECK((t1 - t0) <= 20U, "os_tickless_post_sleep_cb() returns promptly (%lu ticks)",
                       (unsigned long)(t1 - t0));
 
-    AHURA_TEST_CHECK(os_kernel_is_running(), "kernel state is intact after calling both hooks directly");
+    AHURA_TEST_CHECK(os_kernel_is_running(),
+                     "kernel state is intact after calling both hooks directly");
 
     /* Paired back-to-back, the same way os_tickless_idle_process() calls them. */
     os_tickless_pre_sleep_cb();
@@ -6205,13 +8150,12 @@ static void test_tickless_hooks(void)
 }
 
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U) && (OS_CONFIG_TIMER_ENABLE == 1U)
-/** Holds a delay deadline for test_tickless_bounds. 40 ticks, deliberately unlike any other bound
- *  the suite has in flight: a value that collides with one of those makes a wrong answer look
- *  right, which is exactly how the first version of this check passed while proving nothing. */
-static __IO uint32_t os_test_tickless_helper_done = 0U;
-OS_TASK_DEFINE(os_test_tickless_task, 512U);
-
 /******************************************************************************************************/
+/**
+ * @brief Sleep long enough to open a tickless window, then report.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_tickless_sleeper_entry(void *context)
 {
     (void)context;
@@ -6271,7 +8215,8 @@ static void test_tickless_bounds(void)
     (void)os_timer_stop(&os_test_timer_periodic);
 
     if (os_task_create(&os_test_tickless_task,
-                       TEST_TASK_CONFIG(test_tickless_sleeper_entry, NULL, TEST_PRIO_LOW)) == OS_ERR_NONE)
+                       TEST_TASK_CONFIG(test_tickless_sleeper_entry, NULL,
+                                        TEST_PRIO_LOW)) == OS_ERR_NONE)
     {
         (void)os_task_start(&os_test_tickless_task);
         os_delay_ms(2U);                       /* let it reach its os_delay_ms and block */
@@ -6420,7 +8365,6 @@ static void test_tickless_drift(void)
 }
 
 /******************************************************************************************************/
-/******************************************************************************************************/
 /**
  * @brief End-to-end tickless sleep, driven from this task rather than waiting for the idle task,
  *        as test_tickless_hooks() does for the sleep-bracket callbacks): arms a one-shot timer as
@@ -6514,13 +8458,15 @@ static void test_tickless_sleep(void)
                       "(before=0x%08lX after=0x%08lX)",
                       (unsigned long)mask_before, (unsigned long)mask_after);
 
-    AHURA_TEST_CHECK(init_status == OS_ERR_NONE, "the timer takes a %lu-tick horizon for the sleep test",
+    AHURA_TEST_CHECK(init_status == OS_ERR_NONE,
+                     "the timer takes a %lu-tick horizon for the sleep test",
                       (unsigned long)horizon);
     AHURA_TEST_CHECK(start_status == OS_ERR_NONE, "one-shot timer started");
     AHURA_TEST_CHECK((delta >= tolerance_low) && (delta <= tolerance_high),
                       "os_tickless_idle_process() slept ~%lu ticks and measured it accurately (delta=%lu)",
                       (unsigned long)horizon, (unsigned long)delta);
-    AHURA_TEST_CHECK(os_kernel_is_running(), "kernel state is intact after a real tickless sleep/wake cycle");
+    AHURA_TEST_CHECK(os_kernel_is_running(),
+                     "kernel state is intact after a real tickless sleep/wake cycle");
 
     /* Reported, never asserted: a LIGHT configuration has no deep entries by design, and a deep one
      * is entitled to refuse - a busy peer core, a peripheral mid-transfer, an unread byte in a UART
@@ -6539,13 +8485,13 @@ static void test_tickless_sleep(void)
     }
 
     os_delay_ms(5U); /* let the timer service task run the callback */
-    AHURA_TEST_CHECK(os_test_oneshot_fired == 1U, "the timer bounding the sleep fired exactly once (fired=%lu)",
+    AHURA_TEST_CHECK(os_test_oneshot_fired == 1U,
+                     "the timer bounding the sleep fired exactly once (fired=%lu)",
                       (unsigned long)os_test_oneshot_fired);
 
     (void)os_timer_stop(&os_test_churn_timer);
 }
 
-/******************************************************************************************************/
 /******************************************************************************************************/
 /**
  * @brief The tick really STOPS, and a refused window really is a no-op.
@@ -6685,6 +8631,14 @@ static void test_tickless_suppression(void)
 }
 #else
 /******************************************************************************************************/
+/**
+ * @brief End-to-end tickless sleep, driven from this task rather than waiting for the idle task,
+ *        as test_tickless_hooks() does for the sleep-bracket callbacks): arms a one-shot timer as
+ *        a horizon, calls os_tickless_idle_process() once, and checks the real elapsed time was
+ *        measured accurately - proving actual SysTick suppression, not just that the call is
+ *        safe. Fails against a plain-WFI (un-suppressed) OS_ARCH_SLEEP, since the CPU would then
+ *        wake at the very next real tick regardless of the requested horizon.
+ */
 static void test_tickless_sleep(void)
 {
     test_print_section("Tickless Sleep (end-to-end)");
@@ -6692,6 +8646,9 @@ static void test_tickless_sleep(void)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief The window must never outlast the nearest deadline the kernel already knows about.
+ */
 static void test_tickless_bounds(void)
 {
     test_print_section("Tickless Bounds (the window never outlasts a known deadline)");
@@ -6699,6 +8656,9 @@ static void test_tickless_bounds(void)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief Many windows back to back: does the kernel clock keep up with a counter that never stops?
+ */
 static void test_tickless_drift(void)
 {
     test_print_section("Tickless Drift (many windows against a counter that never stops)");
@@ -6706,6 +8666,9 @@ static void test_tickless_drift(void)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief The tick really STOPS, and a refused window really is a no-op.
+ */
 static void test_tickless_suppression(void)
 {
     test_print_section("Tickless Suppression (the tick stops, and a refused window is a no-op)");
@@ -6713,17 +8676,13 @@ static void test_tickless_suppression(void)
 }
 #endif /* OS_CONFIG_TICKLESS_ENABLE && OS_CONFIG_TIMER_ENABLE */
 
-/*
- * ***********************************************************************************************************
- * Benchmarks
- * ***********************************************************************************************************
-*/
-
-/******************************************************************************************************/
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/******************************************************************************************************/
 /**
  * @brief Never actually reached - the benchmark timer's period outlives the measurement.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_bench_sleeper_entry(void *context)
 {
@@ -6733,6 +8692,13 @@ static void test_bench_sleeper_entry(void *context)
 }
 #endif
 
+/******************************************************************************************************/
+/**
+ * @brief Benchmark timer: does nothing but be dispatched.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void test_bench_timer_cb(void *context, uint32_t value)
 {
     (void)context;
@@ -6740,18 +8706,14 @@ static void test_bench_timer_cb(void *context, uint32_t value)
 }
 #endif
 
-/* Runs while the switch benchmark below is sampling: equal priority to the measuring task, so a
- * yield from either one rotates to the other. __IO because the two tasks take turns rather than
- * running together - without it the compiler is entitled to hoist the load out of the loop and the
- * partner would never see the stop. */
-static __IO bool os_test_bench_partner_run = false;
-
 /******************************************************************************************************/
 /**
  * @brief Benchmark partner: hand the CPU straight back, until told to stop.
  *
  * The whole body is one yield on purpose. What the row measures is the switch, so anything else in
  * here would be counted as part of it.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_bench_partner_entry(void *context)
 {
@@ -7029,7 +8991,8 @@ static void test_benchmarks(void)
         test_bench_row("os_atomic_get (load)", TEST_BENCH_SUB(best, overhead),
                    TEST_BENCH_SUB(worst, overhead), clock_hz);
 
-        TEST_BENCH_CYCLES(best, worst, TEST_BENCH_SAMPLES, (void)os_atomic_add(&os_test_bench_atomic, 1));
+        TEST_BENCH_CYCLES(best, worst, TEST_BENCH_SAMPLES,
+                          (void)os_atomic_add(&os_test_bench_atomic, 1));
         test_bench_row("os_atomic_add (read-modify-write)", TEST_BENCH_SUB(best, overhead),
                    TEST_BENCH_SUB(worst, overhead), clock_hz);
 
@@ -7038,14 +9001,16 @@ static void test_benchmarks(void)
         test_bench_row("  ^ same, os_atomic_* layer skipped", TEST_BENCH_SUB(best, overhead),
                    TEST_BENCH_SUB(worst, overhead), clock_hz);
 
-        TEST_BENCH_CYCLES(best, worst, TEST_BENCH_SAMPLES, os_atomic_set_bit(&os_test_bench_atomic, 0U));
+        TEST_BENCH_CYCLES(best, worst, TEST_BENCH_SAMPLES,
+                          os_atomic_set_bit(&os_test_bench_atomic, 0U));
         test_bench_row("os_atomic_set_bit", TEST_BENCH_SUB(best, overhead),
                    TEST_BENCH_SUB(worst, overhead), clock_hz);
 
         /* expected == desired == what the word already holds, so the swap is always taken and
          * leaves the word where it started: this measures the successful path, not a retry. */
         (void)os_atomic_set(&os_test_bench_atomic, 0);
-        TEST_BENCH_CYCLES(best, worst, TEST_BENCH_SAMPLES, (void)os_atomic_cas(&os_test_bench_atomic, 0, 0));
+        TEST_BENCH_CYCLES(best, worst, TEST_BENCH_SAMPLES,
+                          (void)os_atomic_cas(&os_test_bench_atomic, 0, 0));
         test_bench_row("os_atomic_cas (swap taken)", TEST_BENCH_SUB(best, overhead),
                    TEST_BENCH_SUB(worst, overhead), clock_hz);
     }
@@ -7189,7 +9154,8 @@ static void test_benchmarks(void)
             for (fill = 0U; fill < TEST_BENCH_TASK_FILL; fill++)
             {
                 if (os_task_create(os_test_bench_task_fill[fill],
-                                   TEST_TASK_CONFIG(test_bench_sleeper_entry, NULL, TEST_PRIO_LOW)) == OS_ERR_NONE)
+                                   TEST_TASK_CONFIG(test_bench_sleeper_entry, NULL,
+                                                    TEST_PRIO_LOW)) == OS_ERR_NONE)
                 {
                     (void)os_task_start(os_test_bench_task_fill[fill]);
                     started++;
@@ -7200,7 +9166,8 @@ static void test_benchmarks(void)
 
             TEST_BENCH_CYCLES(best, worst, TEST_BENCH_SAMPLES,
                                   (void)os_tickless_expected_idle_ticks_get());
-            test_bench_row("    ^ deadline scan alone (4 sleepers, 8 timers)", TEST_BENCH_SUB(best, overhead),
+            test_bench_row("    ^ deadline scan alone (4 sleepers, 8 timers)",
+                           TEST_BENCH_SUB(best, overhead),
                        TEST_BENCH_SUB(worst, overhead), clock_hz);
 
             for (fill = 0U; fill < started; fill++)
@@ -7261,7 +9228,8 @@ static void test_benchmarks(void)
         for (fill = 0U; fill < TEST_BENCH_TASK_FILL; fill++)
         {
             if (os_task_create(os_test_bench_task_fill[fill],
-                               TEST_TASK_CONFIG(test_worker_entry, NULL, TEST_PRIO_LOW)) == OS_ERR_NONE)
+                               TEST_TASK_CONFIG(test_worker_entry, NULL,
+                                                TEST_PRIO_LOW)) == OS_ERR_NONE)
             {
                 (void)os_task_start(os_test_bench_task_fill[fill]);
                 started++;
@@ -7342,13 +9310,10 @@ static void test_benchmarks(void)
     (void)sink;
 }
 
-/*
- * ***********************************************************************************************************
- * Intrusive list (always compiled in - the scheduler runs on it)
- * ***********************************************************************************************************
-*/
-
 /******************************************************************************************************/
+/**
+ * @brief Intrusive list: insert, remove, iterate.
+ */
 static void test_list(void)
 {
     os_list_t      list;
@@ -7365,90 +9330,39 @@ static void test_list(void)
     os_list_push_back(&list, &b);
     os_list_push_back(&list, &c);
     AHURA_TEST_CHECK(!os_list_is_empty(&list), "list is non-empty after push_back");
-    AHURA_TEST_CHECK(os_list_pop_front(&list) == &a, "pop_front returns nodes in FIFO order (1st = a)");
+    AHURA_TEST_CHECK(os_list_pop_front(&list) == &a,
+                     "pop_front returns nodes in FIFO order (1st = a)");
 
     os_list_remove(&list, &c);
-    AHURA_TEST_CHECK(os_list_pop_front(&list) == &b, "removing a non-head node leaves the rest intact (2nd = b)");
-    AHURA_TEST_CHECK(os_list_is_empty(&list), "list is empty after removing/popping everything pushed");
+    AHURA_TEST_CHECK(os_list_pop_front(&list) == &b,
+                     "removing a non-head node leaves the rest intact (2nd = b)");
+    AHURA_TEST_CHECK(os_list_is_empty(&list),
+                     "list is empty after removing/popping everything pushed");
 
     os_list_push_back(&list, &a);
     os_list_insert_before(&list, &a, &b);
-    AHURA_TEST_CHECK(os_list_pop_front(&list) == &b, "insert_before(head) places the new node ahead of it");
+    AHURA_TEST_CHECK(os_list_pop_front(&list) == &b,
+                     "insert_before(head) places the new node ahead of it");
     AHURA_TEST_CHECK(os_list_pop_front(&list) == &a, "the original head follows");
 
     os_list_push_back(&list, &a);
     os_list_insert_before(&list, NULL, &b);
-    AHURA_TEST_CHECK(os_list_pop_front(&list) == &a, "insert_before(NULL) appends at the tail (a stays head)");
+    AHURA_TEST_CHECK(os_list_pop_front(&list) == &a,
+                     "insert_before(NULL) appends at the tail (a stays head)");
     AHURA_TEST_CHECK(os_list_pop_front(&list) == &b, "the appended node comes out last");
 
     os_list_remove(&list, &c); /* c is not in any list: must be a safe no-op */
-    AHURA_TEST_CHECK(os_list_is_empty(&list), "removing a node that is not in the list is a safe no-op");
+    AHURA_TEST_CHECK(os_list_is_empty(&list),
+                     "removing a node that is not in the list is a safe no-op");
 }
 
-/*
- * ***********************************************************************************************************
- * Config-gated features (multi-core / TrustZone / tickless)
- * ***********************************************************************************************************
-*/
-
-/*
- * ***********************************************************************************************************
- * Multi-core (SMP)
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_CORE_COUNT > 1U)
-
-/* Enough contention that a broken lock loses updates reliably rather than occasionally: each core
- * does this many read-modify-writes on one word, as fast as it can, at the same time as the other.
- * A lock that does not exclude drops hundreds, not one or two. */
-#define TEST_MC_LOCK_ITERATIONS     4000U
-
-/* How long core 0 waits for a task pinned to core 1 to run at all. Generous by design - this is
- * the check that says whether the second core booted, and a slow answer is still an answer. */
-#define TEST_MC_START_TIMEOUT_MS    500U
-
-/* How often each parked worker proves its core is still alive, and how long the late check
- * watches for. The window is several heartbeats so one missed wake cannot fail it. */
-#define TEST_MC_HEARTBEAT_MS        100U
-#define TEST_MC_WATCH_MS            600U
-
-OS_TASK_DEFINE(test_mc_core0, 512U);
-OS_TASK_DEFINE(test_mc_core1, 512U);
-
-/* One slot per worker, indexed by the core it is PINNED to, so a worker writing the wrong slot is
- * itself a detectable failure. __IO throughout: written on one core and read on the other, with
- * no lock, so the compiler must not cache any of it in a register. */
-static __IO uint32_t test_mc_seen_core[2]  = { 0xFFFFFFFFU, 0xFFFFFFFFU };
-static __IO uint32_t test_mc_ready[2]      = { 0U, 0U };
-static __IO uint32_t test_mc_done[2]       = { 0U, 0U };
-static __IO uint32_t test_mc_begin_tick[2] = { 0U, 0U };
-static __IO uint32_t test_mc_end_tick[2]   = { 0U, 0U };
-
-/* Advanced by each parked worker, once per heartbeat, for the whole rest of the run. Read twice by
- * the late check to see whether that core is still going. */
-static __IO uint32_t test_mc_alive[2]      = { 0U, 0U };
-
-/* The kernel tick at each core's most recent heartbeat. Whatever it holds at the end is the moment
- * that core last ran. */
-static __IO uint32_t test_mc_last_tick[2]  = { 0U, 0U };
-
-/* Released by core 0 once BOTH workers have reported in, so the two hammer the shared counter at
- * the same time. Without it one could finish before the other starts and the lock would never be
- * contended - the test would pass on a lock that excludes nothing. */
-static __IO uint32_t test_mc_gate = 0U;
-
-/* The word the kernel spinlock is supposed to protect. Deliberately NOT atomic: the point is to
- * test os_critical_enter/exit, so the increment must be a plain read-modify-write that interleaves
- * destructively if the lock fails. */
-static __IO uint32_t test_mc_counter = 0U;
-
 /******************************************************************************************************/
 /**
  * @brief Body of both multi-core workers: report which core we are on, then hammer the shared
  *        counter under the kernel lock.
  *
- * @param context The core index this task was pinned to, as a small integer cast to a pointer.
+ * @param[in] context  The core index this task was pinned to, as a small integer cast to a pointer.
  */
 static void test_mc_worker_entry(void *context)
 {
@@ -7619,11 +9533,9 @@ static void test_multicore(void)
                      OS_TASK_CORE(OS_CONFIG_CORE_COUNT)) != OS_ERR_NONE,
                      "os_task_core_affinity_set() rejects a core beyond OS_CONFIG_CORE_COUNT");
 }
-
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 #if (OS_CONFIG_CORE_COUNT > 1U)
-
 /******************************************************************************************************/
 /**
  * @brief Re-check, at the very end of the run, that both cores are still alive.
@@ -7633,6 +9545,9 @@ static void test_multicore(void)
  * cannot fail it. That is the question worth asking LAST - whether the secondary core survived
  * the whole suite, not just its own section - which is why the multi-core pair runs after
  * everything else.
+ *
+ * @param[in] watch_ms     How long to watch both cores, in milliseconds.
+ * @param[in] when         Label for the moment this sample is taken.
  */
 static void test_multicore_watch(uint32_t watch_ms, const char *when)
 {
@@ -7678,51 +9593,12 @@ static void test_multicore_watch(uint32_t watch_ms, const char *when)
     }
 }
 
-/*
- * ***********************************************************************************************************
- * Multi-core (SMP) stress - cross-core contention and wake integrity
- * ***********************************************************************************************************
- *
- * Everything above proved the kernel one subsystem at a time, on the core each helper was pinned
- * to. These push the SMP seams specifically, and each is built so a failure is exact rather than
- * approximate: handshakes make every cross-core wake 1:1, so a lost or duplicated wake shows up
- * as a miscounted value, and guarded counters come out exact only if the spinlock really excludes
- * two cores at once.
- *
- * These run with OS_CONFIG_MAX_USER_TASKS at 8: the test task, the two heartbeat workers parked
- * by test_multicore(), and up to five concurrent helpers below.
- */
-
-#define TEST_SMP_NESTED_ITERATIONS   20000U
-#define TEST_SMP_ATOMIC_ITERATIONS   40000U
-#define TEST_SMP_PINGPONG_ROUNDS     500U
-#define TEST_SMP_EVENT_ROUNDS        300U
-#define TEST_SMP_QUEUE_ITEMS         300U
-#define TEST_SMP_CHURN_CYCLES        40U
-#define TEST_SMP_SUBMIT_EACH         16U
-#define TEST_SMP_SOAK_ITERATIONS     150U
-#define TEST_SMP_MIGRATION_SAMPLES   8U
-
-/* Six dedicated task handles: every helper exits on its own (entry returns), so the handles come
- * back INACTIVE between sections and are safe to re-create. Never deleted cross-core, which is
- * OS_ERR_BUSY by design. */
-OS_TASK_DEFINE(test_smp_a, 512U);
-OS_TASK_DEFINE(test_smp_b, 512U);
-OS_TASK_DEFINE(test_smp_c, 512U);
-OS_TASK_DEFINE(test_smp_d, 512U);
-OS_TASK_DEFINE(test_smp_e, 256U);
-OS_TASK_DEFINE(test_smp_f, 256U);
-
 /******************************************************************************************************/
 /**
- * @brief Nested critical sections on both cores at once: the per-core nesting counters and the
- *        single cross-core spinlock must agree, or the counter below loses updates.
+ * @brief SMP: nest critical sections on whichever core this runs.
+ *
+ * @param[in] context      The caller's context pointer.
  */
-static __IO uint32_t test_smp_nested_counter = 0U;
-static __IO uint32_t test_smp_nested_seen[2] = { 0xFFFFFFFFU, 0xFFFFFFFFU };
-static __IO uint32_t test_smp_nested_done[2] = { 0U, 0U };
-static __IO uint32_t test_smp_nested_gate    = 0U;
-
 static void test_smp_nested_entry(void *context)
 {
     uint32_t slot = (uint32_t)(uintptr_t)context;
@@ -7748,6 +9624,10 @@ static void test_smp_nested_entry(void *context)
     test_smp_nested_done[slot] = 1U;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP: nested critical sections taken on both cores at once.
+ */
 static void test_smp_critical_nested(void)
 {
     uint32_t waited;
@@ -7805,14 +9685,10 @@ static void test_smp_critical_nested(void)
 #if (OS_CONFIG_ATOMIC_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief os_atomic_inc on one word from both cores at once. The port's atomics are LDREX/STREX,
- *        so this also proves the GLOBAL exclusive monitor works on this part - a lost update
- *        means the interconnect is not excluding between cores, which the kernel cannot fix.
+ * @brief SMP: hammer the shared atomic counter from this core.
+ *
+ * @param[in] context      The caller's context pointer.
  */
-static os_atomic_t   test_smp_atomic_word   = OS_ATOMIC_INIT(0);
-static __IO uint32_t test_smp_atomic_done[2] = { 0U, 0U };
-static __IO uint32_t test_smp_atomic_gate    = 0U;
-
 static void test_smp_atomic_entry(void *context)
 {
     uint32_t slot = (uint32_t)(uintptr_t)context;
@@ -7830,6 +9706,10 @@ static void test_smp_atomic_entry(void *context)
     test_smp_atomic_done[slot] = 1U;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP: one atomic counter under contention from both cores.
+ */
 static void test_smp_atomic_contention(void)
 {
     uint32_t waited;
@@ -7874,13 +9754,10 @@ static void test_smp_atomic_contention(void)
 #if (OS_CONFIG_NOTIFY_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief Task notifications ping-pong between two pinned tasks, one per core. Each side waits for
- *        its own next value before answering, so every cross-core wake must deliver exactly one
- *        value: any lost or duplicated wake breaks the sequence the instant it happens.
+ * @brief SMP ping-pong: notify the partner, then wait for its answer.
+ *
+ * @param[in] context      The caller's context pointer.
  */
-static __IO bool     test_smp_notify_ok     = true;
-static __IO uint32_t test_smp_notify_rounds = 0U;
-
 static void test_smp_notify_a_entry(void *context)
 {
     uint32_t expected = 1U;
@@ -7916,6 +9793,12 @@ static void test_smp_notify_a_entry(void *context)
     }
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP ping-pong: wait for the partner, then notify it back.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_smp_notify_b_entry(void *context)
 {
     uint32_t expected;
@@ -7961,6 +9844,10 @@ static void test_smp_notify_b_entry(void *context)
     }
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP: task notifications bounce between the cores.
+ */
 static void test_smp_notify_pingpong(void)
 {
     test_print_section("Multi-core (SMP): task notifications ping-pong across cores");
@@ -7994,14 +9881,10 @@ static void test_smp_notify_pingpong(void)
 #if (OS_CONFIG_SEM_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief Binary-semaphore ping-pong between two pinned tasks, one per core. Each round is one
- *        take/give on each side, so the token crosses the IPI path twice - and the final token
- *        count proves the accounting exactly.
+ * @brief SMP ping-pong: hand the semaphore token to the partner.
+ *
+ * @param[in] context      The caller's context pointer.
  */
-static os_sem_t test_smp_sem_a;
-static os_sem_t test_smp_sem_b;
-static __IO uint32_t  test_smp_sem_rounds = 0U;
-
 static void test_smp_sem_a_entry(void *context)
 {
     uint32_t round;
@@ -8024,6 +9907,12 @@ static void test_smp_sem_a_entry(void *context)
     }
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP ping-pong: take the token and hand it straight back.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_smp_sem_b_entry(void *context)
 {
     uint32_t round;
@@ -8044,14 +9933,20 @@ static void test_smp_sem_b_entry(void *context)
     }
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP: semaphore tokens bounce between the cores.
+ */
 static void test_smp_semaphore_pingpong(void)
 {
     test_print_section("Multi-core (SMP): semaphore tokens ping-pong across cores");
 
     test_smp_sem_rounds = 0U;
 
-    AHURA_TEST_CHECK(os_sem_init(&test_smp_sem_a, 0U, 1U) == OS_ERR_NONE, "semaphore A initialized empty");
-    AHURA_TEST_CHECK(os_sem_init(&test_smp_sem_b, 0U, 1U) == OS_ERR_NONE, "semaphore B initialized empty");
+    AHURA_TEST_CHECK(os_sem_init(&test_smp_sem_a, 0U, 1U) == OS_ERR_NONE,
+                     "semaphore A initialized empty");
+    AHURA_TEST_CHECK(os_sem_init(&test_smp_sem_b, 0U, 1U) == OS_ERR_NONE,
+                     "semaphore B initialized empty");
 
     AHURA_TEST_CHECK(os_task_create(&test_smp_a,
                      OS_TASK_CONFIG(test_smp_sem_a_entry, NULL, TEST_PRIO_HIGH,
@@ -8089,17 +9984,10 @@ static void test_smp_semaphore_pingpong(void)
 #if (OS_CONFIG_QUEUE_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief Two producers (one per core) feed one consumer with exactly accounted items. Each item
- *        carries its producer id and per-producer sequence, so the consumer can reject any loss,
- *        duplication or reordering - and a capacity below the combined send rate forces the FULL
- *        path and backpressure through the cross-core wake.
+ * @brief SMP: produce this producer numbered run of items.
+ *
+ * @param[in] context      The caller's context pointer.
  */
-OS_QUEUE_DEFINE_ATTR(test_smp_queue, sizeof(uint32_t), 4, );
-
-static __IO uint32_t test_smp_queue_expected[2] = { 1U, 1U };
-static __IO bool     test_smp_queue_ok          = true;
-static __IO uint32_t test_smp_queue_received    = 0U;
-
 static void test_smp_queue_producer_entry(void *context)
 {
     uint32_t id  = (uint32_t)(uintptr_t)context;
@@ -8117,6 +10005,12 @@ static void test_smp_queue_producer_entry(void *context)
     }
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP: consume every item both producers sent.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_smp_queue_consumer_entry(void *context)
 {
     uint32_t total = TEST_SMP_QUEUE_ITEMS * 2U;
@@ -8149,6 +10043,10 @@ static void test_smp_queue_consumer_entry(void *context)
     }
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP: two producers, one consumer, and the item count has to add up.
+ */
 static void test_smp_queue_accounting(void)
 {
     uint32_t ignored = 0U;
@@ -8194,14 +10092,10 @@ static void test_smp_queue_accounting(void)
 #if (OS_CONFIG_EVENT_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief Event-bit handshake across cores: the setter on core 1 sets bit 1 and waits for bit 2,
- *        the waiter on core 0 consumes bit 1 and answers with bit 2. Clear-on-exit makes each
- *        round 1:1, so a lost wake stalls and a duplicated one breaks the count.
+ * @brief SMP: wait for this round event bit.
+ *
+ * @param[in] context      The caller's context pointer.
  */
-static os_event_t    test_smp_event;
-static __IO bool     test_smp_event_ok     = true;
-static __IO uint32_t test_smp_event_rounds = 0U;
-
 static void test_smp_event_waiter_entry(void *context)
 {
     uint32_t round;
@@ -8234,6 +10128,12 @@ static void test_smp_event_waiter_entry(void *context)
     }
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP: set the event bit the waiter is blocked on.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_smp_event_setter_entry(void *context)
 {
     uint32_t round;
@@ -8264,6 +10164,10 @@ static void test_smp_event_setter_entry(void *context)
     }
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP: event bits hand off between the cores.
+ */
 static void test_smp_event_pingpong(void)
 {
     test_print_section("Multi-core (SMP): event bits hand off across cores");
@@ -8301,12 +10205,10 @@ static void test_smp_event_pingpong(void)
 
 /******************************************************************************************************/
 /**
- * @brief Affinity migration: a task created pinned to core 1 is re-pinned to core 0 while
- *        BLOCKED, and its next wake must dispatch it on the core the new mask names.
+ * @brief Count work while the scheduler is free to move this task.
+ *
+ * @param[in] context      The caller's context pointer.
  */
-static __IO uint32_t test_smp_migration_phase[2][TEST_SMP_MIGRATION_SAMPLES];
-static __IO uint32_t test_smp_migration_done[2]  = { 0U, 0U };
-
 static void test_smp_migration_entry(void *context)
 {
     uint32_t value = 0U;
@@ -8342,6 +10244,10 @@ static void test_smp_migration_entry(void *context)
     test_smp_migration_done[1] = 1U;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP: a task that may migrate keeps its own stack and its own count.
+ */
 static void test_smp_migration(void)
 {
     uint32_t waited;
@@ -8392,7 +10298,8 @@ static void test_smp_migration(void)
     {
         if (test_smp_migration_phase[1][i] != 0U) { phase1_ok = false; }
     }
-    AHURA_TEST_CHECK(phase1_ok, "every phase-1 sample ran on core 0 - the wake honoured the new mask");
+    AHURA_TEST_CHECK(phase1_ok,
+                     "every phase-1 sample ran on core 0 - the wake honoured the new mask");
 }
 
 /******************************************************************************************************/
@@ -8426,20 +10333,22 @@ static void test_smp_lock_independent(void)
 
 /******************************************************************************************************/
 /**
- * @brief Both cores churn create/start/exit on their own worker tasks at once. Each helper exits
- *        immediately, so every cycle exercises the shared task table and ready lists from two
- *        cores against each other.
+ * @brief Transient task body: count one run and exit.
+ *
+ * @param[in] context      The caller's context pointer.
  */
-static __IO uint32_t test_smp_churn_done[2] = { 0U, 0U };
-static __IO uint32_t test_smp_churn_errs[2] = { 0U, 0U };
-static __IO uint32_t test_smp_churn_runs    = 0U;
-
 static void test_smp_churn_worker_entry(void *context)
 {
     (void)context;
     test_smp_churn_runs++;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP: create, start and outlive transient tasks in a loop.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_smp_churn_entry(void *context)
 {
     uint32_t  slot      = (uint32_t)(uintptr_t)context;
@@ -8472,6 +10381,10 @@ static void test_smp_churn_entry(void *context)
     test_smp_churn_done[slot] = 1U;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP: task create/start/exit churn on both cores at once.
+ */
 static void test_smp_task_churn(void)
 {
     uint32_t waited;
@@ -8515,17 +10428,11 @@ static void test_smp_task_churn(void)
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief Deferred calls submitted from both cores at once. The timer service task (pinned to
- *        core 0) delivers every one of them, so the callback itself records which core it ran on.
+ * @brief Deferred call: check which core dispatched it.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
  */
-static void test_smp_submit_cb(void *context, uint32_t value);
-
-OS_TIMER_DEFINE_SUBMIT(test_smp_pool, 24U, 0U, test_smp_submit_cb);
-
-static __IO uint32_t test_smp_submit_runs       = 0U;
-static __IO bool     test_smp_submit_ok         = true;
-static __IO uint32_t test_smp_submit_done[2]    = { 0U, 0U };
-
 static void test_smp_submit_cb(void *context, uint32_t value)
 {
     (void)context;
@@ -8538,6 +10445,12 @@ static void test_smp_submit_cb(void *context, uint32_t value)
     test_smp_submit_runs++;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP: submit deferred calls from this core.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_smp_submit_entry(void *context)
 {
     uint32_t slot = (uint32_t)(uintptr_t)context;
@@ -8560,6 +10473,10 @@ static void test_smp_submit_entry(void *context)
     test_smp_submit_done[slot] = 1U;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief SMP: deferred calls submitted from both cores at once.
+ */
 static void test_smp_deferred_submit(void)
 {
     uint32_t waited;
@@ -8604,30 +10521,10 @@ static void test_smp_deferred_submit(void)
 #if (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ATOMIC_ENABLE == 1U)
 /******************************************************************************************************/
 /**
- * @brief A mixed workload from four tasks, two per core: guarded increments, atomic increments,
- *        a semaphore give/take pair and a queue round-trip every iteration, with hard exact
- *        accounting at the end.
+ * @brief SMP soak worker: mixed queue, mutex and notify traffic.
+ *
+ * @param[in] context      The caller's context pointer.
  */
-static __IO uint32_t test_smp_soak_guarded = 0U;
-static os_atomic_t  test_smp_soak_atomic   = OS_ATOMIC_INIT(0);
-/* One per worker, not one shared between them. A shared max-count-1 semaphore returns FULL to the
- * second of four concurrent givers, and a shared queue cannot promise a sender its own item back -
- * both were the test racing itself rather than anything the kernel got wrong. */
-static os_sem_t test_smp_soak_sem[4];
-
-OS_QUEUE_DEFINE_ATTR(test_smp_soak_q0, sizeof(uint32_t), 1, );
-OS_QUEUE_DEFINE_ATTR(test_smp_soak_q1, sizeof(uint32_t), 1, );
-OS_QUEUE_DEFINE_ATTR(test_smp_soak_q2, sizeof(uint32_t), 1, );
-OS_QUEUE_DEFINE_ATTR(test_smp_soak_q3, sizeof(uint32_t), 1, );
-
-static os_queue_t *const test_smp_soak_queue[4] =
-{
-    &test_smp_soak_q0, &test_smp_soak_q1, &test_smp_soak_q2, &test_smp_soak_q3
-};
-static __IO uint32_t test_smp_soak_done[4] = { 0U, 0U, 0U, 0U };
-static __IO uint32_t test_smp_soak_seen[4] = { 0xFFFFFFFFU, 0xFFFFFFFFU, 0xFFFFFFFFU, 0xFFFFFFFFU };
-static __IO bool     test_smp_soak_ok      = true;
-
 static void test_smp_soak_entry(void *context)
 {
     uint32_t slot    = (uint32_t)(uintptr_t)context;
@@ -8682,24 +10579,6 @@ static void test_smp_soak_entry(void *context)
     test_smp_soak_done[slot] = 1U;
 }
 
-/*
- * ***********************************************************************************************************
- * Multi-core: OS_TASK_CORE_ANY, the one affinity the rest of this suite avoids
- * ***********************************************************************************************************
-*/
-
-#define TEST_ANY_WORKERS     4U
-#define TEST_ANY_ROUNDS      150U
-#define TEST_ANY_SENTINEL    0x5A5AC0DEUL
-
-static __IO uint32_t test_any_gate    = 0U;
-static __IO uint32_t test_any_done[TEST_ANY_WORKERS];
-static __IO uint32_t test_any_cores[TEST_ANY_WORKERS];   /* bitmask of cores this worker ran on */
-static __IO uint32_t test_any_smashed = 0U;
-static __IO uint32_t test_any_guarded = 0U;              /* plain RMW under os_critical_enter */
-
-static void test_any_worker_entry(void *context);
-
 /******************************************************************************************************/
 /**
  * @brief One unpinned worker: note the core, count once under the lock, then yield and check
@@ -8708,7 +10587,7 @@ static void test_any_worker_entry(void *context);
  * The yield is the point. It is the cheapest way to ask the scheduler to reconsider where this
  * task belongs, so the loop offers TEST_ANY_ROUNDS chances to migrate rather than one.
  *
- * @param context The worker's slot index, as a small integer cast to a pointer.
+ * @param[in] context  The worker's slot index, as a small integer cast to a pointer.
  */
 static void test_any_worker_entry(void *context)
 {
@@ -8852,6 +10731,9 @@ static void test_smp_core_any(void)
 }
 
 /******************************************************************************************************/
+/**
+ * @brief SMP: mixed IPC soak run across both cores.
+ */
 static void test_smp_soak_mixed(void)
 {
     uint32_t waited;
@@ -8948,10 +10830,12 @@ static void test_smp_soak_mixed(void)
                      "every queue round-trip returned its own item and every call succeeded");
 }
 #endif /* SEM && QUEUE && ATOMIC */
-
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 /******************************************************************************************************/
+/**
+ * @brief Report what this configuration leaves out (informational only).
+ */
 static void test_unsupported_features(void)
 {
     test_print_section("Multi-core / TrustZone / Tickless (config-gated, informational)");
@@ -8976,25 +10860,13 @@ static void test_unsupported_features(void)
 #endif
 }
 
-/*
- * ***********************************************************************************************************
- * Regressions for fixed defects
- * ***********************************************************************************************************
- *
- * What these share is a method rather than a subsystem: each needs an interleaving the scheduler
- * would not normally produce, and os_kernel_lock is what makes those reachable on target - it
- * holds a woken task in READY, with the tick and every interrupt still running, for as long as
- * the test needs. Messages are kept short here: this suite is already close to the flash limit.
-*/
-
 #if (OS_CONFIG_SEM_ENABLE == 1U)
-static os_sem_t os_test_reg_sem;
-static __IO uint32_t  os_test_reg_order   = 0U;
-static __IO uint32_t  os_test_reg_a_order = 0U;
-static __IO os_err_t os_test_reg_a_st    = OS_ERR_ERROR;
-static __IO os_err_t os_test_reg_b_st    = OS_ERR_ERROR;
-
 /******************************************************************************************************/
+/**
+ * @brief Regression: the second waiter on the semaphore.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_reg_waiter_b(void *context)
 {
     (void)context;
@@ -9003,11 +10875,14 @@ static void test_reg_waiter_b(void *context)
 }
 
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
-static os_mutex_t os_test_reg_mutex;
-
 /* Low priority: holds the mutex, then queues on the semaphore behind a higher-priority waiter.
  * The boost it takes while blocked there is what must re-sort it to the head of that queue. */
 /******************************************************************************************************/
+/**
+ * @brief Regression: the low-priority task that holds the mutex while boosted.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_reg_boosted_entry(void *context)
 {
     (void)context;
@@ -9025,6 +10900,11 @@ static void test_reg_boosted_entry(void *context)
 
 /* Highest priority: contends the mutex purely to trigger the inheritance boost. */
 /******************************************************************************************************/
+/**
+ * @brief Regression: the high-priority task whose wait does the boosting.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
 static void test_reg_booster_entry(void *context)
 {
     (void)context;
@@ -9039,6 +10919,12 @@ static void test_reg_booster_entry(void *context)
 
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
 /******************************************************************************************************/
+/**
+ * @brief Regression timer: does nothing but be dispatched.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
 static void test_reg_timer_cb(void *context, uint32_t value)
 {
     (void)value;
@@ -9048,13 +10934,10 @@ static void test_reg_timer_cb(void *context, uint32_t value)
 
 /******************************************************************************************************/
 /**
- * @brief Helper for the priority test: records that it ran, then returns. Deliberately has no
- *        loop - a spinning helper raised above the suite's own task would never hand the CPU
- *        back, whatever it yielded.
+ * @brief Regression: count one run at the priority under test.
+ *
+ * @param[in] context      The caller's context pointer.
  */
-static __IO uint32_t os_test_prio_ran = 0U;
-
-/******************************************************************************************************/
 static void test_prio_entry(void *context)
 {
     (void)context;
@@ -9080,7 +10963,8 @@ static void test_priority_api(void)
     AHURA_TEST_CHECK(priority == OS_TASK_PRIO_2, "it reports what creation asked for (%u)",
                       (unsigned)priority);
 
-    AHURA_TEST_CHECK(os_task_priority_set(&worker, OS_TASK_PRIO_5) == OS_ERR_NONE, "priority raised to 5");
+    AHURA_TEST_CHECK(os_task_priority_set(&worker, OS_TASK_PRIO_5) == OS_ERR_NONE,
+                     "priority raised to 5");
     (void)os_task_priority_get(&worker, &priority);
     AHURA_TEST_CHECK(priority == OS_TASK_PRIO_5, "the new priority is what comes back (%u)",
                       (unsigned)priority);
@@ -9134,7 +11018,8 @@ static void test_priority_api(void)
 
     (void)os_task_priority_set(&worker, (os_task_priority_t)TEST_PRIO_HIGH);
 
-    /* No delay here on purpose: had the switch waited for the next tick, this would still read 0. */
+    /* No delay here on purpose: had the switch waited for the next tick, this would still read 0.
+     */
     AHURA_TEST_CHECK(os_test_prio_ran == 1U,
                       "raising it above this task ran it before the next line (ran=%lu)",
                       (unsigned long)os_test_prio_ran);
@@ -9146,6 +11031,8 @@ static void test_priority_api(void)
 /******************************************************************************************************/
 /**
  * @brief What a waiter does: block on the mutex, record the order it was granted, release, exit.
+ *
+ * @param[in] context      The caller's context pointer.
  */
 static void test_requeue_entry(void *context)
 {
@@ -9191,7 +11078,8 @@ static void test_priority_requeue(void)
     (void)os_mutex_init(&os_test_requeue_mutex);
 
     lock_status = os_mutex_lock(&os_test_requeue_mutex, OS_WAIT_FOREVER);
-    AHURA_TEST_CHECK(lock_status == OS_ERR_NONE, "this task holds the mutex the waiters will queue on");
+    AHURA_TEST_CHECK(lock_status == OS_ERR_NONE,
+                     "this task holds the mutex the waiters will queue on");
 
     /* Both outrank this task, so each blocks on the mutex before control returns here. B is the
      * higher, so the queue is B then A - the order this test inverts. */
@@ -9270,7 +11158,8 @@ static void test_queue_accounting(void)
 
     AHURA_TEST_CHECK(held, "count + free equalled capacity after every send");
 
-    AHURA_TEST_CHECK(sent == capacity, "it accepted exactly capacity items (%lu)", (unsigned long)sent);
+    AHURA_TEST_CHECK(sent == capacity, "it accepted exactly capacity items (%lu)",
+                     (unsigned long)sent);
     AHURA_TEST_CHECK(os_queue_free_get(&os_test_queue) == 0U, "a full queue reports no free slots");
     AHURA_TEST_CHECK(os_queue_count_get(&os_test_queue) == capacity, "and a count of capacity");
 
@@ -9288,43 +11177,9 @@ static void test_queue_accounting(void)
     AHURA_TEST_CHECK(os_queue_count_get(&os_test_queue) == 0U, "the drained queue holds nothing");
     AHURA_TEST_CHECK(os_queue_free_get(&os_test_queue) == capacity, "and is all free again");
 }
-
 #endif /* OS_CONFIG_QUEUE_ENABLE */
 
-/******************************************************************************************************/
-/**
- * @brief Regression checks: tick saturation, wake handoff on pause, priority-boost re-ordering,
- *        timer restart with an undrained expiry, and timer registry slot release.
- */
-/* ---------------------------------------------------------------------------------------------
- * FPU context
- * ---------------------------------------------------------------------------------------------
- *
- * s16-s31 are what the PORT saves; s0-s15 the hardware stacks on its own. So these are the
- * registers a broken context switch loses, and until now nothing here looked at them.
- *
- * The load and the compare have to sit in the SAME function as the yield. Put them in helpers and
- * the compiler saves s16-s31 in each helper's prologue and restores them in its epilogue - hiding
- * exactly the failure being looked for. Here it cannot: the AAPCS says a callee preserves them, so
- * across os_task_yield() it emits no reload, and what comes back is what really survived.
- */
 #if defined(__ARM_FP)
-
-#define TEST_FPU_REGS   16U            /* s16-s31 */
-
-OS_TASK_DEFINE(fpu_partner, 512U);
-
-static __IO uint32_t os_test_fpu_partner_bad   = 0U;
-static __IO uint32_t os_test_fpu_partner_laps  = 0U;
-static __IO bool     os_test_fpu_partner_stop  = false;
-
-#define TEST_FPU_LOAD(src)  __asm volatile("vldmia %0, {s16-s31}" :: "r"(src) :        \
-                                           "s16", "s17", "s18", "s19", "s20", "s21",   \
-                                           "s22", "s23", "s24", "s25", "s26", "s27",   \
-                                           "s28", "s29", "s30", "s31")
-
-#define TEST_FPU_STORE(dst) __asm volatile("vstmia %0, {s16-s31}" :: "r"(dst) : "memory")
-
 /******************************************************************************************************/
 /**
  * @brief Hold a pattern in s16-s31 and yield, so the task under test has something to be confused
@@ -9441,13 +11296,21 @@ static void test_fpu_context(void)
 #endif
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Regression checks: tick saturation, wake handoff on pause, priority-boost re-ordering,
+ *        timer restart with an undrained expiry, and timer registry slot release.
+ *
+ * @return None.
+ */
 static void test_regressions(void)
 {
     test_print_section("Regressions");
 
     /* A duration too large for the tick range must clamp, never wrap to a small plausible count
      * and never land on the "wait forever" sentinel by accident. */
-    AHURA_TEST_CHECK(OS_TICKS_FROM_MS(0xFFFFFFFFU) == (OS_WAIT_FOREVER - 1U), "ms conversion saturates");
+    AHURA_TEST_CHECK(OS_TICKS_FROM_MS(0xFFFFFFFFU) == (OS_WAIT_FOREVER - 1U),
+                     "ms conversion saturates");
 
 #if (OS_CONFIG_SEM_ENABLE == 1U)
     /* An unconsumed wake is handed on, not lost with the task that never used it. */
@@ -9469,8 +11332,10 @@ static void test_regressions(void)
         os_kernel_unlock();
 
         os_delay_ms(40U);
-        AHURA_TEST_CHECK(os_test_reg_b_st == OS_ERR_NONE, "paused task's wake passed to the next waiter");
-        AHURA_TEST_CHECK(os_task_state_get(&helper) == OS_TASK_STATE_SUSPENDED, "paused task stayed paused");
+        AHURA_TEST_CHECK(os_test_reg_b_st == OS_ERR_NONE,
+                         "paused task's wake passed to the next waiter");
+        AHURA_TEST_CHECK(os_task_state_get(&helper) == OS_TASK_STATE_SUSPENDED,
+                         "paused task stayed paused");
 
         (void)os_task_delete(&helper);
         (void)test_wait_inactive(&helper2, 500U);
@@ -9569,203 +11434,4 @@ static void test_regressions(void)
         }
     }
 #endif /* OS_CONFIG_TIMER_ENABLE */
-}
-
-/*
- * ***********************************************************************************************************
- * Public function implementations
- * ***********************************************************************************************************
-*/
-
-/******************************************************************************************************/
-/**
- * @brief Kernel self-test suite entry point, supplying the os_test() declared in ahura.h.
- *        os_kernel.c creates a task that calls this automatically when OS_CONFIG_TEST_ENABLE
- *        is 1 - nothing else to call.
- */
-void os_test(void)
-{
-    /* Version first: a log pasted into a bug report has to say which kernel produced it, and the
-     * banner is the one line that always survives the copy/paste. OS_VERSION_STRING is a string
-     * literal, so it concatenates here rather than costing a format argument. */
-    printf("\r\n========================================\r\n");
-    printf(" Ahura RTOS v" OS_VERSION_STRING " self-test starting...\r\n");
-    printf("========================================\r\n");
-
-    test_kernel_core();
-    test_delay();
-    test_critical_section();
-    test_task_lifecycle();
-    test_task_identity();
-    test_priority_preemption();
-    test_scheduler_lock();
-
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-    test_mutex();
-#endif
-#if (OS_CONFIG_SEM_ENABLE == 1U)
-    test_semaphore();
-#endif
-#if (OS_CONFIG_QUEUE_ENABLE == 1U)
-    test_queue();
-    test_queue_define_and_dynamic();
-    test_queue_overwrite();
-#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
-    test_atomic();
-#endif
-#endif
-#if (OS_CONFIG_MSG_ENABLE == 1U)
-    test_msg();
-#endif
-#if (OS_CONFIG_EVENT_ENABLE == 1U)
-    test_event_group();
-#endif
-#if (OS_CONFIG_TIMER_ENABLE == 1U)
-    test_timer();
-#endif
-#if (OS_CONFIG_TIMER_ENABLE == 1U)
-    test_timer_retune();
-    test_timer_isr();
-    test_timer_pool();
-    test_timer_real_world();
-#endif
-#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
-    test_task_notify();
-#endif
-    test_assert();
-    test_log();
-#if (OS_CONFIG_ALLOC_ENABLE == 1U)
-    test_alloc();
-#endif
-#if (OS_CONFIG_STACK_WATERMARK_ENABLE == 1U)
-    test_stack_watermark();
-#endif
-#if (OS_CONFIG_CPU_USAGE_ENABLE == 1U)
-    test_cpu_usage();
-#endif
-
-#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_MUTEX_ENABLE == 1U)
-    test_pipeline();
-#endif
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-    test_mutex_priority_ordering();
-#endif
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-    test_mutex_priority_inheritance();
-    test_mutex_multi_inheritance();
-    test_mutex_transitive_inheritance();
-#endif
-#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_EVENT_ENABLE == 1U)
-    test_event_queue_fanin();
-#endif
-#if (OS_CONFIG_MUTEX_ENABLE == 1U) && (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && \
-    (OS_CONFIG_EVENT_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
-    test_stress_soak();
-#endif
-    test_stress_task_churn();
-#if (OS_CONFIG_TIMER_ENABLE == 1U)
-    test_stress_timer_churn();
-#endif
-
-    /* Extended per-subsystem stress: each drives one subsystem at high volume with exact
-     * accounting (see the OS_TEST_STRESS_EXTENDED section header). */
-#if (OS_TEST_STRESS_EXTENDED == 1U)
-#if (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ALLOC_ENABLE == 1U)
-    test_stress_queue_dynamic_churn();
-    test_stress_queue_dynamic_concurrent();
-#endif
-#if (OS_CONFIG_ALLOC_ENABLE == 1U)
-    test_stress_heap_fragmentation();
-#endif
-#if (OS_CONFIG_SEM_ENABLE == 1U)
-    test_stress_semaphore_pingpong();
-#endif
-#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
-    test_stress_notify_storm();
-#endif
-#if (OS_CONFIG_EVENT_ENABLE == 1U)
-    test_stress_event_bit_storm();
-#endif
-#if (OS_CONFIG_TIMER_ENABLE == 1U)
-    test_stress_timer_flood();
-#endif
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-    test_stress_mutex_convoy();
-#endif
-#else
-    test_print_section("Extended per-subsystem stress");
-    printf("  [SKIP] OS_TEST_STRESS_EXTENDED=0: needs ~15 KB of flash this unoptimized build does\r\n"
-           "         not have, and stress timings at -O0 do not reflect shipped firmware.\r\n"
-           "         Build Release (-Os) to run them, or define OS_TEST_STRESS_EXTENDED=1.\r\n");
-#endif /* OS_TEST_STRESS_EXTENDED */
-
-    test_task_footprint();
-    test_context_switch_timing();
-    test_tickless_hooks();
-    test_tickless_bounds();
-    test_tickless_sleep();
-    test_tickless_drift();
-    test_tickless_suppression();
-    test_list();
-    test_priority_api();
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-    test_priority_requeue();
-#endif
-#if (OS_CONFIG_QUEUE_ENABLE == 1U)
-    test_queue_accounting();
-#endif
-    test_fpu_context();
-    test_regressions();
-#if (OS_CONFIG_CORE_COUNT > 1U)
-    /* Multi-core comes LAST, on purpose. Every section above exercises the kernel one subsystem
-     * at a time, and that is the foundation the SMP questions stand on: once the whole
-     * single-core surface has passed, the suite asks whether a second core starts, reports its
-     * own id, honours affinity and shares the spinlock correctly - and then drives the cross-core
-     * seams hard (contention, wake integrity, migration, churn, a mixed soak) before watching
-     * both parked workers for several heartbeats to prove the second core SURVIVED the whole
-     * run, not just its own section. */
-    test_multicore();
-    test_smp_critical_nested();
-#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
-    test_smp_atomic_contention();
-#endif
-#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
-    test_smp_notify_pingpong();
-#endif
-#if (OS_CONFIG_SEM_ENABLE == 1U)
-    test_smp_semaphore_pingpong();
-#endif
-#if (OS_CONFIG_QUEUE_ENABLE == 1U)
-    test_smp_queue_accounting();
-#endif
-#if (OS_CONFIG_EVENT_ENABLE == 1U)
-    test_smp_event_pingpong();
-#endif
-    test_smp_migration();
-    test_smp_lock_independent();
-    test_smp_task_churn();
-#if (OS_CONFIG_TIMER_ENABLE == 1U)
-    test_smp_deferred_submit();
-#endif
-#if (OS_CONFIG_SEM_ENABLE == 1U) && (OS_CONFIG_QUEUE_ENABLE == 1U) && (OS_CONFIG_ATOMIC_ENABLE == 1U)
-    test_smp_soak_mixed();
-#endif
-    test_smp_core_any();
-    test_multicore_watch(TEST_MC_WATCH_MS, "at the end of the whole run");
-#endif
-    test_unsupported_features();
-
-    /* Repeated from the banner on purpose: the result block is what gets screenshotted or pasted
-     * on its own, and a pass count means nothing without the version that produced it. */
-    printf("\r\n========================================\r\n");
-    printf(" Ahura RTOS v" OS_VERSION_STRING "\r\n");
-    printf(" RESULT: %lu passed, %lu failed (of %lu checks)\r\n", (unsigned long)os_test_pass_count,
-           (unsigned long)os_test_fail_count, (unsigned long)(os_test_pass_count + os_test_fail_count));
-    printf("%s\r\n", (os_test_fail_count == 0U) ? " ALL RTOS FEATURES VERIFIED OK" : " SOME CHECKS FAILED - see log above");
-    printf("========================================\r\n");
-
-    /* Last, so the timings are the final thing on the console and are not interleaved with
-     * PASS/FAIL lines: benchmarks report numbers, they do not pass or fail. */
-    test_benchmarks();
-    printf("\r\n");
 }

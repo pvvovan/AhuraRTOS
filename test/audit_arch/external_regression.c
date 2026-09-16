@@ -9,6 +9,7 @@
  *            SPDX-License-Identifier: GPL-3.0-or-later
  *            See LICENSE in the project root for the full license text.
  */
+
 /*
  * ***********************************************************************************************************
  * Includes
@@ -16,27 +17,64 @@
 */
 
 #include "ahura.h"
-volatile uint32_t test_failure;
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
+__IO uint32_t test_failure;
 static uint32_t prepared;
 
 /*
  * ***********************************************************************************************************
- * Function implementations
+ * Public function implementations
  * ***********************************************************************************************************
 */
 
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_tick_suppress_max_cb: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @return What this stand-in reports.
+ */
 uint32_t os_arch_tick_suppress_max_cb(void)
 {
     return 100U;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_tick_suppress_cb: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @param[in] ticks        Tick periods.
+ */
 void os_arch_tick_suppress_cb(uint32_t ticks)
 {
     prepared = ticks;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_arch_tick_resume_cb: what this harness needs of it, with no kernel behind
+ *        it.
+ *
+ * @return What this stand-in reports.
+ */
 uint32_t os_arch_tick_resume_cb(void)
 {
     return 7U;
 }
+
+/******************************************************************************************************/
+/**
+ * @brief Case: an external tick source owns the window, not the port.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_external_ownership(void)
 {
     os_arch_sleep_prepare(20U);

@@ -15,18 +15,18 @@
 
 #include "os_internal.h"
 
-#if (OS_CONFIG_EVENT_ENABLE == 1U)
-
 /*
  * ***********************************************************************************************************
  * Macros
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
 /* Waiter condition encoding in the TCB wait data: data0 = requested bits,
  * data1 = these mode flags. */
 #define OS_EVENT_WAIT_ALL_FLAG        (1UL << 0)
 #define OS_EVENT_CLEAR_ON_EXIT_FLAG   (1UL << 1)
+#endif /* OS_CONFIG_EVENT_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -34,6 +34,7 @@
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
 /* Context handed through os_task_waiters_wake_match during a set_bits walk. */
 typedef struct
 {
@@ -41,6 +42,7 @@ typedef struct
     uint32_t clear_accum;    /* bits consumed by satisfied clear-on-exit waiters */
 
 } os_event_match_context_t;
+#endif /* OS_CONFIG_EVENT_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -48,7 +50,15 @@ typedef struct
  * ***********************************************************************************************************
 */
 
-static bool os_event_waiter_match(uint32_t data0, uint32_t data1, void *context, uint32_t *result_out);
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Waker-side condition evaluation for one waiter, called by set_bits through
+ *        os_task_waiters_wake_match against a single flags snapshot.
+ */
+static bool os_event_waiter_match(uint32_t data0, uint32_t data1, void *context,
+                                  uint32_t *result_out);
+#endif /* OS_CONFIG_EVENT_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -56,6 +66,7 @@ static bool os_event_waiter_match(uint32_t data0, uint32_t data1, void *context,
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Initialize an event object.
@@ -176,7 +187,8 @@ os_err_t os_event_clear_bits(os_event_t *event, uint32_t bits)
  * @return os_err_t  OK on match, BUSY when unmatched without waiting,
  *                    TIMEOUT when the wait elapsed.
  */
-os_err_t os_event_wait_bits(os_event_t *event, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms)
+os_err_t os_event_wait_bits(os_event_t *event, uint32_t bits, bool wait_all, bool clear_on_exit,
+                            uint32_t *matched_bits, uint32_t timeout_ms)
 {
     os_err_t status = OS_ERR_INVALID_ARG;
 
@@ -282,6 +294,7 @@ os_err_t os_event_wait_bits(os_event_t *event, uint32_t bits, bool wait_all, boo
 
     return status;
 }
+#endif /* OS_CONFIG_EVENT_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -289,6 +302,7 @@ os_err_t os_event_wait_bits(os_event_t *event, uint32_t bits, bool wait_all, boo
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Waker-side condition evaluation for one waiter, called by set_bits through
@@ -300,7 +314,8 @@ os_err_t os_event_wait_bits(os_event_t *event, uint32_t bits, bool wait_all, boo
  * @param[out] result_out  Delivery for the waiter: its matched bits.
  * @return bool  True when the waiter's condition is satisfied (wake it).
  */
-static bool os_event_waiter_match(uint32_t data0, uint32_t data1, void *context, uint32_t *result_out)
+static bool os_event_waiter_match(uint32_t data0, uint32_t data1, void *context,
+                                  uint32_t *result_out)
 {
     os_event_match_context_t *match_context = (os_event_match_context_t *)context;
     uint32_t                 matched        = match_context->flags_snapshot & data0;
@@ -327,5 +342,4 @@ static bool os_event_waiter_match(uint32_t data0, uint32_t data1, void *context,
 
     return satisfied;
 }
-
 #endif /* OS_CONFIG_EVENT_ENABLE */

@@ -31,6 +31,12 @@
 #include <stdio.h>
 #include <string.h>
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #if !(OS_CONFIG_MSG_ENABLE == 1U)
 #error "os_main_msg.c needs OS_CONFIG_MSG_ENABLE=1 in os_config.h"
 #endif
@@ -39,17 +45,8 @@
 #error "os_main_msg.c also shows the dynamic form, which needs OS_CONFIG_ALLOC_ENABLE=1"
 #endif
 
-/*
- * ***********************************************************************************************************
- * Private objects
- * ***********************************************************************************************************
-*/
-
 /* Storage in BYTES, not in messages: 128 bytes hold a few long messages or many short ones. */
 #define BUF_BYTES   128U
-
-OS_MSG_DEFINE(static_buf, BUF_BYTES);   /* storage is an array, ready to use          */
-static os_msg_t dynamic_buf;                   /* storage comes from os_msg_init_dynamic()   */
 
 /* Every task states its core affinity on a multi-core build: the kernel asks for that argument
  * rather than defaulting it, so the decision is made on purpose at each creation site. These
@@ -61,9 +58,89 @@ static os_msg_t dynamic_buf;                   /* storage comes from os_msg_init
     OS_TASK_CONFIG((entry), (context), (priority), OS_TASK_CORE_ANY)
 #endif
 
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
+OS_MSG_DEFINE(static_buf, BUF_BYTES);   /* storage is an array, ready to use          */
+static os_msg_t dynamic_buf;                   /* storage comes from os_msg_init_dynamic()   */
+
 OS_TASK_DEFINE(reader_static, 768U);
 OS_TASK_DEFINE(reader_dynamic, 768U);
 
+/*
+ * ***********************************************************************************************************
+ * Private function prototypes
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Reader for the static buffer: block until a message arrives, then print it.
+ */
+static void reader_static_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Reader for the dynamic buffer: identical code, different storage.
+ */
+static void reader_dynamic_entry(void *context);
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Default application task: send to the static buffer, then the dynamic one, in turn.
+ *
+ * @return None.
+ */
+void os_main(void)
+{
+    char     text[64];
+    uint32_t counter = 1U;
+
+    printf("\r\nAhura example: message buffers, static and dynamic\r\n\r\n");
+
+    /* The only line the two buffers do not share. After it, both are used identically. */
+    if (os_msg_init_dynamic(&dynamic_buf, BUF_BYTES) != OS_ERR_NONE)
+    {
+        printf("dynamic buffer could not be allocated\r\n");
+        return;
+    }
+
+    if ((os_task_create(&reader_static, EXAMPLE_TASK(reader_static_entry, NULL, OS_TASK_PRIO_3)) != OS_ERR_NONE) ||
+        (os_task_create(&reader_dynamic, EXAMPLE_TASK(reader_dynamic_entry, NULL, OS_TASK_PRIO_3)) != OS_ERR_NONE))
+    {
+        printf("reader tasks could not be created\r\n");
+        return;
+    }
+
+    (void)os_task_start(&reader_static);
+    (void)os_task_start(&reader_dynamic);
+
+    while (1)
+    {
+        (void)snprintf(text, sizeof(text), "hello %lu", (unsigned long)counter);
+        printf("static  -> %s\r\n", text);
+        (void)os_msg_send(&static_buf, text, strlen(text), 100U);
+
+        os_delay_ms(500U);
+
+        (void)snprintf(text, sizeof(text), "a longer message, number %lu", (unsigned long)counter);
+        printf("dynamic -> %s\r\n", text);
+        (void)os_msg_send(&dynamic_buf, text, strlen(text), 100U);
+
+        os_delay_ms(500U);
+
+        counter++;
+    }
+}
 
 /*
  * ***********************************************************************************************************
@@ -121,59 +198,5 @@ static void reader_dynamic_entry(void *context)
 
             printf("  dynamic <- %s\r\n", text);
         }
-    }
-}
-
-/*
- * ***********************************************************************************************************
- * Public function implementations
- * ***********************************************************************************************************
-*/
-
-/******************************************************************************************************/
-/**
- * @brief Default application task: send to the static buffer, then the dynamic one, in turn.
- *
- * @return None.
- */
-void os_main(void)
-{
-    char     text[64];
-    uint32_t counter = 1U;
-
-    printf("\r\nAhura example: message buffers, static and dynamic\r\n\r\n");
-
-    /* The only line the two buffers do not share. After it, both are used identically. */
-    if (os_msg_init_dynamic(&dynamic_buf, BUF_BYTES) != OS_ERR_NONE)
-    {
-        printf("dynamic buffer could not be allocated\r\n");
-        return;
-    }
-
-    if ((os_task_create(&reader_static, EXAMPLE_TASK(reader_static_entry, NULL, OS_TASK_PRIO_3)) != OS_ERR_NONE) ||
-        (os_task_create(&reader_dynamic, EXAMPLE_TASK(reader_dynamic_entry, NULL, OS_TASK_PRIO_3)) != OS_ERR_NONE))
-    {
-        printf("reader tasks could not be created\r\n");
-        return;
-    }
-
-    (void)os_task_start(&reader_static);
-    (void)os_task_start(&reader_dynamic);
-
-    while (1)
-    {
-        (void)snprintf(text, sizeof(text), "hello %lu", (unsigned long)counter);
-        printf("static  -> %s\r\n", text);
-        (void)os_msg_send(&static_buf, text, strlen(text), 100U);
-
-        os_delay_ms(500U);
-
-        (void)snprintf(text, sizeof(text), "a longer message, number %lu", (unsigned long)counter);
-        printf("dynamic -> %s\r\n", text);
-        (void)os_msg_send(&dynamic_buf, text, strlen(text), 100U);
-
-        os_delay_ms(500U);
-
-        counter++;
     }
 }

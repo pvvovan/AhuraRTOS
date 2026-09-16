@@ -31,8 +31,23 @@
  * ***********************************************************************************************************
 */
 
+/******************************************************************************************************/
+/**
+ * @brief Park the calling task permanently (OS_WAIT_FOREVER delay). Never returns when it can.
+ */
 static void os_delay_forever(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Delay execution by a finite number of scheduler ticks: block when possible,
+ *        busy-wait otherwise.
+ */
 static void os_delay_ticks(uint32_t ticks);
+
+/******************************************************************************************************/
+/**
+ * @brief Busy wait for a cycle-count duration using the IRQ-independent architecture counter.
+ */
 static void os_delay_cycle_wait(uint64_t cycle_count);
 
 /*

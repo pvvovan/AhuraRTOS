@@ -36,34 +36,19 @@
 
 #include <stdio.h>
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #if !(OS_CONFIG_TIMER_ENABLE == 1U)
 #error "os_main_timer.c needs OS_CONFIG_TIMER_ENABLE=1 in os_config.h"
 #endif
 
 /*
  * ***********************************************************************************************************
- * Private objects
- * ***********************************************************************************************************
-*/
-
-/* Stands in for whatever the work is about - a device, a buffer, a driver instance. Passed as
- * context, never copied, so it has to outlive the run. A file-scope object always does. */
-static uint32_t os_main_device = 0xD0D0U;
-
-static void on_blink(void *context, uint32_t value);
-static void on_timeout(void *context, uint32_t value);
-static void on_event(void *context, uint32_t value);
-
-OS_TIMER_DEFINE_PERIODIC(os_main_blinker, 250U, on_blink);
-OS_TIMER_DEFINE_ONESHOT(os_main_timeout,  500U, on_timeout);
-
-/* Four calls may be in flight at once, each run as soon as possible. Both numbers are settled here,
- * so os_timer_submit itself does no arithmetic - which is what an interrupt path wants. */
-OS_TIMER_DEFINE_SUBMIT(os_main_events, 4U, 0U, on_event);
-
-/*
- * ***********************************************************************************************************
- * Private function implementations
+ * Private function prototypes
  * ***********************************************************************************************************
 */
 
@@ -72,25 +57,36 @@ OS_TIMER_DEFINE_SUBMIT(os_main_events, 4U, 0U, on_event);
  * @brief Every callback runs on the kernel timer task, never in an interrupt - so printf is fine
  *        here, and so is blocking.
  */
-static void on_blink(void *context, uint32_t value)
-{
-    (void)context;
-    printf("[timer] blink %lu\r\n", (unsigned long)value);
-}
+static void on_blink(void *context, uint32_t value);
 
 /******************************************************************************************************/
-static void on_timeout(void *context, uint32_t value)
-{
-    (void)value;
-    printf("[timer] one-shot fired (device=0x%lX)\r\n", (unsigned long)(*(uint32_t *)context));
-}
+/**
+ * @brief One-shot timer callback: report that the timeout arrived.
+ */
+static void on_timeout(void *context, uint32_t value);
 
 /******************************************************************************************************/
-static void on_event(void *context, uint32_t value)
-{
-    (void)context;
-    printf("[timer] deferred event %lu handled\r\n", (unsigned long)value);
-}
+/**
+ * @brief Deferred-call callback: report the value it was handed.
+ */
+static void on_event(void *context, uint32_t value);
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
+/* Stands in for whatever the work is about - a device, a buffer, a driver instance. Passed as
+ * context, never copied, so it has to outlive the run. A file-scope object always does. */
+static uint32_t os_main_device = 0xD0D0U;
+
+OS_TIMER_DEFINE_PERIODIC(os_main_blinker, 250U, on_blink);
+OS_TIMER_DEFINE_ONESHOT(os_main_timeout,  500U, on_timeout);
+
+/* Four calls may be in flight at once, each run as soon as possible. Both numbers are settled here,
+ * so os_timer_submit itself does no arithmetic - which is what an interrupt path wants. */
+OS_TIMER_DEFINE_SUBMIT(os_main_events, 4U, 0U, on_event);
 
 /*
  * ***********************************************************************************************************
@@ -145,4 +141,50 @@ void os_main(void)
     {
         os_delay_ms(1000U);
     }
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Every callback runs on the kernel timer task, never in an interrupt - so printf is fine
+ *        here, and so is blocking.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
+static void on_blink(void *context, uint32_t value)
+{
+    (void)context;
+    printf("[timer] blink %lu\r\n", (unsigned long)value);
+}
+
+/******************************************************************************************************/
+/**
+ * @brief One-shot timer callback: report that the timeout arrived.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
+static void on_timeout(void *context, uint32_t value)
+{
+    (void)value;
+    printf("[timer] one-shot fired (device=0x%lX)\r\n", (unsigned long)(*(uint32_t *)context));
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Deferred-call callback: report the value it was handed.
+ *
+ * @param[in] context      The caller's context pointer.
+ * @param[in] value        Value to apply.
+ */
+static void on_event(void *context, uint32_t value)
+{
+    (void)context;
+    printf("[timer] deferred event %lu handled\r\n", (unsigned long)value);
 }

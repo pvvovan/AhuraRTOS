@@ -22,10 +22,10 @@
 #include "os_internal.h"
 
 #if (OS_CONFIG_LOG_ENABLE == 1U)
-
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
+#endif /* OS_CONFIG_LOG_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -33,6 +33,7 @@
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_LOG_ENABLE == 1U)
 #if (OS_CONFIG_LOG_BUFFER_SIZE < 64U)
 #error "OS_CONFIG_LOG_BUFFER_SIZE is too small to hold a useful log line."
 #endif
@@ -44,6 +45,7 @@
 /* The ring can never hold more than SIZE-1 bytes: head == tail has to mean
  * empty, so one slot stays unused to keep "full" distinguishable. */
 #define OS_LOG_CAPACITY         (OS_CONFIG_LOG_BUFFER_SIZE - 1U)
+#endif /* OS_CONFIG_LOG_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -51,6 +53,7 @@
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_LOG_ENABLE == 1U)
 OS_TASK_DEFINE(tsk_log, OS_CONFIG_LOG_TASK_STACK_SIZE);
 
 /* Resolved once in os_log_system_init: the log task is never deleted, so every
@@ -64,8 +67,10 @@ static uint8_t   os_log_buffer[OS_CONFIG_LOG_BUFFER_SIZE];
 static size_t    os_log_head    = 0U;
 static size_t    os_log_tail    = 0U;
 static uint32_t  os_log_dropped = 0U;
+
 /* Draining consumes only the pending notice count, never the public lifetime total. */
 static uint32_t  os_log_dropped_pending = 0U;
+#endif /* OS_CONFIG_LOG_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -73,13 +78,50 @@ static uint32_t  os_log_dropped_pending = 0U;
  * ***********************************************************************************************************
 */
 
-static void   os_log_task_entry(void *context);
-static size_t os_log_free_space(void);
-static void   os_log_put(const char *data, size_t length);
-static void   os_log_queue(const char *data, size_t length);
-static void   os_log_emit_dropped(uint32_t dropped);
+#if (OS_CONFIG_LOG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Log task body: drain the ring into the output hook, sleep when it is empty.
+ */
+static void os_log_task_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Copy finished bytes into the ring and wake the log task, or count a drop.
+ */
+static void os_log_queue(const char *data, size_t length);
+
+/******************************************************************************************************/
+/**
+ * @brief Emit the "N log lines dropped" notice, formatted without libc.
+ */
+static void os_log_emit_dropped(uint32_t dropped);
+
+/******************************************************************************************************/
+/**
+ * @brief Append a NUL-terminated string. Caller guarantees the destination has room.
+ */
 static size_t os_log_append_text(char *dst, size_t offset, const char *text);
+
+/******************************************************************************************************/
+/**
+ * @brief Append an unsigned decimal, right-aligned in at least width columns.
+ */
 static size_t os_log_append_u32(char *dst, size_t offset, uint32_t value, size_t width);
+
+/******************************************************************************************************/
+/**
+ * @brief Bytes the ring can still accept. Caller holds the critical section.
+ */
+static size_t os_log_free_space(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Copy a line into the ring, wrapping as needed. Caller holds the critical section and
+ *        has already checked that it fits.
+ */
+static void os_log_put(const char *data, size_t length);
+#endif /* OS_CONFIG_LOG_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -87,6 +129,7 @@ static size_t os_log_append_u32(char *dst, size_t offset, uint32_t value, size_t
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_LOG_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Format a log line and queue it for transmission (never blocks).
@@ -128,17 +171,18 @@ void os_log_write(uint32_t level, const char *fmt, ...)
 
     switch (level)
     {
-    case OS_LOG_LEVEL_ERROR: severity = 'E'; break;
-    case OS_LOG_LEVEL_WARN:  severity = 'W'; break;
-    case OS_LOG_LEVEL_DEBUG: severity = 'D'; break;
-    default:                 severity = 'I'; break;
+        case OS_LOG_LEVEL_ERROR: severity = 'E'; break;
+        case OS_LOG_LEVEL_WARN:  severity = 'W'; break;
+        case OS_LOG_LEVEL_DEBUG: severity = 'D'; break;
+        default:                 severity = 'I'; break;
     }
 
     if (fmt != NULL)
     {
         /* Timestamp first so lines are orderable even when the transport reorders
          * nothing - the tick is read here, at the call site, not at drain time. */
-        prefix_len = snprintf(line, sizeof(line), "[%8lu] %c ", (unsigned long)os_tick_get(), severity);
+        prefix_len = snprintf(line, sizeof(line), "[%8lu] %c ", (unsigned long)os_tick_get(),
+                              severity);
     }
 
     /* Cannot happen with a sane LINE_MAX, but never index past the buffer. */
@@ -235,6 +279,7 @@ os_err_t os_log_system_init(void)
 
     return status;
 }
+#endif /* OS_CONFIG_LOG_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -242,6 +287,7 @@ os_err_t os_log_system_init(void)
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_LOG_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Log task body: drain the ring into the output hook, sleep when it is empty.
@@ -490,5 +536,4 @@ static void os_log_put(const char *data, size_t length)
 
     os_log_head = (os_log_head + length) % OS_CONFIG_LOG_BUFFER_SIZE;
 }
-
 #endif /* OS_CONFIG_LOG_ENABLE */

@@ -23,14 +23,13 @@
 
 #include "os_internal.h"
 
-#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
-
 /*
  * ***********************************************************************************************************
  * Public function implementations
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_NOTIFY_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Deliver a value to a task's notification mailbox (overwrite: last write wins),
@@ -213,5 +212,4 @@ os_err_t os_notify_wait(uint32_t timeout_ms, uint32_t *value_out)
 
     return status;
 }
-
 #endif /* OS_CONFIG_NOTIFY_ENABLE */

@@ -43,6 +43,7 @@
  *            SPDX-License-Identifier: GPL-3.0-or-later
  *            See LICENSE in the project root for the full license text.
  */
+
 /*
  * ***********************************************************************************************************
  * Includes
@@ -53,7 +54,7 @@
 
 /*
  * ***********************************************************************************************************
- * Debug hooks
+ * Public function implementations
  * ***********************************************************************************************************
 */
 
@@ -72,6 +73,9 @@
  *
  * Do not log from here through OS_LOG_*: the log task cannot run once the core is parked, so
  * the line would sit unsent in the buffer. Write directly to the transport instead.
+ *
+ * @param[in] file         Source file of the failed assertion.
+ * @param[in] line         Line of the failed assertion.
  */
 OS_WEAK void os_assert_failed_cb(const char *file, uint32_t line)
 {
@@ -133,6 +137,9 @@ OS_WEAK void os_stack_overflow_cb(const char *task_name)
  * Keep this reasonably prompt. It runs at OS_CONFIG_LOG_TASK_PRIORITY, so a slow transport
  * delays only the log, but the ring keeps filling while it runs and lines are dropped once it
  * is full.
+ *
+ * @param[in] data         Bytes to write.
+ * @param[in] length       How many bytes.
  */
 OS_WEAK void os_log_output_cb(const uint8_t *data, size_t length)
 {

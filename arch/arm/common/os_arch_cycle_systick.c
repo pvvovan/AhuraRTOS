@@ -29,16 +29,15 @@
  *            See LICENSE in the project root for the full license text.
  */
 
-#ifndef OS_ARCH_PORT_TRANSLATION_UNIT
-#error "os_arch_cycle_systick.c is a textual include, not a translation unit. Compile arch/<family>/<core>/os_arch_port.c instead - it defines OS_ARCH_PORT_TRANSLATION_UNIT and includes this. See doc/installation.md."
-#endif
-
-
 /*
  * ***********************************************************************************************************
  * Macros
  * ***********************************************************************************************************
 */
+
+#ifndef OS_ARCH_PORT_TRANSLATION_UNIT
+#error "os_arch_cycle_systick.c is a textual include, not a translation unit. Compile arch/<family>/<core>/os_arch_port.c instead - it defines OS_ARCH_PORT_TRANSLATION_UNIT and includes this. See doc/installation.md."
+#endif
 
 /* Cycles credited per call while SysTick is not running - before os_tick_init(), or for the whole
  * run with OS_CONFIG_TICK_SOURCE_EXTERNAL, where SysTick may never be started at all. Deliberately
@@ -65,28 +64,36 @@ static uint32_t os_arch_cycle_last[OS_CONFIG_CORE_COUNT];
 /** Raw counter value when a tickless window opened, per core. */
 static uint32_t os_arch_cycle_window_mark[OS_CONFIG_CORE_COUNT];
 
+/*
+ * ***********************************************************************************************************
+ * Private function prototypes
+ * ***********************************************************************************************************
+*/
+
 /******************************************************************************************************/
 /**
  * @brief The counter's true position, without the monotonic clamp.
- *
- * The clamp exists to protect CALLERS, who subtract two reads. Bracketing a window has to see where
- * the counter really is, held value or not, or the correction below would cancel the wrong amount.
- *
- * Interrupts must already be masked by the caller: this is a read-modify-free sample of two
- * registers plus an accumulator, and a tick landing between them pairs a position with the wrong
- * period count.
- *
- * @return uint32_t  Unclamped counter value.
  */
-static uint32_t os_arch_cycle_raw_get(void)
-{
-    uint32_t core   = os_arch_core_id_get();
-    uint32_t reload = OS_ARCH_REG_SYST_RVR & OS_ARCH_SYST_RVR_RELOAD_MSK;
-    uint32_t cvr    = OS_ARCH_REG_SYST_CVR & OS_ARCH_SYST_RVR_RELOAD_MSK;
+static uint32_t os_arch_cycle_raw_get(void);
 
-    return os_arch_cycle_fallback[core] + (os_arch_cycle_periods[core] * (reload + 1U)) +
-           (reload - cvr);
-}
+/******************************************************************************************************/
+/**
+ * @brief Read the SysTick-derived cycle count. See the file header for what it does and does not
+ *        guarantee.
+ */
+static uint32_t os_arch_cycle_systick_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Reset the synthesized counter's state. Called from os_arch_init().
+ */
+static void os_arch_cycle_systick_reset(void);
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
 
 /******************************************************************************************************/
 /**
@@ -143,11 +150,45 @@ void os_arch_cycle_window_close(uint32_t elapsed)
     }
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Close one SysTick period on this core. Called by the kernel from every core's tick.
+ *
+ * @return None.
+ */
+void os_arch_cycle_tick(void)
+{
+    os_arch_cycle_periods[os_arch_core_id_get()]++;
+}
+
 /*
  * ***********************************************************************************************************
- * Function implementations
+ * Private function implementations
  * ***********************************************************************************************************
 */
+
+/******************************************************************************************************/
+/**
+ * @brief The counter's true position, without the monotonic clamp.
+ *
+ * The clamp exists to protect CALLERS, who subtract two reads. Bracketing a window has to see where
+ * the counter really is, held value or not, or the correction below would cancel the wrong amount.
+ *
+ * Interrupts must already be masked by the caller: this is a read-modify-free sample of two
+ * registers plus an accumulator, and a tick landing between them pairs a position with the wrong
+ * period count.
+ *
+ * @return uint32_t  Unclamped counter value.
+ */
+static uint32_t os_arch_cycle_raw_get(void)
+{
+    uint32_t core   = os_arch_core_id_get();
+    uint32_t reload = OS_ARCH_REG_SYST_RVR & OS_ARCH_SYST_RVR_RELOAD_MSK;
+    uint32_t cvr    = OS_ARCH_REG_SYST_CVR & OS_ARCH_SYST_RVR_RELOAD_MSK;
+
+    return os_arch_cycle_fallback[core] + (os_arch_cycle_periods[core] * (reload + 1U)) +
+           (reload - cvr);
+}
 
 /******************************************************************************************************/
 /**
@@ -259,15 +300,4 @@ static void os_arch_cycle_systick_reset(void)
     os_arch_cycle_periods[core]  = 0U;
     os_arch_cycle_fallback[core] = 0U;
     os_arch_cycle_last[core]     = 0U;
-}
-
-/******************************************************************************************************/
-/**
- * @brief Close one SysTick period on this core. Called by the kernel from every core's tick.
- *
- * @return None.
- */
-void os_arch_cycle_tick(void)
-{
-    os_arch_cycle_periods[os_arch_core_id_get()]++;
 }

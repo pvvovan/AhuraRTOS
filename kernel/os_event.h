@@ -13,6 +13,12 @@
 #ifndef OS_EVENT_H
 #define OS_EVENT_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "os_types.h"
 
 #ifdef __cplusplus
@@ -22,12 +28,11 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Events             - OS_CONFIG_EVENT_ENABLE
+ * Types
  * ***********************************************************************************************************
 */
 
 #if (OS_CONFIG_EVENT_ENABLE == 1U)
-
 /******************************************************************************************************/
 /**
  * @brief Event object: 32 bits several tasks can wait on.
@@ -38,7 +43,15 @@ typedef struct
     os_list_t waiters; /**< Tasks blocked waiting for bits to match. */
 
 } os_event_t;
+#endif /* OS_CONFIG_EVENT_ENABLE */
 
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_EVENT_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Initialize an event object.
@@ -63,8 +76,8 @@ os_err_t os_event_clear_bits(os_event_t *event, uint32_t bits);
  *        consumes the requested bits atomically with the match (no lost set between the
  *        wait returning and a separate manual clear).
  */
-os_err_t os_event_wait_bits(os_event_t *event, uint32_t bits, bool wait_all, bool clear_on_exit, uint32_t *matched_bits, uint32_t timeout_ms);
-
+os_err_t os_event_wait_bits(os_event_t *event, uint32_t bits, bool wait_all, bool clear_on_exit,
+                            uint32_t *matched_bits, uint32_t timeout_ms);
 #endif /* OS_CONFIG_EVENT_ENABLE */
 
 #ifdef __cplusplus

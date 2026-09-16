@@ -5,13 +5,9 @@
  *            SPDX-License-Identifier: GPL-3.0-or-later
  *            See LICENSE in the project root for the full license text.
  */
+
 #ifndef OS_ARCH_PORT_H
 #define OS_ARCH_PORT_H
-
-#ifdef __cplusplus
-extern "C"
-{
-#endif
 
 /*
  * ***********************************************************************************************************
@@ -23,6 +19,17 @@ extern "C"
 #include <stddef.h>
 #include <stdint.h>
 #include "../../template/os_config.h"
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
 
 #undef OS_CONFIG_CORE_COUNT
 #define OS_CONFIG_CORE_COUNT 2U
@@ -51,20 +58,102 @@ extern "C"
 #define OS_ARCH_IDLE() ((void)0)
 #define OS_ARCH_CONTEXT_SWITCH_REQUEST() ((void)0)
 
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Raise the kernel interrupt mask; returns the previous mask state for restore.
+ */
 uint32_t os_arch_kernel_mask_save(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Restore the kernel interrupt mask to a state returned by os_arch_kernel_mask_save.
+ */
 void os_arch_kernel_mask_restore(uint32_t mask);
+
+/******************************************************************************************************/
+/**
+ * @brief Index of the calling core; always 0 on single-core builds.
+ */
 uint32_t os_arch_core_id_get(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Return true when executing in interrupt (handler) context.
+ */
 bool os_arch_in_isr(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Index of the highest set bit in a non-zero bitmap (the scheduler's ready-priority pick).
+ *        One CLZ instruction on ARMv7-M and up; ARMv6-M has no CLZ, so GCC emits its small library
+ *        routine there - still cheaper than scanning the task table.
+ */
 uint32_t os_arch_highest_bit_get(uint32_t bits);
+
+/******************************************************************************************************/
+/**
+ * @brief Index of the lowest set bit in a non-zero bitmap (picks the IPI target from an affinity
+ *        mask).
+ */
 uint32_t os_arch_lowest_bit_get(uint32_t bits);
+
+/******************************************************************************************************/
+/**
+ * @brief Build the initial task stack frame for a newly created task.
+ */
 uint32_t *os_arch_task_stack_initialize(uint8_t *stack, size_t bytes,
                                       void (*entry)(void *), void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Initialize architecture-specific low-level resources.
+ */
 void os_arch_init(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Start the kernel tick. See os_arch_port_common.h.
+ */
 void os_arch_tick_init(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Start the first task context. Does not return.
+ */
 void os_arch_start_first_task(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Trap for unrecoverable configuration faults detected at runtime; parks the core with all
+ *        interrupts masked so a debugger lands right at the cause.
+ */
 void os_arch_config_fault_trap(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Interrupt another core so it re-evaluates scheduling. SoC-specific: the RP2040's
+ *        inter-core FIFO, the RP2350's doorbell.
+ */
 void os_arch_core_ipi_request_cb(uint32_t core);
+
+/******************************************************************************************************/
+/**
+ * @brief Boot a secondary core so it reaches os_core_start(). Called by os_start(), once per core
+ *        from 1 to OS_CONFIG_CORE_COUNT-1, with the kernel complete and already running.
+ */
 void os_arch_core_launch_cb(uint32_t core);
+
+/******************************************************************************************************/
+/**
+ * @brief Weak default for the idle wait: a plain WFI, which is correct on parts whose timers keep
+ *        running through it.
+ */
 void os_arch_soc_idle_cb(void);
 
 #ifdef __cplusplus

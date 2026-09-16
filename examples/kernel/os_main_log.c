@@ -32,15 +32,15 @@
 
 #include <stdio.h>
 
-#if !(OS_CONFIG_LOG_ENABLE == 1U)
-#error "os_main_log.c needs OS_CONFIG_LOG_ENABLE=1 in os_config.h"
-#endif
-
 /*
  * ***********************************************************************************************************
  * Macros
  * ***********************************************************************************************************
 */
+
+#if !(OS_CONFIG_LOG_ENABLE == 1U)
+#error "os_main_log.c needs OS_CONFIG_LOG_ENABLE=1 in os_config.h"
+#endif
 
 #define LOG_BURST_LINES 200U
 
@@ -97,7 +97,8 @@ void os_main(void)
      * already there and the one after it. */
     for (iteration = 0U; iteration < LOG_BURST_LINES; iteration++)
     {
-        OS_LOG_INFO("burst line %lu of %lu", (unsigned long)iteration, (unsigned long)LOG_BURST_LINES);
+        OS_LOG_INFO("burst line %lu of %lu", (unsigned long)iteration,
+                    (unsigned long)LOG_BURST_LINES);
     }
 
     /* Blocking here lets tsk_log run and drain what did fit. Once the ring empties it reports the
@@ -116,7 +117,8 @@ void os_main(void)
     {
         /* One line every second drains long before the next arrives, so nothing is ever dropped
          * and this task never waits on the UART. */
-        OS_LOG_INFO("heartbeat %lu, tick %lu", (unsigned long)iteration, (unsigned long)os_tick_get());
+        OS_LOG_INFO("heartbeat %lu, tick %lu", (unsigned long)iteration,
+                    (unsigned long)os_tick_get());
         iteration++;
         os_delay_ms(1000U);
     }

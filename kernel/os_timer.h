@@ -13,6 +13,12 @@
 #ifndef OS_TIMER_H
 #define OS_TIMER_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "os_types.h"
 
 #ifdef __cplusplus
@@ -22,96 +28,11 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Software timer     - OS_CONFIG_TIMER_ENABLE
+ * Macros
  * ***********************************************************************************************************
 */
 
 #if (OS_CONFIG_TIMER_ENABLE == 1U)
-
-/******************************************************************************************************/
-/**
- * @brief Timer operating mode.
- */
-typedef enum
-{
-    
-    OS_TIMER_MODE_ONE_SHOT = 0, /**< Fires once, then stops.             */
-    OS_TIMER_MODE_PERIODIC = 1, /**< Reloads and fires every period.     */
-    OS_TIMER_MODE_SUBMIT   = 2, /**< Defers a callback to the timer task */
-
-} os_timer_mode_t;
-
-/******************************************************************************************************/
-/**
- * @brief Timer callback signature.
- *
- * Both arguments come from os_timer_start or os_timer_submit, so a call can say WHICH object
- * it concerns and WHAT happened without the kernel copying a payload.
- */
-typedef void (*os_timer_callback_t)(void *context, uint32_t value);
-
-/******************************************************************************************************/
-/**
- * @brief Software timer object.
- */
-typedef struct
-{
-    /** Points at this object, so the kernel can tell a real timer from a lump of memory: the
-     *  link state lives inside the object, and following a garbage node would write to an
-     *  address nobody chose. Anything else is refused with OS_ERR_INVALID_ARG. A
-     *  self-pointer rather than a constant catches a COPIED timer too. See os_timer.c. */
-    void                *self;
-    uint32_t            period_ticks;
-    uint32_t            remaining_ticks;
-    os_timer_mode_t     mode;
-    bool                active;  /**< Counting down right now.                       */
-    bool                paused;  /**< Halted by os_timer_pause, remaining_ticks kept. */
-    bool                queued;  /**< Expiry noted by the tick, waiting its turn to run. */
-    os_timer_callback_t callback;
-    void                *context;
-    uint32_t            value;
-    os_list_node_t      ready_node;    /**< Links into the FIFO of expiries awaiting delivery.   */
-    os_list_node_t      running_node;  /**< Links into the list of timers the tick counts down. */
-
-} os_timer_t;
-
-/******************************************************************************************************/
-/**
- * @brief One slot in a pool: a timer, plus the pool to hand it back to. The back-pointer lives
- *        here rather than in os_timer_t so ordinary timers do not pay for it.
- *
- * The pool is named by its struct tag because the two types point at each other, and one of them
- * has to be reachable before it is complete. A pointer to an incomplete type is all this needs,
- * which is the same arrangement os_list_node uses for its own back-reference.
- */
-typedef struct
-{
-    os_timer_t             timer;
-    struct os_timer_pool_s *pool;
-
-} os_timer_entry_t;
-
-/******************************************************************************************************/
-/**
- * @brief A pool of deferred calls: the storage os_timer_submit hands out, one slot per call.
- *
- * Declared by OS_TIMER_DEFINE_SUBMIT and owned by the caller, which is what keeps OS_ERR_FULL
- * local to one pool. Everything here is settled at compile time except free_list and ready, which
- * the kernel fills in the first time the pool is used - so a pool needs no init call and the
- * kernel keeps no list of pools.
- */
-typedef struct os_timer_pool_s
-{
-    void                *self;       /**< Points at this pool; the same validity check timers use.   */
-    os_timer_entry_t    *entries;    /**< The slots, from OS_TIMER_DEFINE_SUBMIT.                    */
-    uint32_t            count;       /**< How many, so at most this many calls may be in flight.     */
-    uint32_t            delay_ticks; /**< From OS_TIMER_DEFINE_SUBMIT; 0 means deliver immediately.  */
-    os_timer_callback_t callback;    /**< What every submission to this pool runs.                   */
-    os_list_t           free_list;   /**< Slots nobody is using; they link through timer.ready_node. */
-    bool                ready;       /**< Set on first use, when the slots are threaded onto free_list. */
-
-} os_timer_pool_t;
-
 /*
  * A timer's life cycle, and what each call does to the countdown:
  *
@@ -208,7 +129,107 @@ typedef struct os_timer_pool_s
 /** Name a deferred-call pool defined in another file. A pool rather than a timer, since that is
  *  what OS_TIMER_DEFINE_SUBMIT declares; only the pool crosses, its entry array stays private. */
 #define OS_TIMER_POOL_DECLARE(pool_name) extern os_timer_pool_t pool_name
+#endif /* OS_CONFIG_TIMER_ENABLE */
 
+/*
+ * ***********************************************************************************************************
+ * Types
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Timer operating mode.
+ */
+typedef enum
+{
+
+    OS_TIMER_MODE_ONE_SHOT = 0, /**< Fires once, then stops.             */
+    OS_TIMER_MODE_PERIODIC = 1, /**< Reloads and fires every period.     */
+    OS_TIMER_MODE_SUBMIT   = 2, /**< Defers a callback to the timer task */
+
+} os_timer_mode_t;
+
+/******************************************************************************************************/
+/**
+ * @brief Timer callback signature.
+ *
+ * Both arguments come from os_timer_start or os_timer_submit, so a call can say WHICH object
+ * it concerns and WHAT happened without the kernel copying a payload.
+ */
+typedef void (*os_timer_callback_t)(void *context, uint32_t value);
+
+/******************************************************************************************************/
+/**
+ * @brief Software timer object.
+ */
+typedef struct
+{
+    /** Points at this object, so the kernel can tell a real timer from a lump of memory: the
+     *  link state lives inside the object, and following a garbage node would write to an
+     *  address nobody chose. Anything else is refused with OS_ERR_INVALID_ARG. A
+     *  self-pointer rather than a constant catches a COPIED timer too. See os_timer.c. */
+    void                *self;
+    uint32_t            period_ticks;
+    uint32_t            remaining_ticks;
+    os_timer_mode_t     mode;
+    bool                active;  /**< Counting down right now.                       */
+    bool                paused;  /**< Halted by os_timer_pause, remaining_ticks kept. */
+    bool                queued;  /**< Expiry noted by the tick, waiting its turn to run. */
+    os_timer_callback_t callback;
+    void                *context;
+    uint32_t            value;
+    os_list_node_t      ready_node;    /**< Links into the FIFO of expiries awaiting delivery.   */
+    os_list_node_t      running_node;  /**< Links into the list of timers the tick counts down. */
+
+} os_timer_t;
+
+/******************************************************************************************************/
+/**
+ * @brief One slot in a pool: a timer, plus the pool to hand it back to. The back-pointer lives
+ *        here rather than in os_timer_t so ordinary timers do not pay for it.
+ *
+ * The pool is named by its struct tag because the two types point at each other, and one of them
+ * has to be reachable before it is complete. A pointer to an incomplete type is all this needs,
+ * which is the same arrangement os_list_node uses for its own back-reference.
+ */
+typedef struct
+{
+    os_timer_t             timer;
+    struct os_timer_pool_s *pool;
+
+} os_timer_entry_t;
+
+/******************************************************************************************************/
+/**
+ * @brief A pool of deferred calls: the storage os_timer_submit hands out, one slot per call.
+ *
+ * Declared by OS_TIMER_DEFINE_SUBMIT and owned by the caller, which is what keeps OS_ERR_FULL
+ * local to one pool. Everything here is settled at compile time except free_list and ready, which
+ * the kernel fills in the first time the pool is used - so a pool needs no init call and the
+ * kernel keeps no list of pools.
+ */
+typedef struct os_timer_pool_s
+{
+    void                *self;       /**< Points at this pool; the same validity check timers use.   */
+    os_timer_entry_t    *entries;    /**< The slots, from OS_TIMER_DEFINE_SUBMIT.                    */
+    uint32_t            count;       /**< How many, so at most this many calls may be in flight.     */
+    uint32_t            delay_ticks; /**< From OS_TIMER_DEFINE_SUBMIT; 0 means deliver immediately.  */
+    os_timer_callback_t callback;    /**< What every submission to this pool runs.                   */
+    os_list_t           free_list;   /**< Slots nobody is using; they link through timer.ready_node. */
+    bool                ready;       /**< Set on first use, when the slots are threaded onto free_list. */
+
+} os_timer_pool_t;
+#endif /* OS_CONFIG_TIMER_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_TIMER_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Start a timer, or resume one os_timer_pause halted - a paused timer continues with the
@@ -268,7 +289,6 @@ os_err_t os_timer_value_set(os_timer_t *timer, uint32_t value);
  *        value. If it may need cancelling, it wants a named timer and os_timer_start instead.
  */
 os_err_t os_timer_submit(os_timer_pool_t *pool, void *context, uint32_t value);
-
 #endif /* OS_CONFIG_TIMER_ENABLE */
 
 #ifdef __cplusplus

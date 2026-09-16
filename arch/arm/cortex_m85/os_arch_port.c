@@ -15,6 +15,12 @@
  *            See LICENSE in the project root for the full license text.
  */
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 /* This file IS the translation unit; the shared implementation below is a textual
  * include and refuses to compile without this. */
 #define OS_ARCH_PORT_TRANSLATION_UNIT

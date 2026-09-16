@@ -20,14 +20,13 @@
 
 #include "os_internal.h"
 
-#if (OS_CONFIG_ALLOC_ENABLE == 1U)
-
 /*
  * ***********************************************************************************************************
  * Macros
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
 #define OS_MEM_ALIGNMENT       8U
 #define OS_MEM_ALIGN_MSK       ((size_t)(OS_MEM_ALIGNMENT - 1U))
 #define OS_MEM_ALLOCATED_MSK   ((size_t)1 << ((sizeof(size_t) * 8U) - 1U))
@@ -37,6 +36,7 @@
 #if (OS_CONFIG_HEAP_SIZE < 64U)
 #error "OS_CONFIG_HEAP_SIZE is too small to hold the allocator bookkeeping."
 #endif
+#endif /* OS_CONFIG_ALLOC_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -44,6 +44,7 @@
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
 /* Every heap block starts with this header; size covers header + payload and
  * carries the allocated flag in its top bit. */
 typedef struct os_mem_block
@@ -52,6 +53,7 @@ typedef struct os_mem_block
     size_t              size;
 
 } os_mem_block_t;
+#endif /* OS_CONFIG_ALLOC_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -59,11 +61,13 @@ typedef struct os_mem_block
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
 static uint8_t         os_mem_heap[OS_CONFIG_HEAP_SIZE];
 static os_mem_block_t  os_mem_start;
 static os_mem_block_t  *os_mem_end            = NULL;
 static size_t          os_mem_free_bytes      = 0U;
 static size_t          os_mem_min_free_bytes  = 0U;
+#endif /* OS_CONFIG_ALLOC_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -71,9 +75,25 @@ static size_t          os_mem_min_free_bytes  = 0U;
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Lazily set up the free list: one block spanning the heap plus the end marker.
+ */
 static void os_mem_init(void);
-static void os_mem_block_insert(os_mem_block_t *block);
+
+/******************************************************************************************************/
+/**
+ * @brief Whether a header found at a caller-supplied address could actually be one of ours.
+ */
 static bool os_mem_block_plausible(const os_mem_block_t *block);
+
+/******************************************************************************************************/
+/**
+ * @brief Insert a free block into the address-ordered list, merging with touching neighbors.
+ */
+static void os_mem_block_insert(os_mem_block_t *block);
+#endif /* OS_CONFIG_ALLOC_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -81,6 +101,7 @@ static bool os_mem_block_plausible(const os_mem_block_t *block);
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Allocate memory from the kernel heap.
@@ -255,6 +276,7 @@ size_t os_mem_watermark_get(void)
 
     return min_free_bytes;
 }
+#endif /* OS_CONFIG_ALLOC_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -262,6 +284,7 @@ size_t os_mem_watermark_get(void)
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Lazily set up the free list: one block spanning the heap plus the end marker.
@@ -393,5 +416,4 @@ static void os_mem_block_insert(os_mem_block_t *block)
         iter->next = block;
     }
 }
-
 #endif /* OS_CONFIG_ALLOC_ENABLE */

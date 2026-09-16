@@ -5,6 +5,7 @@
  *            SPDX-License-Identifier: GPL-3.0-or-later
  *            See LICENSE in the project root for the full license text.
  */
+
 /*
  * ***********************************************************************************************************
  * Includes
@@ -21,33 +22,11 @@
 #include "kernel/os_msg.c"
 #include "kernel/os_log.c"
 
-typedef struct
-{
-    os_list_node_t node;
-    os_list_t *list;
-    uint32_t needed;
-    uint32_t timeout_ticks;
-    bool signaled;
-} test_waiter_t;
-
-__IO uint32_t os_kernel_lock_count[OS_CONFIG_CORE_COUNT];
-__IO bool os_kernel_switch_pending[OS_CONFIG_CORE_COUNT];
-__IO bool os_kernel_running = true;
-
-static test_waiter_t test_waiters[4];
-static uint32_t test_current;
-static uint32_t test_depth;
-static uint32_t test_tick;
-static uint32_t test_seed_tick;
-static void (*test_switch_action)(void);
-volatile uint32_t test_failure;
-static os_msg_t *test_buffer;
-static size_t test_second_size;
-static os_err_t test_second_status;
-static os_err_t test_seed_receive_status;
-static uint8_t test_data[30];
-static uint32_t test_report_count;
-static bool test_inject_log_drop;
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
 
 #define TEST_CHECK(condition)                               \
     do                                                      \
@@ -60,15 +39,100 @@ static bool test_inject_log_drop;
 
 /*
  * ***********************************************************************************************************
- * Function implementations
+ * Types
  * ***********************************************************************************************************
 */
 
+typedef struct
+{
+    os_list_node_t node;
+    os_list_t *list;
+    uint32_t needed;
+    uint32_t timeout_ticks;
+    bool signaled;
+
+} test_waiter_t;
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
+__IO uint32_t os_kernel_lock_count[OS_CONFIG_CORE_COUNT];
+__IO bool os_kernel_switch_pending[OS_CONFIG_CORE_COUNT];
+__IO bool os_kernel_running = true;
+
+static test_waiter_t test_waiters[4];
+static uint32_t test_current;
+static uint32_t test_depth;
+static uint32_t test_tick;
+static uint32_t test_seed_tick;
+static void (*test_switch_action)(void);
+__IO uint32_t test_failure;
+static os_msg_t *test_buffer;
+static size_t test_second_size;
+static os_err_t test_second_status;
+static os_err_t test_seed_receive_status;
+static uint8_t test_data[30];
+static uint32_t test_report_count;
+static bool test_inject_log_drop;
+
+/*
+ * ***********************************************************************************************************
+ * Private function prototypes
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Signal one waiter and take it off the list.
+ */
+static void test_wake(test_waiter_t *waiter);
+
+/******************************************************************************************************/
+/**
+ * @brief Seed the buffer with the messages a case starts from.
+ */
+static void test_receive_seed(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Start the second task this case needs.
+ */
+static void test_start_second(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Clear the state shared between cases.
+ */
+static void test_reset(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Whether the captured output holds this text.
+ */
+static bool test_contains(const uint8_t *data, size_t length, const char *text);
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_critical_enter: what this harness needs of it, with no kernel behind it.
+ */
 void os_critical_enter(void)
 {
     test_depth++;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_critical_exit: what this harness needs of it, with no kernel behind it.
+ */
 void os_critical_exit(void)
 {
     TEST_CHECK(test_depth > 0U);
@@ -81,11 +145,25 @@ void os_critical_exit(void)
     }
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_tick_get: what this harness needs of it, with no kernel behind it.
+ *
+ * @return What this stand-in reports.
+ */
 uint32_t os_tick_get(void)
 {
     return test_tick;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_wait_data_set: what this harness needs of it, with no kernel behind
+ *        it.
+ *
+ * @param[in] data0        First word of the wait data.
+ * @param[in] data1        Second word of the wait data.
+ */
 void os_task_wait_data_set(uint32_t data0, uint32_t data1)
 {
     TEST_CHECK(test_depth > 0U);
@@ -93,6 +171,13 @@ void os_task_wait_data_set(uint32_t data0, uint32_t data1)
     test_waiters[test_current].needed = data0;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_wait_begin: what this harness needs of it, with no kernel behind it.
+ *
+ * @param[in] waiters      Waiter list to work on.
+ * @param[in] ticks        Tick periods.
+ */
 void os_task_wait_begin(os_list_t *waiters, uint32_t ticks)
 {
     test_waiter_t *waiter = &test_waiters[test_current];
@@ -105,6 +190,10 @@ void os_task_wait_begin(os_list_t *waiters, uint32_t ticks)
     os_list_push_back(waiters, &waiter->node);
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_wait_end: what this harness needs of it, with no kernel behind it.
+ */
 void os_task_wait_end(void)
 {
     test_waiter_t *waiter = &test_waiters[test_current];
@@ -119,6 +208,11 @@ void os_task_wait_end(void)
 
 /* Same body: the split is about which caller already holds the critical
  * section, and this harness substitutes the scheduler entirely. */
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_wait_end_locked: what this harness needs of it, with no kernel behind
+ *        it.
+ */
 void os_task_wait_end_locked(void)
 {
     test_waiter_t *waiter = &test_waiters[test_current];
@@ -131,18 +225,26 @@ void os_task_wait_end_locked(void)
     waiter->signaled = false;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_wait_signaled: what this harness needs of it, with no kernel behind
+ *        it.
+ *
+ * @return What this stand-in reports.
+ */
 bool os_task_wait_signaled(void)
 {
     return test_waiters[test_current].signaled;
 }
 
-static void test_wake(test_waiter_t *waiter)
-{
-    os_list_remove(waiter->list, &waiter->node);
-    waiter->list = NULL;
-    waiter->signaled = true;
-}
-
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_waiters_wake_one: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @param[in] waiters      Waiter list to work on.
+ * @return What this stand-in reports.
+ */
 bool os_task_waiters_wake_one(os_list_t *waiters)
 {
     bool woke = waiters->head != NULL;
@@ -154,6 +256,16 @@ bool os_task_waiters_wake_one(os_list_t *waiters)
     return woke;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_waiters_wake_match: what this harness needs of it, with no kernel
+ *        behind it.
+ *
+ * @param[in] waiters      Waiter list to work on.
+ * @param[in] context      The caller's context pointer.
+ * @param[in] match        Predicate a waiter must satisfy to be woken.
+ * @return What this stand-in reports.
+ */
 uint32_t os_task_waiters_wake_match(os_list_t *waiters, os_task_wait_match_fn match, void *context)
 {
     os_list_node_t *node = waiters->head;
@@ -175,37 +287,12 @@ uint32_t os_task_waiters_wake_match(os_list_t *waiters, os_task_wait_match_fn ma
     return count;
 }
 
-static void test_receive_seed(void)
-{
-    uint8_t output[30];
-    size_t length;
-    uint32_t saved = test_current;
-    test_current = 2U;
-    test_tick = test_seed_tick;
-    test_seed_receive_status = os_msg_receive(test_buffer, output, sizeof(output), &length, OS_WAIT_NOTHING);
-    test_current = saved;
-}
-
-static void test_start_second(void)
-{
-    test_current = 1U;
-    test_switch_action = test_receive_seed;
-    test_second_status = os_msg_send(test_buffer, test_data, test_second_size, OS_WAIT_FOREVER);
-    test_current = 0U;
-}
-
-static void test_reset(void)
-{
-    (void)memset(test_waiters, 0, sizeof(test_waiters));
-    test_current = 0U;
-    test_depth = 0U;
-    test_tick = 0U;
-    test_seed_tick = 0U;
-    test_switch_action = NULL;
-    test_second_status = OS_ERR_ERROR;
-    test_seed_receive_status = OS_ERR_ERROR;
-}
-
+/******************************************************************************************************/
+/**
+ * @brief Case: two senders into one buffer.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_two_senders(void)
 {
     uint8_t storage[32];
@@ -226,6 +313,12 @@ uint32_t test_two_senders(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: only an eligible sender is woken.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_eligible_sender(void)
 {
     uint8_t storage[32];
@@ -245,6 +338,12 @@ uint32_t test_eligible_sender(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: competing senders are served in order.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_competing_senders(void)
 {
     uint8_t storage[32];
@@ -266,6 +365,12 @@ uint32_t test_competing_senders(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: the largest message metadata the buffer allows.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_maximum_sender_metadata(void)
 {
     static uint8_t storage[OS_MSG_SPACE(OS_MSG_LENGTH_MAX)];
@@ -280,6 +385,12 @@ uint32_t test_maximum_sender_metadata(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: receivers take messages in the order sent.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_receivers(void)
 {
     uint8_t storage[32];
@@ -309,6 +420,12 @@ uint32_t test_receivers(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: what is left in the buffer after a partial drain.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_remaining_messages(void)
 {
     uint8_t storage[32];
@@ -337,20 +454,13 @@ uint32_t test_remaining_messages(void)
     return test_failure;
 }
 
-static bool test_contains(const uint8_t *data, size_t length, const char *text)
-{
-    size_t text_length = strlen(text);
-    bool found = false;
-    for (size_t i = 0U; (i + text_length) <= length; i++)
-    {
-        if (memcmp(&data[i], text, text_length) == 0)
-        {
-            found = true;
-        }
-    }
-    return found;
-}
-
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_log_output_cb: what this harness needs of it, with no kernel behind it.
+ *
+ * @param[in] data         Bytes to write.
+ * @param[in] length       How many bytes.
+ */
 void os_log_output_cb(const uint8_t *data, size_t length)
 {
     static const char full[OS_CONFIG_LOG_BUFFER_SIZE - 1U] = {0};
@@ -376,6 +486,15 @@ void os_log_output_cb(const uint8_t *data, size_t length)
     }
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_create_system: what this harness needs of it, with no kernel behind
+ *        it.
+ *
+ * @param[in] task         Task handle.
+ * @param[in] config       Task creation configuration.
+ * @return What this stand-in reports.
+ */
 os_err_t os_task_create_system(os_task_t *task, const os_task_config_t *config)
 {
     (void)config;
@@ -383,23 +502,49 @@ os_err_t os_task_create_system(os_task_t *task, const os_task_config_t *config)
     return OS_ERR_NONE;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_start: what this harness needs of it, with no kernel behind it.
+ *
+ * @param[in] task         Task handle.
+ * @return What this stand-in reports.
+ */
 os_err_t os_task_start(os_task_t *task)
 {
     (void)task;
     return OS_ERR_NONE;
 }
 
-void *os_task_tcb_resolve(uint32_t id)
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_tcb_resolve: what this harness needs of it, with no kernel behind it.
+ *
+ * @param[in] id           Task id.
+ * @return What this stand-in reports.
+ */
+void* os_task_tcb_resolve(uint32_t id)
 {
     (void)id;
     return NULL;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_wake_tcb: what this harness needs of it, with no kernel behind it.
+ *
+ * @param[in] tcb          Task control block.
+ */
 void os_task_wake_tcb(void *tcb)
 {
     (void)tcb;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Stand-in for os_task_sleep_ticks: what this harness needs of it, with no kernel behind it.
+ *
+ * @param[in] ticks        Tick periods.
+ */
 void os_task_sleep_ticks(uint32_t ticks)
 {
     TEST_CHECK(ticks == OS_WAIT_FOREVER);
@@ -408,6 +553,12 @@ void os_task_sleep_ticks(uint32_t ticks)
     __asm volatile("bkpt #0");
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: the log ring drains into the output callback.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_log_drain(void)
 {
     static const char full[OS_CONFIG_LOG_BUFFER_SIZE - 1U] = {0};
@@ -423,6 +574,12 @@ uint32_t test_log_drain(void)
     return test_failure;
 }
 
+/******************************************************************************************************/
+/**
+ * @brief Case: a full log ring is reported, not silently dropped.
+ *
+ * @return What the case observed.
+ */
 uint32_t test_log_notice_full_ring(void)
 {
     static const char full[OS_CONFIG_LOG_BUFFER_SIZE - 1U] = {0};
@@ -439,4 +596,91 @@ uint32_t test_log_notice_full_ring(void)
     TEST_CHECK(test_report_count == 1U);
     TEST_CHECK(os_log_dropped_get() == 2U);
     return test_failure;
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Signal one waiter and take it off the list.
+ *
+ * @param[in] waiter       Waiter to signal.
+ */
+static void test_wake(test_waiter_t *waiter)
+{
+    os_list_remove(waiter->list, &waiter->node);
+    waiter->list = NULL;
+    waiter->signaled = true;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Seed the buffer with the messages a case starts from.
+ */
+static void test_receive_seed(void)
+{
+    uint8_t output[30];
+    size_t length;
+    uint32_t saved = test_current;
+    test_current = 2U;
+    test_tick = test_seed_tick;
+    test_seed_receive_status = os_msg_receive(test_buffer, output, sizeof(output), &length,
+                                              OS_WAIT_NOTHING);
+    test_current = saved;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Start the second task this case needs.
+ */
+static void test_start_second(void)
+{
+    test_current = 1U;
+    test_switch_action = test_receive_seed;
+    test_second_status = os_msg_send(test_buffer, test_data, test_second_size, OS_WAIT_FOREVER);
+    test_current = 0U;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Clear the state shared between cases.
+ */
+static void test_reset(void)
+{
+    (void)memset(test_waiters, 0, sizeof(test_waiters));
+    test_current = 0U;
+    test_depth = 0U;
+    test_tick = 0U;
+    test_seed_tick = 0U;
+    test_switch_action = NULL;
+    test_second_status = OS_ERR_ERROR;
+    test_seed_receive_status = OS_ERR_ERROR;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Whether the captured output holds this text.
+ *
+ * @param[in] data         Bytes to write.
+ * @param[in] length       How many bytes.
+ * @param[in] text         Text to print.
+ *
+ * @return What the case observed.
+ */
+static bool test_contains(const uint8_t *data, size_t length, const char *text)
+{
+    size_t text_length = strlen(text);
+    bool found = false;
+    for (size_t i = 0U; (i + text_length) <= length; i++)
+    {
+        if (memcmp(&data[i], text, text_length) == 0)
+        {
+            found = true;
+        }
+    }
+    return found;
 }

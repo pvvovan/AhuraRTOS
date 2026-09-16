@@ -20,24 +20,33 @@
  *   - CAS, because the A extension has no compare-and-swap. (Zacas adds amocas.w, but it is not in
  *     the ISA string the Pico SDK builds with, so relying on it would break the build it targets.)
  *
- * The .aqrl suffix on every operation gives acquire-release ordering: no access after the atomic may
- * be hoisted above it and none before it may sink below. That is what the kernel's users of these
- * expect, and it costs nothing on a core that does not reorder.
+ * The .aqrl suffix on every operation gives acquire-release ordering: no access after the atomic
+ * may be hoisted above it and none before it may sink below. That is what the kernel's users of
+ * these expect, and it costs nothing on a core that does not reorder.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: GPL-3.0-or-later
  *            See LICENSE in the project root for the full license text.
  */
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #ifndef OS_ARCH_PORT_TRANSLATION_UNIT
 #error "os_arch_atomic.c is a textual include, not a translation unit. Compile arch/<family>/<core>/os_arch_port.c instead - it defines OS_ARCH_PORT_TRANSLATION_UNIT and includes this. See doc/installation.md."
 #endif
 
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
+ * ***********************************************************************************************************
+*/
 
 #if (OS_CONFIG_ATOMIC_ENABLE == 1U)
-
 #if (OS_ARCH_HAS_EXCLUSIVES == 1)
-
 /******************************************************************************************************/
 /**
  * @brief Atomic exchange. See os_arch_port_common.h.
@@ -46,7 +55,7 @@
  * @param[in]     value   Value to store.
  * @return int32_t  Value held before the exchange.
  */
-int32_t os_arch_atomic_exchange(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_exchange(__IO int32_t *target, int32_t value)
 {
     int32_t previous;
 
@@ -67,7 +76,7 @@ int32_t os_arch_atomic_exchange(volatile int32_t *target, int32_t value)
  * @param[in]     value   Amount to add.
  * @return int32_t  Value held before the addition.
  */
-int32_t os_arch_atomic_add(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_add(__IO int32_t *target, int32_t value)
 {
     int32_t previous;
 
@@ -89,7 +98,7 @@ int32_t os_arch_atomic_add(volatile int32_t *target, int32_t value)
  * @param[in]     value   Amount to subtract.
  * @return int32_t  Value held before the subtraction.
  */
-int32_t os_arch_atomic_sub(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_sub(__IO int32_t *target, int32_t value)
 {
     int32_t previous;
     int32_t negated = (int32_t)(0U - (uint32_t)value);
@@ -108,7 +117,7 @@ int32_t os_arch_atomic_sub(volatile int32_t *target, int32_t value)
  * @param[in]     value   Bits to set.
  * @return int32_t  Value held before the operation.
  */
-int32_t os_arch_atomic_or(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_or(__IO int32_t *target, int32_t value)
 {
     int32_t previous;
 
@@ -126,7 +135,7 @@ int32_t os_arch_atomic_or(volatile int32_t *target, int32_t value)
  * @param[in]     value   Mask to apply.
  * @return int32_t  Value held before the operation.
  */
-int32_t os_arch_atomic_and(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_and(__IO int32_t *target, int32_t value)
 {
     int32_t previous;
 
@@ -144,7 +153,7 @@ int32_t os_arch_atomic_and(volatile int32_t *target, int32_t value)
  * @param[in]     value   Bits to toggle.
  * @return int32_t  Value held before the operation.
  */
-int32_t os_arch_atomic_xor(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_xor(__IO int32_t *target, int32_t value)
 {
     int32_t previous;
 
@@ -165,7 +174,7 @@ int32_t os_arch_atomic_xor(volatile int32_t *target, int32_t value)
  * @param[in]     value   Mask to apply.
  * @return int32_t  Value held before the operation.
  */
-int32_t os_arch_atomic_nand(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_nand(__IO int32_t *target, int32_t value)
 {
     int32_t  previous;
     int32_t  updated;
@@ -197,7 +206,7 @@ int32_t os_arch_atomic_nand(volatile int32_t *target, int32_t value)
  * @param[in]     desired   Value to store if it is.
  * @return bool  True when the swap happened.
  */
-bool os_arch_atomic_cas(volatile int32_t *target, int32_t expected, int32_t desired)
+bool os_arch_atomic_cas(__IO int32_t *target, int32_t expected, int32_t desired)
 {
     int32_t  current;
     uint32_t failed;
@@ -216,14 +225,16 @@ bool os_arch_atomic_cas(volatile int32_t *target, int32_t expected, int32_t desi
 
     return (failed == 0U);
 }
-
 #else /* no A extension: exclude with the kernel's own critical section */
-
 /******************************************************************************************************/
 /**
  * @brief Atomic exchange. See os_arch_port_common.h.
+ *
+ * @param[in] target       Word to operate on.
+ * @param[in] value        Value to apply.
+ * @return The value the word held before.
  */
-int32_t os_arch_atomic_exchange(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_exchange(__IO int32_t *target, int32_t value)
 {
     int32_t previous;
 
@@ -240,8 +251,12 @@ int32_t os_arch_atomic_exchange(volatile int32_t *target, int32_t value)
 /******************************************************************************************************/
 /**
  * @brief Atomic add. See os_arch_port_common.h.
+ *
+ * @param[in] target       Word to operate on.
+ * @param[in] value        Value to apply.
+ * @return The value the word held before.
  */
-int32_t os_arch_atomic_add(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_add(__IO int32_t *target, int32_t value)
 {
     int32_t previous;
 
@@ -258,8 +273,12 @@ int32_t os_arch_atomic_add(volatile int32_t *target, int32_t value)
 /******************************************************************************************************/
 /**
  * @brief Atomic subtract. See os_arch_port_common.h.
+ *
+ * @param[in] target       Word to operate on.
+ * @param[in] value        Value to apply.
+ * @return The value the word held before.
  */
-int32_t os_arch_atomic_sub(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_sub(__IO int32_t *target, int32_t value)
 {
     int32_t previous;
 
@@ -276,8 +295,12 @@ int32_t os_arch_atomic_sub(volatile int32_t *target, int32_t value)
 /******************************************************************************************************/
 /**
  * @brief Atomic bitwise OR. See os_arch_port_common.h.
+ *
+ * @param[in] target       Word to operate on.
+ * @param[in] value        Value to apply.
+ * @return The value the word held before.
  */
-int32_t os_arch_atomic_or(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_or(__IO int32_t *target, int32_t value)
 {
     int32_t previous;
 
@@ -294,8 +317,12 @@ int32_t os_arch_atomic_or(volatile int32_t *target, int32_t value)
 /******************************************************************************************************/
 /**
  * @brief Atomic bitwise AND. See os_arch_port_common.h.
+ *
+ * @param[in] target       Word to operate on.
+ * @param[in] value        Value to apply.
+ * @return The value the word held before.
  */
-int32_t os_arch_atomic_and(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_and(__IO int32_t *target, int32_t value)
 {
     int32_t previous;
 
@@ -312,8 +339,12 @@ int32_t os_arch_atomic_and(volatile int32_t *target, int32_t value)
 /******************************************************************************************************/
 /**
  * @brief Atomic bitwise XOR. See os_arch_port_common.h.
+ *
+ * @param[in] target       Word to operate on.
+ * @param[in] value        Value to apply.
+ * @return The value the word held before.
  */
-int32_t os_arch_atomic_xor(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_xor(__IO int32_t *target, int32_t value)
 {
     int32_t previous;
 
@@ -330,8 +361,12 @@ int32_t os_arch_atomic_xor(volatile int32_t *target, int32_t value)
 /******************************************************************************************************/
 /**
  * @brief Atomic bitwise NAND. See os_arch_port_common.h.
+ *
+ * @param[in] target       Word to operate on.
+ * @param[in] value        Value to apply.
+ * @return The value the word held before.
  */
-int32_t os_arch_atomic_nand(volatile int32_t *target, int32_t value)
+int32_t os_arch_atomic_nand(__IO int32_t *target, int32_t value)
 {
     int32_t previous;
 
@@ -348,8 +383,13 @@ int32_t os_arch_atomic_nand(volatile int32_t *target, int32_t value)
 /******************************************************************************************************/
 /**
  * @brief Compare-and-swap. See os_arch_port_common.h.
+ *
+ * @param[in] target       Word to operate on.
+ * @param[in] expected     Value the word must still hold.
+ * @param[in] desired      Value to store once it does.
+ * @return True when the swap was made.
  */
-bool os_arch_atomic_cas(volatile int32_t *target, int32_t expected, int32_t desired)
+bool os_arch_atomic_cas(__IO int32_t *target, int32_t expected, int32_t desired)
 {
     bool swapped = false;
 
@@ -365,7 +405,5 @@ bool os_arch_atomic_cas(volatile int32_t *target, int32_t expected, int32_t desi
 
     return swapped;
 }
-
 #endif /* OS_ARCH_HAS_EXCLUSIVES */
-
 #endif /* OS_CONFIG_ATOMIC_ENABLE */

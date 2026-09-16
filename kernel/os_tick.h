@@ -13,6 +13,12 @@
 #ifndef OS_TICK_H
 #define OS_TICK_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "os_types.h"
 
 #ifdef __cplusplus
@@ -22,7 +28,7 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Tick conversion
+ * Macros
  * ***********************************************************************************************************
 */
 
@@ -37,10 +43,9 @@ extern "C"
 
 #define OS_TICKS_FROM_MS(ms)    OS_TICKS_SATURATE((((uint64_t)(ms) * (uint64_t)OS_CONFIG_TICK_HZ) + 999ULL) / 1000ULL)
 
-
 /*
  * ***********************************************************************************************************
- * CPU usage          - OS_CONFIG_CPU_USAGE_ENABLE
+ * Public function prototypes
  * ***********************************************************************************************************
 */
 
@@ -53,19 +58,14 @@ extern "C"
 uint32_t os_cpu_usage_get(void);
 #endif /* OS_CONFIG_CPU_USAGE_ENABLE */
 
-
-/*
- * ***********************************************************************************************************
- * Tickless idle      - OS_CONFIG_TICKLESS_ENABLE
- * ***********************************************************************************************************
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/* Tickless idle      - OS_CONFIG_TICKLESS_ENABLE.
  *
  * Three kernel-provided control functions, two application-provided hooks and
  * one SoC-provided sleep, all behind the one guard. Calling any of them with
  * tickless idle disabled is a compile error naming the function, not a call
  * that silently does nothing.
-*/
-
-#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+ */
 
 /******************************************************************************************************/
 /**
@@ -149,7 +149,6 @@ bool os_arch_soc_sleep_prepare_cb(void);
  * and release parked peers here. The default does nothing.
  */
 void os_arch_soc_sleep_finish_cb(void);
-
 #endif /* OS_CONFIG_TICKLESS_ENABLE */
 
 #ifdef __cplusplus

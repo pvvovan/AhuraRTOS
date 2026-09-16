@@ -24,15 +24,15 @@
 
 #include <stdio.h>
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #if !(OS_CONFIG_STACK_WATERMARK_ENABLE == 1U)
 #error "os_main_stack_watermark.c needs OS_CONFIG_STACK_WATERMARK_ENABLE=1 in os_config.h"
 #endif
-
-/*
- * ***********************************************************************************************************
- * Private objects
- * ***********************************************************************************************************
-*/
 
 /* Every task states its core affinity on a multi-core build: the kernel asks for that argument
  * rather than defaulting it, so the decision is made on purpose at each creation site. These
@@ -44,32 +44,26 @@
     OS_TASK_CONFIG((entry), (context), (priority), OS_TASK_CORE_ANY)
 #endif
 
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
 OS_TASK_DEFINE(worker, 512U);
 
 /*
  * ***********************************************************************************************************
- * Private function implementations
+ * Private function prototypes
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
-static void worker_entry(void *context)
-{
-    __IO uint8_t local_buffer[128]; /* burn some stack depth so the watermark has something to report */
-    size_t            i;
-
-    (void)context;
-
-    for (i = 0U; i < sizeof(local_buffer); i++)
-    {
-        local_buffer[i] = (uint8_t)i;
-    }
-
-    while (1)
-    {
-        os_delay_ms(500U);
-    }
-}
+/**
+ * @brief Worker entry: runs at a HIGHER priority than os_main, so the only thing that can keep it
+ *        off the CPU is the scheduler lock.
+ */
+static void worker_entry(void *context);
 
 /*
  * ***********************************************************************************************************
@@ -100,5 +94,36 @@ void os_main(void)
         printf("[stack_watermark] os_main task: %lu bytes free at minimum\r\n", (unsigned long)min_free);
 
         os_delay_ms(1000U);
+    }
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Worker entry: runs at a HIGHER priority than os_main, so the only thing that can keep it
+ *        off the CPU is the scheduler lock.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
+static void worker_entry(void *context)
+{
+    __IO uint8_t local_buffer[128]; /* burn some stack depth so the watermark has something to report */
+    size_t            i;
+
+    (void)context;
+
+    for (i = 0U; i < sizeof(local_buffer); i++)
+    {
+        local_buffer[i] = (uint8_t)i;
+    }
+
+    while (1)
+    {
+        os_delay_ms(500U);
     }
 }

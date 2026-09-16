@@ -20,7 +20,38 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Status codes and task types
+ * Macros
+ * ***********************************************************************************************************
+*/
+
+/* The compile-time assertion, spelled the way the language in use spells it: _Static_assert in
+ * C11, static_assert in C++, which does not declare the C spelling at all. Defined here, in the
+ * first kernel header ahura.h includes, because this header and the ones after it use it. */
+#ifdef __cplusplus
+#define OS_STATIC_ASSERT(condition, message)    static_assert(condition, message)
+#else
+#define OS_STATIC_ASSERT(condition, message)    _Static_assert(condition, message)
+#endif
+
+/** Timeout value: wait forever (never time out). */
+#define OS_WAIT_FOREVER         0xFFFFFFFFU
+
+/** Timeout value: do not wait, fail immediately when unavailable. */
+#define OS_WAIT_NOTHING         0U
+
+/** Core affinity: the task may run on any core - the empty mask, so no core is
+ *  named and none is excluded. What the kernel's own idle, timer and log tasks
+ *  use, and what a single-core OS_TASK_CONFIG fills in for you. */
+#define OS_TASK_CORE_ANY        0U
+
+/** Core affinity: the task may run only on core n. Combine with | for a set
+ *  of allowed cores. Cores are numbered from 0, so a dual-core part is
+ *  OS_TASK_CORE(0) and OS_TASK_CORE(1). */
+#define OS_TASK_CORE(n)         (1UL << (n))
+
+/*
+ * ***********************************************************************************************************
+ * Types
  * ***********************************************************************************************************
 */
 
@@ -110,19 +141,7 @@ typedef struct
 
 } os_task_config_t;
 
-
-/*
- * ***********************************************************************************************************
- * Timeouts, task priorities and core affinity
- * ***********************************************************************************************************
-*/
-
-/** Timeout value: wait forever (never time out). */
-#define OS_WAIT_FOREVER         0xFFFFFFFFU
-
-/** Timeout value: do not wait, fail immediately when unavailable. */
-#define OS_WAIT_NOTHING         0U
-
+/******************************************************************************************************/
 /** Every task priority level, one name per level, value N for level N.
  *
  *  Applications may use OS_TASK_PRIO_1_LOWEST..OS_TASK_PRIO_30_HIGHEST. The two outside that range
@@ -171,9 +190,15 @@ typedef enum
 
     /* Kernel-owned, above every user task: os_task_create rejects it, and it is what
      * OS_CONFIG_TIMER_PRIORITY defaults to. */
-    OS_TASK_PRIO_MAX        = 31U
+    OS_TASK_PRIO_MAX        = 31U,
 
 } os_task_priority_t;
+
+/*
+ * ***********************************************************************************************************
+ * Constants
+ * ***********************************************************************************************************
+*/
 
 /* The user range must sit exactly between the two kernel-owned levels, with no gap on either side.
  * A gap would mean a level no task could ever occupy - wasted ready-list and bitmap space - and an
@@ -218,16 +243,6 @@ OS_STATIC_ASSERT((OS_CONFIG_LOG_TASK_STACK_SIZE >= OS_CONFIG_MIN_STACK_SIZE) &&
                  ((OS_CONFIG_LOG_TASK_STACK_SIZE % OS_ARCH_STACK_ALIGNMENT_BYTES) == 0U),
                  "OS_CONFIG_LOG_TASK_STACK_SIZE must meet the minimum and port alignment");
 #endif
-
-/** Core affinity: the task may run on any core - the empty mask, so no core is
- *  named and none is excluded. What the kernel's own idle, timer and log tasks
- *  use, and what a single-core OS_TASK_CONFIG fills in for you. */
-#define OS_TASK_CORE_ANY        0U
-
-/** Core affinity: the task may run only on core n. Combine with | for a set
- *  of allowed cores. Cores are numbered from 0, so a dual-core part is
- *  OS_TASK_CORE(0) and OS_TASK_CORE(1). */
-#define OS_TASK_CORE(n)         (1UL << (n))
 
 #ifdef __cplusplus
 }

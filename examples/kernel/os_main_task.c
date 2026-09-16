@@ -26,7 +26,7 @@
 
 /*
  * ***********************************************************************************************************
- * Private objects
+ * Macros
  * ***********************************************************************************************************
 */
 
@@ -39,6 +39,12 @@
 #define EXAMPLE_TASK(entry, context, priority)  \
     OS_TASK_CONFIG((entry), (context), (priority), OS_TASK_CORE_ANY)
 #endif
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
 
 OS_TASK_DEFINE(worker, 512U);
 
@@ -75,54 +81,28 @@ static __IO uint32_t os_main_placed_iterations = 0U;
 
 /*
  * ***********************************************************************************************************
- * Private function implementations
+ * Private function prototypes
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
-static const char* task_state_name(os_task_state_t state)
-{
-    switch (state)
-    {
-        case OS_TASK_STATE_INACTIVE:  return "INACTIVE";
-        case OS_TASK_STATE_READY:     return "READY";
-        case OS_TASK_STATE_RUNNING:   return "RUNNING";
-        case OS_TASK_STATE_BLOCKED:   return "BLOCKED";
-        case OS_TASK_STATE_SUSPENDED: return "SUSPENDED";
-        default:                      return "?";
-    }
-}
+/**
+ * @brief Name of a task state, for printing.
+ */
+static const char* task_state_name(os_task_state_t state);
 
 /******************************************************************************************************/
 /**
  * @brief Worker entry: counts its own iterations and yields, so os_main can watch it progress.
  */
-static void worker_entry(void *context)
-{
-    (void)context;
-
-    while (1)
-    {
-        os_main_worker_iterations++;
-        os_task_yield();
-    }
-}
+static void worker_entry(void *context);
 
 /******************************************************************************************************/
 /**
  * @brief Entry for the task whose stack carries attributes: nothing about it differs, which is
  *        the point - only where its stack sits changed.
  */
-static void placed_entry(void *context)
-{
-    (void)context;
-
-    while (1)
-    {
-        os_main_placed_iterations++;
-        os_task_yield();
-    }
-}
+static void placed_entry(void *context);
 
 /*
  * ***********************************************************************************************************
@@ -193,5 +173,67 @@ void os_main(void)
     while (1)
     {
         os_delay_ms(1000U);
+    }
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Name of a task state, for printing.
+ *
+ * @param[in] state        State to name.
+ *
+ * @return The name of that state.
+ */
+static const char* task_state_name(os_task_state_t state)
+{
+    switch (state)
+    {
+        case OS_TASK_STATE_INACTIVE:  return "INACTIVE";
+        case OS_TASK_STATE_READY:     return "READY";
+        case OS_TASK_STATE_RUNNING:   return "RUNNING";
+        case OS_TASK_STATE_BLOCKED:   return "BLOCKED";
+        case OS_TASK_STATE_SUSPENDED: return "SUSPENDED";
+        default:                      return "?";
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Worker entry: counts its own iterations and yields, so os_main can watch it progress.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
+static void worker_entry(void *context)
+{
+    (void)context;
+
+    while (1)
+    {
+        os_main_worker_iterations++;
+        os_task_yield();
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Entry for the task whose stack carries attributes: nothing about it differs, which is
+ *        the point - only where its stack sits changed.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
+static void placed_entry(void *context)
+{
+    (void)context;
+
+    while (1)
+    {
+        os_main_placed_iterations++;
+        os_task_yield();
     }
 }

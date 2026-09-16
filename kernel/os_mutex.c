@@ -15,14 +15,13 @@
 
 #include "os_internal.h"
 
-#if (OS_CONFIG_MUTEX_ENABLE == 1U)
-
 /*
  * ***********************************************************************************************************
  * Public function implementations
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_MUTEX_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Initialize a mutex object.
@@ -315,5 +314,4 @@ os_err_t os_mutex_unlock(os_mutex_t *mutex)
 
     return status;
 }
-
 #endif /* OS_CONFIG_MUTEX_ENABLE */

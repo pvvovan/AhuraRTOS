@@ -17,34 +17,44 @@
 
 #include <string.h>
 
-#if (OS_CONFIG_MSG_ENABLE == 1U)
-
-/* WHY THIS IS NOT A QUEUE
- *
- * os_queue's fixed item size is what makes it cheap, and variable-length messages break it: sizing
- * every slot for the longest message a link can carry wastes most of the buffer when the traffic is
- * mostly short, and padding throws away the length the receiver needed.
- *
- * So this is a ring of BYTES, not of slots. Each message is a small length header followed by
- * exactly its own bytes; capacity is stated in bytes and shared, so one buffer holds many short
- * messages or few long ones with no slot count to guess.
- *
- * Two consequences, both handled below rather than hidden: there is no honest "how many messages
- * fit", only free bytes (os_msg_free_get); and a sender woken by a receive may still not fit, so
- * the retry re-tests the condition instead of trusting the wake.
- */
-
 /*
  * ***********************************************************************************************************
  * Private function prototypes
  * ***********************************************************************************************************
 */
 
-static bool   os_msg_sender_match(uint32_t needed, uint32_t unused, void *context, uint32_t *result_out);
-static void   os_msg_ring_write(os_msg_t *msg, const uint8_t *source, size_t length);
-static void   os_msg_ring_read(os_msg_t *msg, uint8_t *destination, size_t length);
-static void   os_msg_length_write(os_msg_t *msg, size_t length);
+#if (OS_CONFIG_MSG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Match a sender against currently free bytes while the caller holds the critical section.
+ */
+static bool os_msg_sender_match(uint32_t needed, uint32_t unused, void *context,
+                                uint32_t *result_out);
+
+/******************************************************************************************************/
+/**
+ * @brief Copy length bytes into the ring at tail, wrapping at most once, and advance tail.
+ */
+static void os_msg_ring_write(os_msg_t *msg, const uint8_t *source, size_t length);
+
+/******************************************************************************************************/
+/**
+ * @brief Copy length bytes out of the ring at head, wrapping at most once, and advance head.
+ */
+static void os_msg_ring_read(os_msg_t *msg, uint8_t *destination, size_t length);
+
+/******************************************************************************************************/
+/**
+ * @brief Write a message's length header into the ring at tail, and advance tail past it.
+ */
+static void os_msg_length_write(os_msg_t *msg, size_t length);
+
+/******************************************************************************************************/
+/**
+ * @brief Read the oldest message's length header WITHOUT consuming it.
+ */
 static size_t os_msg_length_peek(const os_msg_t *msg);
+#endif /* OS_CONFIG_MSG_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -52,6 +62,7 @@ static size_t os_msg_length_peek(const os_msg_t *msg);
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_MSG_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Send one message, waiting up to timeout_ms while it does not fit.
@@ -190,7 +201,8 @@ os_err_t os_msg_send(os_msg_t *msg, const void *data, size_t length, uint32_t ti
  *                    the waiting message; EMPTY when none is waiting and the call may not block;
  *                    TIMEOUT when the wait elapsed with none delivered.
  */
-os_err_t os_msg_receive(os_msg_t *msg, void *data, size_t data_size, size_t *length_out, uint32_t timeout_ms)
+os_err_t os_msg_receive(os_msg_t *msg, void *data, size_t data_size, size_t *length_out,
+                        uint32_t timeout_ms)
 {
     os_err_t status = OS_ERR_INVALID_ARG;
 
@@ -419,12 +431,12 @@ os_err_t os_msg_init_dynamic(os_msg_t *msg, size_t byte_size)
         {
             /* One critical section covers both the initialization and the ownership flag.
              *
-             * Setting buffer_owned in a second, separate critical section would leave the object fully
-             * usable but still claiming it does not own its buffer. An os_msg_cleanup landing in that
-             * gap would empty the buffer and, seeing buffer_owned false, walk away without freeing the
-             * allocation just made - a permanent leak of byte_size bytes with nothing to report it.
-             * The window is only a few instructions wide, which is exactly the kind that survives
-             * testing and fails in the field. */
+             * Setting buffer_owned in a second, separate critical section would leave the object
+             * fully usable but still claiming it does not own its buffer. An os_msg_cleanup landing
+             * in that gap would empty the buffer and, seeing buffer_owned false, walk away without
+             * freeing the allocation just made - a permanent leak of byte_size bytes with nothing
+             * to report it. The window is only a few instructions wide, which is exactly the kind
+             * that survives testing and fails in the field. */
             os_critical_enter();
 
             if ((msg->send_waiters.head != NULL) || (msg->receive_waiters.head != NULL))
@@ -537,6 +549,7 @@ os_err_t os_msg_cleanup(os_msg_t *msg)
 
     return status;
 }
+#endif /* OS_CONFIG_MSG_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -544,6 +557,7 @@ os_err_t os_msg_cleanup(os_msg_t *msg)
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_MSG_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Match a sender against currently free bytes while the caller holds the critical section.
@@ -558,7 +572,8 @@ os_err_t os_msg_cleanup(os_msg_t *msg)
  * @param[out] result_out  Unused wait result, set to zero.
  * @return bool  True when this message fits the current free-space snapshot.
  */
-static bool os_msg_sender_match(uint32_t needed, uint32_t unused, void *context, uint32_t *result_out)
+static bool os_msg_sender_match(uint32_t needed, uint32_t unused, void *context,
+                                uint32_t *result_out)
 {
     const os_msg_t *msg = (const os_msg_t *)context;
 
@@ -681,5 +696,4 @@ static size_t os_msg_length_peek(const os_msg_t *msg)
 
     return length;
 }
-
 #endif /* OS_CONFIG_MSG_ENABLE */

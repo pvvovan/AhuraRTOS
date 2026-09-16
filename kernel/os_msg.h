@@ -13,6 +13,12 @@
 #ifndef OS_MSG_H
 #define OS_MSG_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "os_types.h"
 
 #ifdef __cplusplus
@@ -22,8 +28,12 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Message buffer     - OS_CONFIG_MSG_ENABLE
+ * Macros
  * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_MSG_ENABLE == 1U)
+/* Message buffer     - OS_CONFIG_MSG_ENABLE.
  *
  * A queue for messages whose LENGTH varies. Where os_queue_t stores N items of one fixed size, this
  * stores as many messages as fit in a byte budget, each exactly as long as it is:
@@ -33,13 +43,11 @@ extern "C"
  *     os_msg_receive(&cmd_buf, rx, sizeof(rx), &rx_len, OS_WAIT_FOREVER);
  *
  * Reach for it when the length is data rather than a constant, and for a queue when every item is
- * the same struct. Capacity is in BYTES, and each message costs its own length plus a 2-byte header;
- * os_msg_send() adds that itself and answers OS_ERR_FULL when the message does not fit.
+ * the same struct. Capacity is in BYTES, and each message costs its own length plus a 2-byte
+ * header; os_msg_send() adds that itself and answers OS_ERR_FULL when the message does not fit.
  *
  * Messages arrive whole and in order, one per os_msg_receive(): never a fragment, never two joined.
-*/
-
-#if (OS_CONFIG_MSG_ENABLE == 1U)
+ */
 
 /** Bytes of overhead each stored message carries: its length header.
  *
@@ -60,24 +68,6 @@ extern "C"
  *  which is the same sum in the terms the application already thinks in. Kept because the
  *  kernel's own size checks are written against it. */
 #define OS_MSG_SPACE(length)    ((size_t)(length) + (size_t)OS_MSG_HEADER_BYTES)
-
-/******************************************************************************************************/
-/**
- * @brief Message buffer object: a byte ring carrying whole variable-length messages.
- */
-typedef struct
-{
-    uint8_t   *buffer;
-    size_t    capacity;        /**< Storage in bytes, headers included.          */
-    size_t    head;            /**< Read offset into buffer.                     */
-    size_t    tail;            /**< Write offset into buffer.                    */
-    size_t    used;            /**< Bytes currently in use, headers included.    */
-    size_t    count;           /**< Whole messages currently stored.             */
-    os_list_t send_waiters;    /**< Tasks blocked because the message would not fit. */
-    os_list_t receive_waiters; /**< Tasks blocked because nothing is waiting.    */
-    bool      buffer_owned;    /**< Buffer came from os_msg_init_dynamic: os_msg_cleanup frees it. */
-
-} os_msg_t;
 
 /** Compile-time initializer binding a message buffer to a byte array, shared by the two macros
  *  below so they cannot drift apart. Everything omitted is zero-initialized by the C rules for
@@ -122,13 +112,47 @@ typedef struct
 /** Name a message buffer defined in another file. Only the object crosses; its byte array stays
  *  private to the file that defined it. */
 #define OS_MSG_DECLARE(name)            extern os_msg_t name
+#endif /* OS_CONFIG_MSG_ENABLE */
 
+/*
+ * ***********************************************************************************************************
+ * Types
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_MSG_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Message buffer object: a byte ring carrying whole variable-length messages.
+ */
+typedef struct
+{
+    uint8_t   *buffer;
+    size_t    capacity;        /**< Storage in bytes, headers included.          */
+    size_t    head;            /**< Read offset into buffer.                     */
+    size_t    tail;            /**< Write offset into buffer.                    */
+    size_t    used;            /**< Bytes currently in use, headers included.    */
+    size_t    count;           /**< Whole messages currently stored.             */
+    os_list_t send_waiters;    /**< Tasks blocked because the message would not fit. */
+    os_list_t receive_waiters; /**< Tasks blocked because nothing is waiting.    */
+    bool      buffer_owned;    /**< Buffer came from os_msg_init_dynamic: os_msg_cleanup frees it. */
+
+} os_msg_t;
+#endif /* OS_CONFIG_MSG_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_MSG_ENABLE == 1U)
+#if (OS_CONFIG_ALLOC_ENABLE == 1U)
 /* --- Dynamic storage: the byte buffer comes from the kernel heap ------------------------------ */
 
 /* A dynamic message buffer needs no DEFINE macro either: it is a plain os_msg_t and
  * os_msg_init_dynamic() obtains the storage. That call expects the object zeroed. */
 
-#if (OS_CONFIG_ALLOC_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Initialize a message buffer over storage allocated from the kernel heap, for a capacity
@@ -153,7 +177,8 @@ os_err_t os_msg_send(os_msg_t *msg, const void *data, size_t length, uint32_t ti
  *        too small is OS_ERR_INVALID_ARG with the message left in place and length_out set to the
  *        size it needs - nothing is truncated.
  */
-os_err_t os_msg_receive(os_msg_t *msg, void *data, size_t data_size, size_t *length_out, uint32_t timeout_ms);
+os_err_t os_msg_receive(os_msg_t *msg, void *data, size_t data_size, size_t *length_out,
+                        uint32_t timeout_ms);
 
 /******************************************************************************************************/
 /**
@@ -182,7 +207,6 @@ size_t os_msg_peek_size(const os_msg_t *msg);
  *        usable. Refuses with OS_ERR_BUSY while tasks are blocked on it.
  */
 os_err_t os_msg_cleanup(os_msg_t *msg);
-
 #endif /* OS_CONFIG_MSG_ENABLE */
 
 #ifdef __cplusplus

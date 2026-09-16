@@ -6,9 +6,9 @@
  * COPY THIS ONLY IF YOUR TARGET HAS NO SoC PACKAGE. Every callback here is a fact about the
  * silicon rather than a product decision, so a package under soc/<vendor>/<family>/ already
  * implements the whole group for the parts it covers - see doc/soc.md, which also lists what is
- * packaged today. Selecting one with AHURA_SOC is all that is needed; this file is then not part
- * of the build and must not be copied, because two definitions of one callback is exactly the
- * failure the split exists to prevent.
+ * packaged today. The installers never copy this file, and a project that selects a package with
+ * AHURA_SOC must not either: the callbacks below are defined strong, so a copy next to a package
+ * fails to link with a multiple-definition error naming the callback. That is the point.
  *
  * So this file is the escape hatch that keeps every other MCU supported: an unpackaged part, a
  * custom ASIC, an FPGA soft core. Copy it into the application source tree as soc_cb.c, add
@@ -17,15 +17,17 @@
  * soc.cmake, and it makes the port reusable.
  *
  * Some of these are MANDATORY when their feature is enabled - the kernel declares them and
- * defines nothing, so a missing one is a link error rather than a silently empty hook. Each block
- * below says which it is. The #if guards match the exact condition under which the kernel calls
- * the group, so the file compiles cleanly under any configuration.
+ * defines nothing, so a missing one is a link error rather than a silently empty hook. Each
+ * definition says which it is. The #if guards match the exact condition under which the kernel
+ * calls the group, so the file compiles cleanly under any configuration.
  *
- * Every definition here is WEAK, the same way a vendor startup file marks its interrupt handlers,
- * so a strong definition of any one of them elsewhere in the application wins at link time with
- * no duplicate-symbol error and nothing to delete here. That is the supported way to override one
- * callback of a SoC package while keeping the rest: put the strong definition in the application,
- * where it beats the package's weak one.
+ * Two are weak on purpose: os_tickless_pre_sleep_cb() and os_tickless_post_sleep_cb() are the
+ * application's to replace (doc/tickless.md, "Application hooks"), so a strong definition in its
+ * own sources wins over the defaults here.
+ *
+ * Nothing to implement for the CPU clock: the kernel reads CMSIS SystemCoreClock. A device whose
+ * startup code lacks that symbol defines it anywhere in the application and keeps it current when
+ * the clock tree changes.
  *
  * The application's own callbacks - os_log_output_cb, os_assert_failed_cb, os_stack_overflow_cb -
  * are NOT here. They live in template/os_cb.c, which every project copies.
@@ -34,6 +36,7 @@
  *            SPDX-License-Identifier: GPL-3.0-or-later
  *            See LICENSE in the project root for the full license text.
  */
+
 /*
  * ***********************************************************************************************************
  * Includes
@@ -44,26 +47,7 @@
 
 /*
  * ***********************************************************************************************************
- * Platform clock
- * ***********************************************************************************************************
-*/
-
-/* Nothing to implement here. The kernel reads the CPU frequency straight from the CMSIS
- * SystemCoreClock variable, which the device's SystemInit() sets and SystemCoreClockUpdate()
- * refreshes after every clock-tree change, so a board that boots on an internal oscillator and
- * later switches to a PLL is handled with no kernel involvement.
- *
- * Only devices whose startup code does not provide that symbol need to act, and then only by
- * defining it (anywhere in the application):
- *
- *     uint32_t SystemCoreClock = 120000000U;
- *
- * Keep it updated if the clock tree changes at runtime; the kernel re-reads it on every use.
- */
-
-/*
- * ***********************************************************************************************************
- * Kernel tick source (OS_CONFIG_TICK_SOURCE_EXTERNAL only)
+ * Public function implementations
  * ***********************************************************************************************************
 */
 
@@ -74,23 +58,16 @@
  *        os_tick_handler() OS_CONFIG_TICK_HZ times per second.
  *
  * REQUIRED while OS_CONFIG_TICK_SOURCE is OS_CONFIG_TICK_SOURCE_EXTERNAL: the kernel ships no
- * default, so leaving this out is a link error rather than a kernel whose clock never advances -
- * which presents as every delay, timeout and timer hanging forever, with nothing pointing at the
- * tick as the cause. Delete this block (and set the option back to SYSTICK) to let the port
- * program SysTick itself.
+ * default, so leaving this out is a link error rather than a kernel whose clock never advances.
+ * Delete this block (and set the option back to SYSTICK) to let the port program SysTick itself.
  *
- * Called once from os_init(), after the application has configured its clock tree.
+ * Called once from os_init(), after the application has configured its clock tree. Give the
+ * interrupt it starts the LOWEST priority the device offers, and keep it reachable by the kernel's
+ * mask: with a nonzero OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY, a tick ISR above that threshold is
+ * trapped by os_arch_isr_priority_check the moment it calls into the kernel.
  *
- * Two rules for the interrupt this starts:
- *
- *   1. Give it the LOWEST priority the device offers, which is what the port does for SysTick.
- *      Anything higher lets a tick preempt application interrupts.
- *   2. It must be reachable by the kernel's interrupt mask. With a nonzero
- *      OS_CONFIG_MAX_SYSCALL_IRQ_PRIORITY, a tick ISR above that threshold is trapped by
- *      os_arch_isr_priority_check the moment it calls into the kernel.
- *
- * Example - an RTC/LPTIM-style peripheral, which is the usual reason to be here at all (Nordic
- * nRF5x, and any design whose SysTick stops in the sleep mode it ships with):
+ * Example - an RTC/LPTIM-style peripheral, the usual reason to be here (Nordic nRF5x, and any
+ * design whose SysTick stops in the sleep mode it ships with):
  *
  *     void os_arch_tick_init_cb(void)
  *     {
@@ -104,30 +81,30 @@
  *         my_lptim_flag_clear();
  *         os_tick_handler();
  *     }
+ *
+ * @return None.
  */
-OS_WEAK void os_arch_tick_init_cb(void)
+void os_arch_tick_init_cb(void)
 {
 }
 #endif /* OS_CONFIG_TICK_SOURCE_EXTERNAL */
-
-/*
- * ***********************************************************************************************************
- * TrustZone secure-context management (OS_CONFIG_TRUSTZONE_NON_SECURE only)
- * ***********************************************************************************************************
-*/
 
 #if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
 /******************************************************************************************************/
 /**
  * @brief Bank the secure-side context (secure stack / PSP_S) of the task being switched out.
- *        task_id 0 is the idle task (never owns a secure context). Typically calls a secure
- *        gateway (cmse_nonsecure_entry) provided by the secure firmware.
+ *
+ * Typically calls a secure gateway (cmse_nonsecure_entry) provided by the secure firmware.
  *
  * REQUIRED while OS_CONFIG_TRUSTZONE is OS_CONFIG_TRUSTZONE_NON_SECURE: the kernel ships no
  * default, so leaving this out is a link error rather than tasks switching with their secure
  * state left behind.
+ *
+ * @param[in] task_id  Kernel id of the task being switched out; 0 is the idle task, which never
+ *                     owns a secure context.
+ * @return None.
  */
-OS_WEAK void os_arch_tz_context_save_cb(uint32_t task_id)
+void os_arch_tz_context_save_cb(uint32_t task_id)
 {
     (void)task_id;
 }
@@ -135,50 +112,53 @@ OS_WEAK void os_arch_tz_context_save_cb(uint32_t task_id)
 /******************************************************************************************************/
 /**
  * @brief Restore the secure-side context of the task being switched in.
+ *
+ * REQUIRED on the same terms as os_arch_tz_context_save_cb().
+ *
+ * @param[in] task_id  Kernel id of the task being switched in; 0 is the idle task.
+ * @return None.
  */
-OS_WEAK void os_arch_tz_context_restore_cb(uint32_t task_id)
+void os_arch_tz_context_restore_cb(uint32_t task_id)
 {
     (void)task_id;
 }
 #endif /* OS_CONFIG_TRUSTZONE_NON_SECURE */
 
-/*
- * ***********************************************************************************************************
- * Multi-core SoC glue (OS_CONFIG_CORE_COUNT > 1 only)
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_CORE_COUNT > 1U)
 /******************************************************************************************************/
 /**
- * @brief Return the index of the calling core (0-based). SoC-specific: e.g. SIO CPUID on the RP2040.
+ * @brief Return the index of the calling core, 0-based. SoC-specific: SIO CPUID on the RP2040.
+ *
+ * REQUIRED when OS_CONFIG_CORE_COUNT is above 1.
+ *
+ * @return uint32_t  The calling core's index.
  */
-OS_WEAK uint32_t os_arch_core_id_get_cb(void)
+uint32_t os_arch_core_id_get_cb(void)
 {
     return 0U;
 }
 
+#if (OS_CONFIG_TICKLESS_ENABLE != 1U)
 /******************************************************************************************************/
 /**
- * @brief Interrupt another core so it re-evaluates scheduling. SoC-specific: e.g. the RP2040
- *        inter-core FIFO/doorbell.
+ * @brief Interrupt another core so it re-evaluates scheduling. SoC-specific: the RP2040's
+ *        inter-core FIFO, the RP2350's doorbell.
  *
- * OPTIONAL while ticking is continuous: without an implementation the target core reacts at its own
- * next tick instead, which costs latency and nothing else.
+ * OPTIONAL while ticking is continuous: without an implementation the target core reacts at its
+ * own next tick instead, which costs latency and nothing else.
  *
- * REQUIRED as soon as OS_CONFIG_TICKLESS_ENABLE is on, which is why the default below disappears in
- * that combination and leaving it out becomes a link error naming this symbol. A suppressed window
- * is precisely the absence of a next tick: os_tickless_deadline_armed() (kernel/os_tick.c) has this
- * call and nothing else to pull core 0 out of a window that a deadline armed on another core now
- * falls inside. With an empty body that deadline is simply missed - a 10 ms delay on core 1 taking
- * as long as core 0's window, with nothing anywhere reporting it.
+ * REQUIRED once OS_CONFIG_TICKLESS_ENABLE is on, which is why this stub is not offered in that
+ * combination. A suppressed window is precisely the absence of a next tick, and this call is the
+ * only thing that pulls core 0 out of a window a deadline armed on another core now falls inside.
+ *
+ * @param[in] core_id  Core to interrupt.
+ * @return None.
  */
-#if !((OS_CONFIG_CORE_COUNT > 1U) && (OS_CONFIG_TICKLESS_ENABLE == 1U))
-OS_WEAK void os_arch_core_ipi_request_cb(uint32_t core_id)
+void os_arch_core_ipi_request_cb(uint32_t core_id)
 {
     (void)core_id;
 }
-#endif
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
 
 /******************************************************************************************************/
 /**
@@ -186,9 +166,7 @@ OS_WEAK void os_arch_core_ipi_request_cb(uint32_t core_id)
  *        from 1 to OS_CONFIG_CORE_COUNT-1, with the kernel complete and already running.
  *
  * REQUIRED when OS_CONFIG_CORE_COUNT is above 1: the kernel ships no default, so leaving this out
- * is a link error rather than a second core that silently never starts - which otherwise presents
- * as an application whose tasks simply never get scheduled there, with nothing pointing at the
- * cause.
+ * is a link error rather than a second core that silently never starts.
  *
  * Two things the implementation owes the kernel, in this order:
  *
@@ -197,9 +175,8 @@ OS_WEAK void os_arch_core_ipi_request_cb(uint32_t core_id)
  *   2. Have the core call os_core_start(), which configures its banked per-core state and enters
  *      the scheduler. It does not return.
  *
- * Do NOT start the core any earlier than this callback fires. os_core_start() begins dispatching
- * immediately, so a core released during os_init() would pick from ready lists core 0 is still
- * building.
+ * Do NOT start the core any earlier than this callback fires: os_core_start() begins dispatching
+ * immediately, and a core released during os_init() would pick from ready lists still being built.
  *
  * Example - the RP2040/RP2350, whose SDK boots core 1 onto core 0's vector table for you:
  *
@@ -214,8 +191,11 @@ OS_WEAK void os_arch_core_ipi_request_cb(uint32_t core_id)
  *         (void)core_id;               // only one secondary core on this part
  *         multicore_launch_core1(core1_entry);
  *     }
+ *
+ * @param[in] core_id  Core to start.
+ * @return None.
  */
-OS_WEAK void os_arch_core_launch_cb(uint32_t core_id)
+void os_arch_core_launch_cb(uint32_t core_id)
 {
     (void)core_id;
 }
@@ -225,13 +205,12 @@ OS_WEAK void os_arch_core_launch_cb(uint32_t core_id)
  * @brief Top of the given core's handler (MSP) stack. The first context switch on each core
  *        resets its MSP to this value while abandoning the boot context.
  *
- * REQUIRED when OS_CONFIG_CORE_COUNT is above 1: the kernel ships no default, so leaving this out
- * is a link error rather than a secondary core silently sharing core 0's handler stack - the
- * vector table only ever names core 0's initial stack pointer, and reading it on another core is
- * exactly that failure, with both cores' exception frames overwriting each other.
+ * REQUIRED when OS_CONFIG_CORE_COUNT is above 1: the vector table only names core 0's initial stack
+ * pointer, and a secondary core reading it would share core 0's handler stack, both cores'
+ * exception frames overwriting each other.
  *
- * Return the address a full stack pointer STARTS at (the top of the region, one past its highest
- * byte), from the symbols of the per-core stacks only the linker script knows:
+ * Return the address a full stack pointer STARTS at (one past the region's highest byte), from the
+ * symbols of the per-core stacks only the linker script knows:
  *
  *     uint32_t os_arch_handler_stack_top_cb(uint32_t core_id)
  *     {
@@ -239,25 +218,23 @@ OS_WEAK void os_arch_core_launch_cb(uint32_t core_id)
  *              ? (uint32_t)&__StackOneTop    // one symbol pair per core
  *              : (uint32_t)&__StackTop;
  *     }
+ *
+ * @param[in] core_id  Core whose handler stack is asked for.
+ * @return uint32_t  Top of that core's handler stack.
  */
-OS_WEAK uint32_t os_arch_handler_stack_top_cb(uint32_t core_id)
+uint32_t os_arch_handler_stack_top_cb(uint32_t core_id)
 {
     (void)core_id;
     return 0U;
 }
 
-/* os_arch_handler_stack_limit_cb() is deliberately NOT defined here. The ARMv8-M port ships a
- * weak default for it (the linker's single-stack symbols, correct for core 0, declined for the
- * rest), so a second weak definition in this file would race it at link time with no way to say
- * which won. A multi-core ARMv8-M target OVERRIDES it with a strong definition returning each
- * core's stack bottom, exactly like the top callback above; other ports never call it. */
+/* os_arch_handler_stack_limit_cb() is not offered here: the ARMv8-M port ships a default that is
+ * right for core 0, and a stub would replace it. A multi-core ARMv8-M target defines it, returning
+ * each core's stack bottom; the other ports never call it. */
 
-/* Exactly the condition under which the kernel routes its spinlock through
- * these callbacks (os_arch_port_common.h), so the two can never disagree:
- * cores without LDREX/STREX, plus any core where
- * OS_CONFIG_SPINLOCK_SOC_BACKEND opts out of the built-in backend.
- * Testing OS_ARCH_HAS_EXCLUSIVES alone would miss that second case and leave
- * the opt-out failing at link time. */
+/* The exact condition under which the kernel routes its spinlock through these callbacks
+ * (os_arch_port_common.h): cores without LDREX/STREX, plus any core where
+ * OS_CONFIG_SPINLOCK_SOC_BACKEND opts out of the built-in backend. */
 #if (OS_ARCH_SPINLOCK_USE_CB)
 /******************************************************************************************************/
 /**
@@ -266,43 +243,39 @@ OS_WEAK uint32_t os_arch_handler_stack_top_cb(uint32_t core_id)
  *
  * MANDATORY when the built-in LDREX/STREX backend is unavailable or opted out of: the kernel
  * ships no default, so leaving it out fails at link time.
+ *
+ * @param[in,out] lock  The kernel's spinlock object.
+ * @return None.
  */
-OS_WEAK void os_arch_spinlock_acquire_cb(os_arch_spinlock_t *lock)
+void os_arch_spinlock_acquire_cb(os_arch_spinlock_t *lock)
 {
     (void)lock;
 }
 
 /******************************************************************************************************/
 /**
- * @brief Release the kernel spinlock taken by os_arch_spinlock_acquire_cb. MANDATORY on the same
- *        terms.
+ * @brief Release the kernel spinlock taken by os_arch_spinlock_acquire_cb().
+ *
+ * MANDATORY on the same terms.
+ *
+ * @param[in,out] lock  The kernel's spinlock object.
+ * @return None.
  */
-OS_WEAK void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock)
+void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock)
 {
     (void)lock;
 }
 #endif /* OS_ARCH_SPINLOCK_USE_CB */
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
 
-/*
- * ***********************************************************************************************************
- * Tickless idle hooks (OS_CONFIG_TICKLESS_ENABLE only)
- *
- * Both MANDATORY when tickless idle is on: the kernel declares them and defines neither, so a
- * missing one is a link error. Delete the pair (and this block) when it is off.
- *
- * Worth checking before leaving pre-sleep empty: a vendor HAL driving its own periodic tick from a
- * separate timer wakes the WFI at that timer's period, cutting every suppressed sleep short.
- * Suspending it here and resuming it post-sleep is what makes tickless idle save power.
- *
- * BOTH run with the kernel's interrupts masked, which is what stops an ISR from moving a deadline
- * between the sleep length being decided and the WFI. So polling a hardware flag is fine, but
- * waiting on anything an interrupt must deliver (a DMA callback, HAL_GetTick()) will hang. Keep
- * both short - their duration adds directly to interrupt latency.
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/* The two tickless hooks. MANDATORY to exist while tickless idle is on, since the kernel defines
+ * neither, and weak because they are the application's to replace.
+ *
+ * Both run with the kernel's interrupts masked. Polling a hardware flag is fine; waiting on
+ * anything an interrupt must deliver (a DMA callback, HAL_GetTick()) hangs. Keep both short: their
+ * duration is added to interrupt latency. A vendor HAL driving its own periodic tick is worth
+ * suspending in the pre-sleep hook, or it ends every window at its own period. */
 
 /******************************************************************************************************/
 /**
@@ -310,11 +283,12 @@ OS_WEAK void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock)
  *
  * Empty body = plain SLEEP (SLEEPDEEP left clear): the CPU clock stops but every peripheral clock -
  * UARTs, timers, DMA - keeps running, so nothing needs saving here and os_tickless_post_sleep_cb()
- * has nothing to restore. If a peripheral's completion must be guaranteed before the CPU naps (e.g.
- * flush a debug UART so the last line is fully transmitted), block on its busy/TX-complete flag
- * here. Selecting a deeper mode (STOP/SLEEPDEEP) instead means gated peripheral and system clocks -
- * restore them (and re-run the clock configuration if PLL/HSE were affected) in
- * os_tickless_post_sleep_cb() before anything relies on them again.
+ * has nothing to restore. To guarantee a peripheral finishes before the CPU naps (a debug UART's
+ * last line), block on its busy/TX-complete flag here. A deeper mode (STOP/SLEEPDEEP) gates
+ * peripheral and system clocks: restore them, re-running the clock configuration if PLL/HSE were
+ * affected, in os_tickless_post_sleep_cb() before anything relies on them again.
+ *
+ * @return None.
  */
 OS_WEAK void os_tickless_pre_sleep_cb(void)
 {
@@ -325,9 +299,10 @@ OS_WEAK void os_tickless_pre_sleep_cb(void)
  * @brief Called right after wakeup: clear SLEEPDEEP, restore clocks.
  *
  * Runs with the kernel's interrupts still masked and before the sleep has been announced, so the
- * kernel clock is still short by the whole sleep duration while this executes. Restore hardware
- * here; do not call kernel APIs that block, delay, or read the tick expecting it to be current.
- * Keep it short for the same reason: everything in here is added to interrupt latency.
+ * kernel clock is still short by the whole sleep while this executes. Restore hardware here; do not
+ * call kernel APIs that block, delay, or read the tick expecting it to be current.
+ *
+ * @return None.
  */
 OS_WEAK void os_tickless_post_sleep_cb(void)
 {

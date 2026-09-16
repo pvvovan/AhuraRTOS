@@ -33,15 +33,15 @@
 
 #include <stdio.h>
 
-#if !(OS_CONFIG_ATOMIC_ENABLE == 1U)
-#error "os_main_atomic.c needs OS_CONFIG_ATOMIC_ENABLE=1 in os_config.h"
-#endif
-
 /*
  * ***********************************************************************************************************
  * Macros
  * ***********************************************************************************************************
 */
+
+#if !(OS_CONFIG_ATOMIC_ENABLE == 1U)
+#error "os_main_atomic.c needs OS_CONFIG_ATOMIC_ENABLE=1 in os_config.h"
+#endif
 
 #define INCREMENTS_PER_TASK 20000UL
 #define WRITER_COUNT        2UL
@@ -49,12 +49,6 @@
 /* Bit indices for the flag word below, to show os_atomic_*_bit on a shared set of flags. */
 #define FLAG_FIRST_WRITER_DONE  0U
 #define FLAG_SECOND_WRITER_DONE 1U
-
-/*
- * ***********************************************************************************************************
- * Private objects
- * ***********************************************************************************************************
-*/
 
 /* Every task states its core affinity on a multi-core build: the kernel asks for that argument
  * rather than defaulting it, so the decision is made on purpose at each creation site. These
@@ -65,6 +59,12 @@
 #define EXAMPLE_TASK(entry, context, priority)  \
     OS_TASK_CONFIG((entry), (context), (priority), OS_TASK_CORE_ANY)
 #endif
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
 
 OS_TASK_DEFINE(writer_a, 512U);
 OS_TASK_DEFINE(writer_b, 512U);
@@ -81,31 +81,15 @@ static __IO int32_t os_main_plain_counter = 0;
 
 /*
  * ***********************************************************************************************************
- * Private function implementations
+ * Private function prototypes
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
-static void writer_entry(void *context)
-{
-    uint32_t bit = (uint32_t)(uintptr_t)context;
-    uint32_t i;
-
-    for (i = 0U; i < INCREMENTS_PER_TASK; i++)
-    {
-        /* Indivisible: no other writer can slip between the read and the write. */
-        (void)os_atomic_inc(&os_main_atomic_counter);
-
-        /* Three separate steps, and the scheduler is free to preempt between them. */
-        os_main_plain_counter = os_main_plain_counter + 1;
-    }
-
-    /* Set this writer's completion bit without disturbing the other one's, which a
-     * read-modify-write on a shared flag word could not promise. */
-    os_atomic_set_bit(&os_main_flags, bit);
-
-    (void)os_atomic_inc(&os_main_writers_done);
-}
+/**
+ * @brief Second task: add to the shared atomic counter.
+ */
+static void writer_entry(void *context);
 
 /*
  * ***********************************************************************************************************
@@ -171,4 +155,37 @@ void os_main(void)
     {
         os_delay_ms(1000U);
     }
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Second task: add to the shared atomic counter.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
+static void writer_entry(void *context)
+{
+    uint32_t bit = (uint32_t)(uintptr_t)context;
+    uint32_t i;
+
+    for (i = 0U; i < INCREMENTS_PER_TASK; i++)
+    {
+        /* Indivisible: no other writer can slip between the read and the write. */
+        (void)os_atomic_inc(&os_main_atomic_counter);
+
+        /* Three separate steps, and the scheduler is free to preempt between them. */
+        os_main_plain_counter = os_main_plain_counter + 1;
+    }
+
+    /* Set this writer's completion bit without disturbing the other one's, which a
+     * read-modify-write on a shared flag word could not promise. */
+    os_atomic_set_bit(&os_main_flags, bit);
+
+    (void)os_atomic_inc(&os_main_writers_done);
 }

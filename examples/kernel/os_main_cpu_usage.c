@@ -23,15 +23,15 @@
 
 #include <stdio.h>
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #if !(OS_CONFIG_CPU_USAGE_ENABLE == 1U)
 #error "os_main_cpu_usage.c needs OS_CONFIG_CPU_USAGE_ENABLE=1 in os_config.h"
 #endif
-
-/*
- * ***********************************************************************************************************
- * Private objects
- * ***********************************************************************************************************
-*/
 
 /* Every task states its core affinity on a multi-core build: the kernel asks for that argument
  * rather than defaulting it, so the decision is made on purpose at each creation site. These
@@ -43,34 +43,27 @@
     OS_TASK_CONFIG((entry), (context), (priority), OS_TASK_CORE_ANY)
 #endif
 
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
 OS_TASK_DEFINE(spinner, 512U);
 
 static __IO bool os_main_spin = false;
 
 /*
  * ***********************************************************************************************************
- * Private function implementations
+ * Private function prototypes
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
-static void spinner_entry(void *context)
-{
-    (void)context;
-
-    while (1)
-    {
-        if (os_main_spin)
-        {
-            /* Tight loop: never blocks or yields, so it consumes every tick
-             * the scheduler gives it while os_main is asleep below. */
-        }
-        else
-        {
-            os_delay_ms(20U);
-        }
-    }
-}
+/**
+ * @brief Burn CPU so the load sampler has something to measure.
+ */
+static void spinner_entry(void *context);
 
 /*
  * ***********************************************************************************************************
@@ -100,5 +93,35 @@ void os_main(void)
         os_main_spin = true;
         os_delay_ms(500U);
         printf("[cpu_usage] busy:  %lu%%\r\n", (unsigned long)os_cpu_usage_get());
+    }
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Burn CPU so the load sampler has something to measure.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
+static void spinner_entry(void *context)
+{
+    (void)context;
+
+    while (1)
+    {
+        if (os_main_spin)
+        {
+            /* Tight loop: never blocks or yields, so it consumes every tick
+             * the scheduler gives it while os_main is asleep below. */
+        }
+        else
+        {
+            os_delay_ms(20U);
+        }
     }
 }

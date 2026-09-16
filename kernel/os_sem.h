@@ -13,6 +13,12 @@
 #ifndef OS_SEM_H
 #define OS_SEM_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "os_types.h"
 
 #ifdef __cplusplus
@@ -22,12 +28,11 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Semaphore          - OS_CONFIG_SEM_ENABLE
+ * Types
  * ***********************************************************************************************************
 */
 
 #if (OS_CONFIG_SEM_ENABLE == 1U)
-
 /******************************************************************************************************/
 /**
  * @brief Semaphore object.
@@ -39,7 +44,15 @@ typedef struct
     os_list_t waiters; /**< Tasks blocked waiting for a token. */
 
 } os_sem_t;
+#endif /* OS_CONFIG_SEM_ENABLE */
 
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_SEM_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Initialize a semaphore object.
@@ -57,7 +70,6 @@ os_err_t os_sem_give(os_sem_t *semaphore);
  * @brief Take one token from semaphore, waiting up to timeout_ms when empty.
  */
 os_err_t os_sem_take(os_sem_t *semaphore, uint32_t timeout_ms);
-
 #endif /* OS_CONFIG_SEM_ENABLE */
 
 #ifdef __cplusplus

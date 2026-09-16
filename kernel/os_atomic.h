@@ -13,6 +13,12 @@
 #ifndef OS_ATOMIC_H
 #define OS_ATOMIC_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "os_types.h"
 
 #ifdef __cplusplus
@@ -22,12 +28,22 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Atomics            - OS_CONFIG_ATOMIC_ENABLE
+ * Macros
  * ***********************************************************************************************************
 */
 
 #if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+/** Initializer for an os_atomic_t: static os_atomic_t counter = OS_ATOMIC_INIT(0); */
+#define OS_ATOMIC_INIT(value)  ((os_atomic_t)(value))
+#endif /* OS_CONFIG_ATOMIC_ENABLE */
 
+/*
+ * ***********************************************************************************************************
+ * Types
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Atomic word: the type of every variable the os_atomic_* operations act on.
@@ -37,11 +53,15 @@ extern "C"
  * usual way a counter that "uses atomics" still loses updates.
  */
 typedef int32_t os_atomic_t;
+#endif /* OS_CONFIG_ATOMIC_ENABLE */
 
-/** Initializer for an os_atomic_t: static os_atomic_t counter = OS_ATOMIC_INIT(0); */
-#define OS_ATOMIC_INIT(value)  ((os_atomic_t)(value))
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
+ * ***********************************************************************************************************
+*/
 
-/******************************************************************************************************/
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
 /*
  * Atomic operations on an os_atomic_t (see the type above). Safe from tasks and from ISRs.
  *
@@ -160,7 +180,6 @@ void os_atomic_clear_bit(os_atomic_t *target, uint32_t bit);
  * @brief Set one bit to the given state.
  */
 void os_atomic_set_bit_to(os_atomic_t *target, uint32_t bit, bool value);
-
 #endif /* OS_CONFIG_ATOMIC_ENABLE */
 
 #ifdef __cplusplus

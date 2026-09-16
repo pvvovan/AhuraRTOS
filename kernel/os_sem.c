@@ -15,14 +15,13 @@
 
 #include "os_internal.h"
 
-#if (OS_CONFIG_SEM_ENABLE == 1U)
-
 /*
  * ***********************************************************************************************************
  * Public function implementations
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_SEM_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Initialize a semaphore object.
@@ -180,5 +179,4 @@ os_err_t os_sem_take(os_sem_t *semaphore, uint32_t timeout_ms)
 
     return status;
 }
-
 #endif /* OS_CONFIG_SEM_ENABLE */

@@ -23,15 +23,15 @@
 
 #include <stdio.h>
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #if !(OS_CONFIG_SEM_ENABLE == 1U)
 #error "os_main_sem.c needs OS_CONFIG_SEM_ENABLE=1 in os_config.h"
 #endif
-
-/*
- * ***********************************************************************************************************
- * Private objects
- * ***********************************************************************************************************
-*/
 
 /* Every task states its core affinity on a multi-core build: the kernel asks for that argument
  * rather than defaulting it, so the decision is made on purpose at each creation site. These
@@ -43,29 +43,27 @@
     OS_TASK_CONFIG((entry), (context), (priority), OS_TASK_CORE_ANY)
 #endif
 
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
 OS_TASK_DEFINE(consumer, 512U);
 
 static os_sem_t os_main_sem;
 
 /*
  * ***********************************************************************************************************
- * Private function implementations
+ * Private function prototypes
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
-static void consumer_entry(void *context)
-{
-    (void)context;
-
-    while (1)
-    {
-        if (os_sem_take(&os_main_sem, OS_WAIT_FOREVER) == OS_ERR_NONE)
-        {
-            printf("[semaphore] consumer took a token\r\n");
-        }
-    }
-}
+/**
+ * @brief Wait for a token, then do one unit of work.
+ */
+static void consumer_entry(void *context);
 
 /*
  * ***********************************************************************************************************
@@ -98,5 +96,30 @@ void os_main(void)
             os_delay_ms(200U);
         }
         os_delay_ms(1000U);
+    }
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Wait for a token, then do one unit of work.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
+static void consumer_entry(void *context)
+{
+    (void)context;
+
+    while (1)
+    {
+        if (os_sem_take(&os_main_sem, OS_WAIT_FOREVER) == OS_ERR_NONE)
+        {
+            printf("[semaphore] consumer took a token\r\n");
+        }
     }
 }

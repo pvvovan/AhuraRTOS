@@ -13,6 +13,12 @@
 #ifndef OS_TASK_H
 #define OS_TASK_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "os_types.h"
 
 #ifdef __cplusplus
@@ -22,7 +28,7 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Task declaration macros
+ * Macros
  * ***********************************************************************************************************
 */
 
@@ -69,7 +75,8 @@ extern "C"
 /** Define a task: its handle, its stack, and the storage descriptor tying the two together.
  *
  *  The handle is plain "task_name"; the stack gets "task_name_stack_buf", which nothing should name
- *  by hand. stack_size is in bytes, rounded up to a multiple of 8, at least OS_CONFIG_MIN_STACK_SIZE.
+ *  by hand. stack_size is in bytes, rounded up to a multiple of 8, at least
+ *  OS_CONFIG_MIN_STACK_SIZE.
  *
  *      OS_TASK_DEFINE(worker, 512U);
  *      status = os_task_create(&worker, OS_TASK_CONFIG(worker_entry, NULL, OS_TASK_PRIO_1));
@@ -119,28 +126,30 @@ extern "C"
  *
  *  Initialized positionally: a designated initializer would substitute inside ".entry". */
 #if (OS_CONFIG_CORE_COUNT == 1U)
-#define OS_TASK_CONFIG(entry, context, priority) \
-    &(os_task_config_t) { \
-        (entry), \
-        (context), \
-        (priority), \
-        OS_TASK_CORE_ANY \
+#define OS_TASK_CONFIG(entry, context, priority)                                                   \
+    &(os_task_config_t) {                                                                          \
+        (entry),                                                                                   \
+        (context),                                                                                 \
+        (priority),                                                                                \
+        OS_TASK_CORE_ANY                                                                           \
     }
 #else
-#define OS_TASK_CONFIG(entry, context, priority, core_affinity) \
-    &(os_task_config_t) { \
-        (entry), \
-        (context), \
-        (priority), \
-        (core_affinity) \
+#define OS_TASK_CONFIG(entry, context, priority, core_affinity)                                    \
+    &(os_task_config_t) {                                                                          \
+        (entry),                                                                                   \
+        (context),                                                                                 \
+        (priority),                                                                                \
+        (core_affinity)                                                                            \
     }
 #endif
 
-
 /*
  * ***********************************************************************************************************
- * Tasks
+ * Public function prototypes
  * ***********************************************************************************************************
+*/
+
+/* Tasks.
  *
  * A NULL task handle means THIS TASK wherever one is accepted below, the same shorthand FreeRTOS
  * uses. The exceptions are os_task_create, which needs somewhere to write the new handle, and
@@ -149,7 +158,7 @@ extern "C"
  * os_task_pause and os_task_delete are task-only whatever handle they are given: an interrupt must
  * not tear down the context it is about to return into. NULL is refused with OS_ERR_INVALID_ARG
  * from an ISR and before the first dispatch, since there is no calling task in either case.
-*/
+ */
 
 /******************************************************************************************************/
 /**
@@ -185,7 +194,8 @@ void os_task_yield(void);
 
 /******************************************************************************************************/
 /**
- * @brief Change a task's priority (NULL means the calling task); takes effect immediately, including
+ * @brief Change a task's priority (NULL means the calling task); takes effect immediately,
+ *        including
  *        for a task already queued on a mutex, semaphore, queue or event. Accepts only
  *        OS_TASK_PRIO_1_LOWEST..OS_TASK_PRIO_30_HIGHEST; OS_ERR_BUSY for the idle task and the
  *        kernel's service tasks. A priority-inheritance boost in force is kept - the new value
@@ -222,13 +232,6 @@ bool os_task_current_is_idle(void);
  */
 const char* os_task_name_get(const os_task_t *task);
 
-
-/*
- * ***********************************************************************************************************
- * Stack watermark    - OS_CONFIG_STACK_WATERMARK_ENABLE
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_STACK_WATERMARK_ENABLE == 1U)
 /******************************************************************************************************/
 /**
@@ -237,36 +240,23 @@ const char* os_task_name_get(const os_task_t *task);
 os_err_t os_task_stack_watermark_get(const os_task_t *task, size_t *min_free_bytes);
 #endif /* OS_CONFIG_STACK_WATERMARK_ENABLE */
 
-
-/*
- * ***********************************************************************************************************
- * Stack overflow     - OS_CONFIG_STACK_CHECK_ENABLE
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_STACK_CHECK_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Reported when a task is found to have overrun its stack, at the moment it is switched out.
  *        REQUIRED when OS_CONFIG_STACK_CHECK_ENABLE is 1; the kernel ships no default. The core
- *        parks immediately afterwards, which makes this the only chance to record which task it was.
+ *        parks immediately afterwards, which makes this the only chance to record which task it
+ *        was.
  *
- *        Runs inside PendSV with the kernel's interrupts masked, so it must NOT call any kernel API.
+ *        Runs inside PendSV with the kernel's interrupts masked, so it must NOT call any kernel
+ *        API.
  *
  * @param[in] task_name  Name of the offending task, as given to OS_TASK_DEFINE.
  */
 void os_stack_overflow_cb(const char *task_name);
 #endif /* OS_CONFIG_STACK_CHECK_ENABLE */
 
-
-/*
- * ***********************************************************************************************************
- * Multi-core         - OS_CONFIG_CORE_COUNT > 1
- * ***********************************************************************************************************
-*/
-
 #if (OS_CONFIG_CORE_COUNT > 1U)
-
 /******************************************************************************************************/
 /**
  * @brief Enter the scheduler on a secondary core. Call after os_start() is running on core 0,
@@ -317,7 +307,6 @@ void os_arch_core_launch_cb(uint32_t core_id);
  * Called from task context, late enough that a USB console has been opened and can be read.
  */
 void os_arch_soc_diagnose_cb(void);
-
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
 
 /******************************************************************************************************/

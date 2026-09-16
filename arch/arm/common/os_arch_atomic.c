@@ -31,19 +31,25 @@
  *            See LICENSE in the project root for the full license text.
  */
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #ifndef OS_ARCH_PORT_TRANSLATION_UNIT
 #error "os_arch_atomic.c is a textual include, not a translation unit. Compile arch/<family>/<core>/os_arch_port.c instead - it defines OS_ARCH_PORT_TRANSLATION_UNIT and includes this. See doc/installation.md."
 #endif
 
-
-#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
-
-#if (OS_ARCH_ATOMIC_LOCK_FREE == 1)
-
 /*
  * ***********************************************************************************************************
- * Function implementations - lock-free backend (LDREX/STREX)
+ * Public function implementations
  * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+#if (OS_ARCH_ATOMIC_LOCK_FREE == 1)
+/* Function implementations - lock-free backend (LDREX/STREX).
  *
  * Each operation is a single inline-assembly block: take a reservation on the word, compute from
  * what it held, store only if the reservation survived, and go round again if it did not.
@@ -56,7 +62,7 @@
  *
  * "1:" and "1b" are local numeric labels, so each block stays correct wherever the compiler emits
  * it.
-*/
+ */
 
 /******************************************************************************************************/
 /**
@@ -302,24 +308,19 @@ bool os_arch_atomic_cas(__IO int32_t *target, int32_t expected, int32_t desired)
 
     return (store_failed == 0U);
 }
-
 #else /* OS_ARCH_ATOMIC_LOCK_FREE == 0 */
-
-/*
- * ***********************************************************************************************************
- * Function implementations - critical-section backend
- * ***********************************************************************************************************
+/* Function implementations - critical-section backend.
  *
  * Interference cannot be DETECTED here, so it has to be PREVENTED: each operation runs inside
  * os_critical_enter/exit, which costs the length of the update in interrupt latency and, on
- * multi-core, can wait on unrelated kernel work holding the same lock. Reusing the kernel's critical
- * section rather than a second private lock is deliberate - two locks over the same data is how
- * lock-ordering bugs start. No retry loop is needed, since nothing can interfere while the section
- * is held.
+ * multi-core, can wait on unrelated kernel work holding the same lock. Reusing the kernel's
+ * critical section rather than a second private lock is deliberate - two locks over the same data
+ * is how lock-ordering bugs start. No retry loop is needed, since nothing can interfere while the
+ * section is held.
  *
  * ADD and SUB compute in the unsigned domain and convert back: signed overflow is undefined
  * behaviour, and unsigned wrapping reproduces the same two's-complement pattern anyway.
-*/
+ */
 
 /******************************************************************************************************/
 /**
@@ -503,7 +504,5 @@ bool os_arch_atomic_cas(__IO int32_t *target, int32_t expected, int32_t desired)
 
     return swapped;
 }
-
 #endif /* OS_ARCH_ATOMIC_LOCK_FREE */
-
 #endif /* OS_CONFIG_ATOMIC_ENABLE */

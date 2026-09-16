@@ -17,6 +17,8 @@
 
 #include "os_internal.h"
 
+#include "os_task_internal.h"
+
 /*
  * ***********************************************************************************************************
  * Macros
@@ -60,7 +62,26 @@
  * features cost nothing together. */
 #define OS_TASK_STACK_CANARY         0xA5A5A5A5UL
 
-#include "os_task_internal.h"
+/* Every scheduling core owns one idle task and one current-task slot; the task table and the
+ * ready/delay lists are shared, protected by the critical sections and the kernel spinlock. */
+/* Table slots the kernel reserves for its own service tasks, on top of OS_CONFIG_MAX_USER_TASKS.
+ *
+ * This is what lets OS_CONFIG_MAX_USER_TASKS mean how many of ITS tasks may exist, rather than a
+ * budget shared with whichever kernel services happen to be enabled.
+ *
+ * Exactly one of tsk_main and tsk_test always exists, and each optional service adds one. The idle
+ * tasks are NOT counted: they live in os_task_idle_tcb, outside this table, one per core. */
+#define OS_TASK_SYSTEM_SLOTS  (1U +                                                                \
+                               ((OS_CONFIG_TIMER_ENABLE == 1U) ? 1U : 0U) +                        \
+                                                              ((OS_CONFIG_LOG_ENABLE   == 1U) ? 1U : 0U))
+
+#define OS_TASK_TABLE_SIZE    (OS_CONFIG_MAX_USER_TASKS + OS_TASK_SYSTEM_SLOTS)
+
+/*
+ * ***********************************************************************************************************
+ * Constants
+ * ***********************************************************************************************************
+*/
 
 /* OS_TASK_DEADLOCK_MAX_DEPTH (os_internal.h) bounds how far a wait chain is followed: a cycle
  * that already formed among other tasks would otherwise be walked forever. Eight is far past any
@@ -74,12 +95,9 @@
 OS_STATIC_ASSERT((OS_CONFIG_MIN_STACK_SIZE >= 128U) && ((OS_CONFIG_MIN_STACK_SIZE % 8U) == 0U),
                  "OS_CONFIG_MIN_STACK_SIZE must be at least 128 and a multiple of 8");
 
-/*
- * ***********************************************************************************************************
- * Types
- * ***********************************************************************************************************
-*/
-
+/* The slot has to fit in the byte a task id reserves for it, and slot + 1 must not overflow it. */
+OS_STATIC_ASSERT(OS_TASK_TABLE_SIZE < 255U,
+                 "OS_CONFIG_MAX_USER_TASKS leaves more task slots than a task id can name");
 
 /*
  * ***********************************************************************************************************
@@ -87,28 +105,10 @@ OS_STATIC_ASSERT((OS_CONFIG_MIN_STACK_SIZE >= 128U) && ((OS_CONFIG_MIN_STACK_SIZ
  * ***********************************************************************************************************
 */
 
-/* Every scheduling core owns one idle task and one current-task slot; the task table and the
- * ready/delay lists are shared, protected by the critical sections and the kernel spinlock. */
-/* Table slots the kernel reserves for its own service tasks, on top of OS_CONFIG_MAX_USER_TASKS.
- *
- * This is what lets OS_CONFIG_MAX_USER_TASKS mean how many of ITS tasks may exist, rather than a
- * budget shared with whichever kernel services happen to be enabled.
- *
- * Exactly one of tsk_main and tsk_test always exists, and each optional service adds one. The idle
- * tasks are NOT counted: they live in os_task_idle_tcb, outside this table, one per core. */
-#define OS_TASK_SYSTEM_SLOTS  (1U + \
-                               ((OS_CONFIG_TIMER_ENABLE == 1U) ? 1U : 0U) + \
-                                                              ((OS_CONFIG_LOG_ENABLE   == 1U) ? 1U : 0U))
-
-#define OS_TASK_TABLE_SIZE    (OS_CONFIG_MAX_USER_TASKS + OS_TASK_SYSTEM_SLOTS)
-
-/* The slot has to fit in the byte a task id reserves for it, and slot + 1 must not overflow it. */
-OS_STATIC_ASSERT(OS_TASK_TABLE_SIZE < 255U,
-                 "OS_CONFIG_MAX_USER_TASKS leaves more task slots than a task id can name");
-
 static uint8_t                 os_task_idle_stack[OS_CONFIG_CORE_COUNT][OS_CONFIG_MIN_STACK_SIZE] OS_STACK_ALIGNED;
 static os_task_tcb_t           os_task_idle_tcb[OS_CONFIG_CORE_COUNT];
 static os_task_tcb_t           os_task_table[OS_TASK_TABLE_SIZE];
+
 /* Next generation to hand out for each slot. Per slot rather than global, because that is what
  * lets an id name its slot: a global counter would put an arbitrary number in the bits the slot
  * needs. Starts at 1 so a slot's first id is never all-zero in the generation field either. */
@@ -135,8 +135,8 @@ static os_list_t               os_task_delay_list;
  * the pending flag, and the outermost os_kernel_unlock issues the PendSV
  * the lock swallowed. The flag is also set by the switch path itself, which
  * catches a PendSV that was already pending when the lock was taken. */
-
 #if (OS_CONFIG_TIME_SLICE_TICKS > 0U)
+
 /* Ticks left in the running task's round-robin quantum, per core. Reloaded
  * whenever a task is dispatched and counted down by the tick; an
  * equal-priority peer only takes over once it reaches zero. */
@@ -149,30 +149,127 @@ static __IO uint32_t           os_task_slice_left[OS_CONFIG_CORE_COUNT];
  * ***********************************************************************************************************
 */
 
-static os_err_t      os_task_create_any(os_task_t *task, const os_task_config_t *config, bool system_task);
-static bool          os_task_create_args_ok(const os_task_t *task, const os_task_config_t *config);
+/******************************************************************************************************/
+/**
+ * @brief Resolve a delete request to the TCB it names, or say why it cannot be honoured.
+ */
+static os_err_t os_task_delete_resolve(os_task_t *task, uint32_t core,
+                                       os_task_tcb_t **tcb_out, bool *is_self_out);
+
+/******************************************************************************************************/
+/**
+ * @brief Put a task in the delay list, keyed by how far away its wake-up is.
+ */
+static void os_task_delay_insert(os_task_tcb_t *tcb, uint32_t ticks);
+
+/******************************************************************************************************/
+/**
+ * @brief Take a task out of the delay list, handing its remaining share to whoever follows it.
+ */
+static void os_task_delay_remove(os_task_tcb_t *tcb);
+
+/******************************************************************************************************/
+/**
+ * @brief Whether a create request is well formed, before anything is written.
+ */
+static bool os_task_create_args_ok(const os_task_t *task, const os_task_config_t *config);
+
+/******************************************************************************************************/
+/**
+ * @brief Shared task creation core used by the public and kernel-internal paths.
+ */
+static os_err_t os_task_create_any(os_task_t *task, const os_task_config_t *config,
+                                   bool system_task);
+
 #if (OS_CONFIG_STACK_WATERMARK_ENABLE == 1U)
-static void           os_task_stack_fill(uint8_t *stack_base, size_t stack_bytes);
-#endif
+/******************************************************************************************************/
+/**
+ * @brief Fill a stack with the watermark pattern before its first use.
+ */
+static void os_task_stack_fill(uint8_t *stack_base, size_t stack_bytes);
+#endif /* OS_CONFIG_STACK_WATERMARK_ENABLE */
+
 #if (OS_CONFIG_STACK_CHECK_ENABLE == 1U)
-static void           os_task_stack_guard_set(uint8_t *stack_base);
-static void           os_task_stack_guard_check(const os_task_tcb_t *tcb, const uint32_t *stack_ptr);
-#endif
-static void           os_task_idle_entry(void *context);
-static void           os_task_tcb_clear(os_task_tcb_t *tcb);
+/******************************************************************************************************/
+/**
+ * @brief Write the guard word at the bottom of a task stack.
+ */
+static void os_task_stack_guard_set(uint8_t *stack_base);
+
+/******************************************************************************************************/
+/**
+ * @brief Check a task's stack for overflow at switch-out; never returns if one is found.
+ */
+static void os_task_stack_guard_check(const os_task_tcb_t *tcb, const uint32_t *stack_ptr);
+#endif /* OS_CONFIG_STACK_CHECK_ENABLE */
+
+/******************************************************************************************************/
+/**
+ * @brief Idle task body: wait for interrupts forever.
+ */
+static void os_task_idle_entry(void *context);
+
+/******************************************************************************************************/
+/**
+ * @brief Reset a TCB to the inactive state.
+ */
+static void os_task_tcb_clear(os_task_tcb_t *tcb);
+
+/******************************************************************************************************/
+/**
+ * @brief The TCB that a NULL public handle stands for: the calling task.
+ */
 static os_task_tcb_t* os_task_self_tcb(void);
-static void           os_task_delay_insert(os_task_tcb_t *tcb, uint32_t ticks);
-static void           os_task_delay_remove(os_task_tcb_t *tcb);
-static void           os_task_make_ready(os_task_tcb_t *tcb);
-static void           os_task_unlink(os_task_tcb_t *tcb);
-static void           os_task_wait_node_insert(os_list_t *waiters, os_task_tcb_t *tcb);
-static void           os_task_switch_request(void);
-static void           os_task_preempt_request(const os_task_tcb_t *tcb);
-static uint32_t       os_task_running_core(const os_task_tcb_t *tcb);
-static void           os_task_wake_compensate(os_task_tcb_t *tcb);
-static os_err_t       os_task_delete_resolve(os_task_t *task, uint32_t core,
-                                             os_task_tcb_t **tcb_out, bool *is_self_out);
-static void           os_task_wake_locked(os_task_tcb_t *tcb);
+
+/******************************************************************************************************/
+/**
+ * @brief Queue a task at the tail of its priority's ready list and flag the priority.
+ */
+static void os_task_make_ready(os_task_tcb_t *tcb);
+
+/******************************************************************************************************/
+/**
+ * @brief Remove a task from whatever scheduler list its state implies (no-op when in none).
+ */
+static void os_task_unlink(os_task_tcb_t *tcb);
+
+/******************************************************************************************************/
+/**
+ * @brief Queue a task's wait node in an object's waiter list, priority ordered.
+ */
+static void os_task_wait_node_insert(os_list_t *waiters, os_task_tcb_t *tcb);
+
+/******************************************************************************************************/
+/**
+ * @brief Pend a context switch on the calling core, or remember it when the scheduler is locked.
+ */
+static void os_task_switch_request(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Request a reschedule wherever the given task may run: locally when its affinity
+ *        allows this core, otherwise via IPI to the first core in its mask.
+ */
+static void os_task_preempt_request(const os_task_tcb_t *tcb);
+
+/******************************************************************************************************/
+/**
+ * @brief Shared body of os_task_wake / os_task_wake_tcb: caller already holds whatever
+ *        locking that entry point's contract requires.
+ */
+static void os_task_wake_locked(os_task_tcb_t *tcb);
+
+/******************************************************************************************************/
+/**
+ * @brief Pass on an unconsumed wake before a READY task is suspended or deleted.
+ */
+static void os_task_wake_compensate(os_task_tcb_t *tcb);
+
+/******************************************************************************************************/
+/**
+ * @brief Find the core a task is currently executing on.
+ */
+static uint32_t os_task_running_core(const os_task_tcb_t *tcb);
 
 /*
  * ***********************************************************************************************************
@@ -316,91 +413,91 @@ os_err_t os_task_pause(os_task_t *task)
     }
     else
     {
-    os_critical_enter();
-    core = os_arch_core_id_get();
+        os_critical_enter();
+        core = os_arch_core_id_get();
 
-    if (task == NULL)
-    {
-        tcb = os_task_self_tcb();
-    }
-    else if (task->id == 0U)
-    {
-        status = OS_ERR_INVALID_ARG;
-    }
-    else
-    {
-        tcb = os_task_find_by_id(task->id);
-    }
-
-    if (status == OS_ERR_NONE)
-    {
-        /* The idle task is checked before the NULL case so the two keep the statuses they
-         * always had: BUSY for idle, INVALID_ARG for an unresolvable handle. */
-        if (tcb == &os_task_idle_tcb[core])
+        if (task == NULL)
         {
-            status = OS_ERR_BUSY;
+            tcb = os_task_self_tcb();
         }
-        else if (tcb == NULL)
+        else if (task->id == 0U)
         {
             status = OS_ERR_INVALID_ARG;
         }
-        /* The kernel's own service tasks are off limits, for the same reason the idle task is:
-         * the timer and log APIs are both built on one running, and suspending it turns
-         * every call into a silent no-op that reports success. Kernel code that needs one parked
-         * blocks it from the inside instead. */
-        else if (tcb->system_task)
-        {
-            status = OS_ERR_BUSY;
-        }
         else
         {
-            bool is_self = (tcb == os_task_current[core]);
+            tcb = os_task_find_by_id(task->id);
+        }
 
-            /* A task executing on another core cannot be paused from here: its
-             * context is live over there. */
-            if (!is_self && (os_task_running_core(tcb) < OS_CONFIG_CORE_COUNT))
+        if (status == OS_ERR_NONE)
+        {
+            /* The idle task is checked before the NULL case so the two keep the statuses they
+             * always had: BUSY for idle, INVALID_ARG for an unresolvable handle. */
+            if (tcb == &os_task_idle_tcb[core])
             {
                 status = OS_ERR_BUSY;
             }
-            /* Suspending the CALLING task means switching away from it, which is what
-             * a scheduler lock defers - it would keep running while marked SUSPENDED.
-             * Refused rather than deferred, so the caller learns it happened. Pausing
-             * any OTHER task needs no switch and stays allowed. */
-            else if (is_self && (os_kernel_lock_count[core] != 0U))
+            else if (tcb == NULL)
+            {
+                status = OS_ERR_INVALID_ARG;
+            }
+            /* The kernel's own service tasks are off limits, for the same reason the idle task is:
+             * the timer and log APIs are both built on one running, and suspending it turns every
+             * call into a silent no-op that reports success. Kernel code that needs one parked
+             * blocks it from the inside instead. */
+            else if (tcb->system_task)
             {
                 status = OS_ERR_BUSY;
             }
             else
             {
-                /* This task may be READY only because a give/send/set_bits woke it and
-                 * it has not yet run its retry loop to consume the notification (see
-                 * os_task_wake_compensate): pass the notification on to another waiter
-                 * of the same object before suspending, so it is not silently dropped. */
-                os_task_wake_compensate(tcb);
+                bool is_self = (tcb == os_task_current[core]);
 
-                /* Suspending a task blocked on a primitive reads as a forced (spurious)
-                 * signal, mirroring os_task_wake/os_task_start: on a later os_task_start
-                 * the primitive re-checks its condition instead of misreporting
-                 * OS_ERR_TIMEOUT, even on an OS_WAIT_FOREVER wait. */
-                if (tcb->state == OS_TASK_STATE_BLOCKED)
+                /* A task executing on another core cannot be paused from here: its
+                 * context is live over there. */
+                if (!is_self && (os_task_running_core(tcb) < OS_CONFIG_CORE_COUNT))
                 {
-                    tcb->wait_signaled = true;
+                    status = OS_ERR_BUSY;
                 }
-
-                os_task_unlink(tcb);
-
-                tcb->delay_ticks = 0U;
-                tcb->state       = OS_TASK_STATE_SUSPENDED;
-
-                if (is_self && os_kernel_is_running())
+                /* Suspending the CALLING task means switching away from it, which is what
+                 * a scheduler lock defers - it would keep running while marked SUSPENDED.
+                 * Refused rather than deferred, so the caller learns it happened. Pausing
+                 * any OTHER task needs no switch and stays allowed. */
+                else if (is_self && (os_kernel_lock_count[core] != 0U))
                 {
-                    os_task_switch_request();
+                    status = OS_ERR_BUSY;
+                }
+                else
+                {
+                    /* This task may be READY only because a give/send/set_bits woke it and
+                     * it has not yet run its retry loop to consume the notification (see
+                     * os_task_wake_compensate): pass the notification on to another waiter
+                     * of the same object before suspending, so it is not silently dropped. */
+                    os_task_wake_compensate(tcb);
+
+                    /* Suspending a task blocked on a primitive reads as a forced (spurious)
+                     * signal, mirroring os_task_wake/os_task_start: on a later os_task_start
+                     * the primitive re-checks its condition instead of misreporting
+                     * OS_ERR_TIMEOUT, even on an OS_WAIT_FOREVER wait. */
+                    if (tcb->state == OS_TASK_STATE_BLOCKED)
+                    {
+                        tcb->wait_signaled = true;
+                    }
+
+                    os_task_unlink(tcb);
+
+                    tcb->delay_ticks = 0U;
+                    tcb->state       = OS_TASK_STATE_SUSPENDED;
+
+                    if (is_self && os_kernel_is_running())
+                    {
+                        os_task_switch_request();
+                    }
                 }
             }
         }
-    }
 
-    os_critical_exit();
+        os_critical_exit();
     }
 
     return status;
@@ -413,92 +510,6 @@ os_err_t os_task_pause(os_task_t *task)
  * @param[in,out] task  Task handle, or NULL for the calling task.
  * @return os_err_t    Status code.
  */
-/******************************************************************************************************/
-/**
- * @brief Resolve a delete request to the TCB it names, or say why it cannot be honoured.
- *
- * Split out of os_task_delete so both keep a single exit without a deep staircase. Called with the
- * kernel critical section already held.
- *
- * @param[in]  task         Handle to delete, or NULL for the calling task.
- * @param[in]  core         This core's index.
- * @param[out] tcb_out      The TCB to tear down, written only on success.
- * @param[out] is_self_out  Whether that TCB is the caller's own, written only on success.
- * @return os_err_t  OK when the caller may proceed; INVALID_ARG for a handle that names nothing;
- *                    BUSY for the idle task, a kernel service task, a task running on another
- *                    core, or the caller's own task while the scheduler is locked.
- */
-static os_err_t os_task_delete_resolve(os_task_t *task, uint32_t core,
-                                       os_task_tcb_t **tcb_out, bool *is_self_out)
-{
-    os_err_t       status = OS_ERR_INVALID_ARG;
-    os_task_tcb_t *tcb    = NULL;
-
-    if (task == NULL)
-    {
-        tcb = os_task_self_tcb();
-
-        if (tcb == &os_task_idle_tcb[core])
-        {
-            tcb    = NULL;
-            status = OS_ERR_BUSY;
-        }
-        else if (tcb != NULL)
-        {
-            /* Re-resolve through the table: confirms the running task really owns
-             * a live table slot before its TCB is torn down. */
-            tcb = os_task_find_by_id(tcb->id);
-        }
-        else
-        {
-            /* No calling task to speak of; status stays OS_ERR_INVALID_ARG. */
-        }
-    }
-    else if (task->id != 0U)
-    {
-        tcb = os_task_find_by_id(task->id);
-    }
-    else
-    {
-        /* A handle already cleared by an earlier delete; status stays OS_ERR_INVALID_ARG. */
-    }
-
-    if (tcb != NULL)
-    {
-        bool is_self = (tcb == os_task_current[core]);
-
-        /* See os_task_pause: a kernel service task is not the application's to tear down.
-         * Deleting one would also release its TCB slot and leave the timer/log registries
-         * pointing at a task that no longer exists. */
-        if (tcb->system_task)
-        {
-            status = OS_ERR_BUSY;
-        }
-        /* A task executing on another core cannot be deleted from here: its context is live
-         * over there. */
-        else if (!is_self && (os_task_running_core(tcb) < OS_CONFIG_CORE_COUNT))
-        {
-            status = OS_ERR_BUSY;
-        }
-        /* See os_task_pause: deleting the CALLING task requires switching away from it, and a
-         * locked scheduler cannot. Tearing its TCB down and then letting it run on would be far
-         * worse than refusing. */
-        else if (is_self && (os_kernel_lock_count[core] != 0U))
-        {
-            status = OS_ERR_BUSY;
-        }
-        else
-        {
-            *tcb_out     = tcb;
-            *is_self_out = is_self;
-            status       = OS_ERR_NONE;
-        }
-    }
-
-    return status;
-}
-
-/******************************************************************************************************/
 os_err_t os_task_delete(os_task_t *task)
 {
     /* Task-only, like os_mutex_lock and os_notify_wait. Both of these can end up acting on the
@@ -584,7 +595,8 @@ void os_task_yield(void)
  * effective priority is propagated to any mutex owner this task is waiting behind.
  *
  * @param[in,out] task      Task handle, or NULL for the calling task.
- * @param[in]     priority  New priority: OS_TASK_PRIO_1..OS_TASK_PRIO_30 (or any value in that range).
+ * @param[in]     priority  New priority: OS_TASK_PRIO_1..OS_TASK_PRIO_30 (or any value in that
+ *                          range).
  * @return os_err_t  OK; INVALID_ARG for an unknown handle or an out-of-range priority;
  *                    BUSY for the idle task or a kernel service task.
  */
@@ -893,78 +905,6 @@ bool os_task_tcb_is_blocked(const void *tcb_handle)
     return (((const os_task_tcb_t *)tcb_handle)->state == OS_TASK_STATE_BLOCKED);
 }
 #endif /* OS_CONFIG_NOTIFY_ENABLE */
-
-/******************************************************************************************************/
-/**
- * @brief Put a task in the delay list, keyed by how far away its wake-up is.
- *
- * A DELTA list: kept in wake-up order, each entry holding the ticks it waits AFTER the one in
- * front. Only the head is measured against the present, so the tick decrements ONE entry instead of
- * walking every sleeper. The cost moves to this insert, which is the right trade - a task blocks
- * once per wait, the tick fires a thousand times a second.
- *
- * Deltas rather than absolute wake ticks: nothing here ever compares two times, so there is no wrap
- * to be safe against and no cap on how long a single delay may be. See doc/design.md, "The delay
- * and timer lists".
- *
- * Caller holds a critical section.
- *
- * @param[in,out] tcb    Task to insert; must not already be in the list.
- * @param[in]     ticks  Ticks from now until it should wake. Never OS_WAIT_FOREVER - those sleepers
- *                       are in no list at all.
- * @return None.
- */
-static void os_task_delay_insert(os_task_tcb_t *tcb, uint32_t ticks)
-{
-    os_list_node_t *node      = os_task_delay_list.head;
-    uint32_t        remaining = ticks;
-
-    while (node != NULL)
-    {
-        os_task_tcb_t *entry = OS_TASK_TCB_FROM_NODE(node);
-
-        if (entry->delay_ticks > remaining)
-        {
-            /* We wake first, so this entry now waits only the difference after us. */
-            entry->delay_ticks -= remaining;
-            break;
-        }
-
-        /* It wakes before us: its share of the wait is spent, and what is left is ours. */
-        remaining -= entry->delay_ticks;
-        node        = node->next;
-    }
-
-    tcb->delay_ticks = remaining;
-
-    /* A NULL position appends, which is exactly the "we wake last" case the loop falls out of. */
-    os_list_insert_before(&os_task_delay_list, node, &tcb->state_node);
-}
-
-/******************************************************************************************************/
-/**
- * @brief Take a task out of the delay list, handing its remaining share to whoever follows it.
- *
- * A delta list only means anything as long as the chain of differences is unbroken: an entry
- * removed from the middle was carrying part of the wait of everything behind it, and dropping that
- * silently would wake all of them early by exactly its delta.
- *
- * Caller holds a critical section; the task must be in the list.
- *
- * @param[in,out] tcb  Task to remove.
- * @return None.
- */
-static void os_task_delay_remove(os_task_tcb_t *tcb)
-{
-    os_list_node_t *next = tcb->state_node.next;
-
-    if (next != NULL)
-    {
-        OS_TASK_TCB_FROM_NODE(next)->delay_ticks += tcb->delay_ticks;
-    }
-
-    os_list_remove(&os_task_delay_list, &tcb->state_node);
-}
 
 /******************************************************************************************************/
 /**
@@ -1298,12 +1238,14 @@ void os_task_wait_end_locked(void)
             current->woken_from    = NULL;
     #if (OS_CONFIG_MUTEX_ENABLE == 1U)
             /* Backstop only. Every path that leaves a mutex wait without acquiring calls
-             * os_task_mutex_waiter_depart first, which is what actually releases the boost; this makes
-             * sure no exit route can leave a stale id behind to be spent on the wrong owner later. */
+             * os_task_mutex_waiter_depart first, which is what actually releases the boost; this
+             * makes sure no exit route can leave a stale id behind to be spent on the wrong owner
+             * later. */
             current->pi_owner_id   = 0U;
 
             /* Cleared here rather than in os_mutex.c because every way out of a wait passes through
-             * this call, so no exit path can leave a stale edge behind for a later walk to follow. */
+             * this call, so no exit path can leave a stale edge behind for a later walk to follow.
+             */
             current->blocked_on_mutex = NULL;
             current->blocked_forever  = false;
     #endif
@@ -1945,77 +1887,197 @@ uint32_t* os_task_stack_select_next(void)
     }
     else
     {
-    /* O(1) pick on single-core: the bitmap names the highest non-empty
-     * priority and the FIFO head is the next task (round-robin). On
-     * multi-core builds each list is additionally walked past tasks whose
-     * affinity excludes this core, and past a task still mid-switch-out on
-     * another core (running_core != CORE_COUNT: it was woken here before
-     * that core's os_task_stack_save_current saved its context, so its
-     * stack_ptr is not yet safe to restore from - see the running_core
-     * write there); either skip leaves the bitmap bit set. */
-    bitmap = os_task_ready_bitmap;
-    while (bitmap != 0U)
-    {
-        uint32_t       priority = os_arch_highest_bit_get(bitmap);
-        os_list_t      *list    = &os_task_ready_list[priority];
-        os_list_node_t *node    = list->head;
-
-        while (node != NULL)
+        /* O(1) pick on single-core: the bitmap names the highest non-empty
+         * priority and the FIFO head is the next task (round-robin). On
+         * multi-core builds each list is additionally walked past tasks whose
+         * affinity excludes this core, and past a task still mid-switch-out on
+         * another core (running_core != CORE_COUNT: it was woken here before
+         * that core's os_task_stack_save_current saved its context, so its
+         * stack_ptr is not yet safe to restore from - see the running_core
+         * write there); either skip leaves the bitmap bit set. */
+        bitmap = os_task_ready_bitmap;
+        while (bitmap != 0U)
         {
-            os_task_tcb_t *tcb = OS_TASK_TCB_FROM_NODE(node);
+            uint32_t       priority = os_arch_highest_bit_get(bitmap);
+            os_list_t      *list    = &os_task_ready_list[priority];
+            os_list_node_t *node    = list->head;
+
+            while (node != NULL)
+            {
+                os_task_tcb_t *tcb = OS_TASK_TCB_FROM_NODE(node);
 
 #if (OS_CONFIG_CORE_COUNT > 1U)
-            if ((tcb->core_affinity != OS_TASK_CORE_ANY) &&
-                ((tcb->core_affinity & (1UL << core)) == 0U))
-            {
-                node = node->next;
-                continue;
-            }
+                if ((tcb->core_affinity != OS_TASK_CORE_ANY) &&
+                    ((tcb->core_affinity & (1UL << core)) == 0U))
+                {
+                    node = node->next;
+                    continue;
+                }
 
-            if (tcb->running_core != OS_CONFIG_CORE_COUNT)
-            {
-                node = node->next;
-                continue;
-            }
+                if (tcb->running_core != OS_CONFIG_CORE_COUNT)
+                {
+                    node = node->next;
+                    continue;
+                }
 #endif
 
-            os_list_remove(list, node);
-            if (os_list_is_empty(list))
-            {
-                os_task_ready_bitmap &= ~(1UL << priority);
+                os_list_remove(list, node);
+                if (os_list_is_empty(list))
+                {
+                    os_task_ready_bitmap &= ~(1UL << priority);
+                }
+
+                next = tcb;
+                break;
             }
 
-            next = tcb;
-            break;
+            if (next != &os_task_idle_tcb[core])
+            {
+                break;
+            }
+
+            bitmap &= ~(1UL << priority);
         }
 
-        if (next != &os_task_idle_tcb[core])
-        {
-            break;
-        }
-
-        bitmap &= ~(1UL << priority);
-    }
-
-    next->state           = OS_TASK_STATE_RUNNING;
-    next->running_core     = core;
-    os_task_current[core] = next;
+        next->state           = OS_TASK_STATE_RUNNING;
+        next->running_core     = core;
+        os_task_current[core] = next;
 
 #if (OS_CONFIG_TIME_SLICE_TICKS > 0U)
-    /* A dispatched task starts a fresh quantum. That includes being
-     * re-dispatched immediately (a yield with no peer ready), which is what
-     * makes an explicit yield a genuine restart rather than a way to inherit
-     * the tail of the previous slice. */
-    os_task_slice_left[core] = OS_CONFIG_TIME_SLICE_TICKS;
+        /* A dispatched task starts a fresh quantum. That includes being
+         * re-dispatched immediately (a yield with no peer ready), which is what
+         * makes an explicit yield a genuine restart rather than a way to inherit
+         * the tail of the previous slice. */
+        os_task_slice_left[core] = OS_CONFIG_TIME_SLICE_TICKS;
 #endif
 
-    result = next->stack_ptr;
+        result = next->stack_ptr;
     }
 
     os_critical_multicore_unlock();
     os_arch_kernel_mask_restore(mask_state);
 
     return result;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Find a live task by its ID.
+ *
+ * A slot only counts as live while its state is not INACTIVE, so a recycled or never-created
+ * slot can never be matched by a stale id.
+ *
+ * @param[in] id  Task ID.
+ * @return os_task_tcb_t*  Pointer to the task control block, or NULL if not found.
+ */
+os_task_tcb_t* os_task_find_by_id(uint32_t id)
+{
+    os_task_tcb_t *found = NULL;
+
+    /* Id 0 names nothing, and its slot field would underflow the subtraction below. */
+    if (id != 0U)
+    {
+        uint32_t slot = OS_TASK_ID_SLOT(id);
+
+        /* The slot comes from the id, so a corrupt or forged one has to be bounds-checked before it
+         * indexes anything. Then the full id is compared, not just the slot: that is what makes a
+         * stale handle to a recycled slot resolve to nothing, exactly as the old search did by
+         * failing to find it. A slot only counts as live while its state is not INACTIVE. */
+        if ((slot < OS_TASK_TABLE_SIZE) &&
+            (os_task_table[slot].state != OS_TASK_STATE_INACTIVE) &&
+            (os_task_table[slot].id == id))
+        {
+            found = &os_task_table[slot];
+        }
+    }
+
+    return found;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Change a task's effective (scheduled) priority, moving it between ready-list buckets,
+ *        re-sorting it in any waiter list it is queued on, and requesting a reschedule wherever
+ *        needed - the only correct way to mutate tcb->priority once a task may already be
+ *        READY/RUNNING or blocked on an object. Caller holds a critical section (mutex
+ *        lock/unlock's own).
+ *
+ * @param[in,out] tcb           Task to reprioritize.
+ * @param[in]     new_priority  New effective priority.
+ * @return None.
+ */
+void os_task_effective_priority_set(os_task_tcb_t *tcb, uint32_t new_priority)
+{
+    /* Four mutually exclusive cases over the task's state, so one chain rather than four
+     * blocks that each returned for themselves. Order is unchanged. */
+    if (new_priority == tcb->priority)
+    {
+        /* Already there: nothing to move and nothing to request. */
+    }
+    else if (tcb->state == OS_TASK_STATE_READY)
+    {
+        bool increasing = (new_priority > tcb->priority);
+
+        os_task_unlink(tcb);     /* leaves the OLD priority's bucket  */
+        tcb->priority = new_priority;
+        os_task_make_ready(tcb); /* rejoins at the NEW priority's bucket */
+
+        if (increasing && os_kernel_is_running())
+        {
+            os_task_preempt_request(tcb);
+        }
+    }
+    else if ((tcb->state == OS_TASK_STATE_RUNNING) && (new_priority < tcb->priority) &&
+             os_kernel_is_running())
+    {
+        /* Lowering the priority of a task that is currently executing may
+         * unmask a ready task that now outranks it - nothing else triggers
+         * this check (unlike the READY/boost case, no os_task_preempt_request
+         * call is naturally in the caller's path). */
+        uint32_t core = os_task_running_core(tcb);
+
+        tcb->priority = new_priority;
+
+        if ((core < OS_CONFIG_CORE_COUNT) && (new_priority < OS_TASK_PRIO_MAX))
+        {
+            uint32_t above_mask = ~((1UL << (new_priority + 1U)) - 1U);
+
+            if ((os_task_ready_bitmap & above_mask) != 0U)
+            {
+#if (OS_CONFIG_CORE_COUNT > 1U)
+                if (core == os_arch_core_id_get())
+                {
+                    os_task_switch_request();
+                }
+                else
+                {
+                    os_arch_core_ipi_request_cb(core);
+                }
+#else
+                os_task_switch_request();
+#endif
+            }
+        }
+    }
+    else
+    {
+        /* BLOCKED/SUSPENDED, or RUNNING with an unchanged-relevance change: no
+         * state list to move and no reschedule to request yet - that part takes
+         * effect the next time this task is made ready. */
+        tcb->priority = new_priority;
+
+        /* A waiter list is priority-sorted at insert time, so a task boosted while
+         * it is queued on some other object still sits where its OLD priority put
+         * it: it would be woken after waiters it now outranks, and (since the head
+         * is read as the highest-priority waiter) it would also feed a wrong
+         * recomputed priority back into os_task_mutex_owner_unlink_and_reprioritize.
+         * Re-sorting is a remove and a re-insert at the new position. */
+        if (tcb->wait_list != NULL)
+        {
+            os_list_remove(tcb->wait_list, &tcb->wait_node);
+            os_task_wait_node_insert(tcb->wait_list, tcb);
+        }
+    }
 }
 
 /*
@@ -2026,14 +2088,161 @@ uint32_t* os_task_stack_select_next(void)
 
 /******************************************************************************************************/
 /**
- * @brief Shared task creation core used by the public and kernel-internal paths.
+ * @brief Resolve a delete request to the TCB it names, or say why it cannot be honoured.
  *
- * @param[out] task         Output task handle.
- * @param[in]  config       Task creation configuration.
- * @param[in]  system_task  True for a kernel service task (os_task_create_system): exempt from the
- *                          user priority range, and protected from os_task_pause/os_task_delete.
- * @return os_err_t   Status code.
+ * Split out of os_task_delete so both keep a single exit without a deep staircase. Called with the
+ * kernel critical section already held.
+ *
+ * @param[in]  task         Handle to delete, or NULL for the calling task.
+ * @param[in]  core         This core's index.
+ * @param[out] tcb_out      The TCB to tear down, written only on success.
+ * @param[out] is_self_out  Whether that TCB is the caller's own, written only on success.
+ * @return os_err_t  OK when the caller may proceed; INVALID_ARG for a handle that names nothing;
+ *                    BUSY for the idle task, a kernel service task, a task running on another
+ *                    core, or the caller's own task while the scheduler is locked.
  */
+static os_err_t os_task_delete_resolve(os_task_t *task, uint32_t core,
+                                       os_task_tcb_t **tcb_out, bool *is_self_out)
+{
+    os_err_t       status = OS_ERR_INVALID_ARG;
+    os_task_tcb_t *tcb    = NULL;
+
+    if (task == NULL)
+    {
+        tcb = os_task_self_tcb();
+
+        if (tcb == &os_task_idle_tcb[core])
+        {
+            tcb    = NULL;
+            status = OS_ERR_BUSY;
+        }
+        else if (tcb != NULL)
+        {
+            /* Re-resolve through the table: confirms the running task really owns
+             * a live table slot before its TCB is torn down. */
+            tcb = os_task_find_by_id(tcb->id);
+        }
+        else
+        {
+            /* No calling task to speak of; status stays OS_ERR_INVALID_ARG. */
+        }
+    }
+    else if (task->id != 0U)
+    {
+        tcb = os_task_find_by_id(task->id);
+    }
+    else
+    {
+        /* A handle already cleared by an earlier delete; status stays OS_ERR_INVALID_ARG. */
+    }
+
+    if (tcb != NULL)
+    {
+        bool is_self = (tcb == os_task_current[core]);
+
+        /* See os_task_pause: a kernel service task is not the application's to tear down.
+         * Deleting one would also release its TCB slot and leave the timer/log registries
+         * pointing at a task that no longer exists. */
+        if (tcb->system_task)
+        {
+            status = OS_ERR_BUSY;
+        }
+        /* A task executing on another core cannot be deleted from here: its context is live
+         * over there. */
+        else if (!is_self && (os_task_running_core(tcb) < OS_CONFIG_CORE_COUNT))
+        {
+            status = OS_ERR_BUSY;
+        }
+        /* See os_task_pause: deleting the CALLING task requires switching away from it, and a
+         * locked scheduler cannot. Tearing its TCB down and then letting it run on would be far
+         * worse than refusing. */
+        else if (is_self && (os_kernel_lock_count[core] != 0U))
+        {
+            status = OS_ERR_BUSY;
+        }
+        else
+        {
+            *tcb_out     = tcb;
+            *is_self_out = is_self;
+            status       = OS_ERR_NONE;
+        }
+    }
+
+    return status;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Put a task in the delay list, keyed by how far away its wake-up is.
+ *
+ * A DELTA list: kept in wake-up order, each entry holding the ticks it waits AFTER the one in
+ * front. Only the head is measured against the present, so the tick decrements ONE entry instead of
+ * walking every sleeper. The cost moves to this insert, which is the right trade - a task blocks
+ * once per wait, the tick fires a thousand times a second.
+ *
+ * Deltas rather than absolute wake ticks: nothing here ever compares two times, so there is no wrap
+ * to be safe against and no cap on how long a single delay may be. See doc/design.md, "The delay
+ * and timer lists".
+ *
+ * Caller holds a critical section.
+ *
+ * @param[in,out] tcb    Task to insert; must not already be in the list.
+ * @param[in]     ticks  Ticks from now until it should wake. Never OS_WAIT_FOREVER - those sleepers
+ *                       are in no list at all.
+ * @return None.
+ */
+static void os_task_delay_insert(os_task_tcb_t *tcb, uint32_t ticks)
+{
+    os_list_node_t *node      = os_task_delay_list.head;
+    uint32_t        remaining = ticks;
+
+    while (node != NULL)
+    {
+        os_task_tcb_t *entry = OS_TASK_TCB_FROM_NODE(node);
+
+        if (entry->delay_ticks > remaining)
+        {
+            /* We wake first, so this entry now waits only the difference after us. */
+            entry->delay_ticks -= remaining;
+            break;
+        }
+
+        /* It wakes before us: its share of the wait is spent, and what is left is ours. */
+        remaining -= entry->delay_ticks;
+        node        = node->next;
+    }
+
+    tcb->delay_ticks = remaining;
+
+    /* A NULL position appends, which is exactly the "we wake last" case the loop falls out of. */
+    os_list_insert_before(&os_task_delay_list, node, &tcb->state_node);
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Take a task out of the delay list, handing its remaining share to whoever follows it.
+ *
+ * A delta list only means anything as long as the chain of differences is unbroken: an entry
+ * removed from the middle was carrying part of the wait of everything behind it, and dropping that
+ * silently would wake all of them early by exactly its delta.
+ *
+ * Caller holds a critical section; the task must be in the list.
+ *
+ * @param[in,out] tcb  Task to remove.
+ * @return None.
+ */
+static void os_task_delay_remove(os_task_tcb_t *tcb)
+{
+    os_list_node_t *next = tcb->state_node.next;
+
+    if (next != NULL)
+    {
+        OS_TASK_TCB_FROM_NODE(next)->delay_ticks += tcb->delay_ticks;
+    }
+
+    os_list_remove(&os_task_delay_list, &tcb->state_node);
+}
+
 /******************************************************************************************************/
 /**
  * @brief Whether a create request is well formed, before anything is written.
@@ -2072,7 +2281,17 @@ static bool os_task_create_args_ok(const os_task_t *task, const os_task_config_t
 }
 
 /******************************************************************************************************/
-static os_err_t os_task_create_any(os_task_t *task, const os_task_config_t *config, bool system_task)
+/**
+ * @brief Shared task creation core used by the public and kernel-internal paths.
+ *
+ * @param[out] task         Output task handle.
+ * @param[in]  config       Task creation configuration.
+ * @param[in]  system_task  True for a kernel service task (os_task_create_system): exempt from the
+ *                          user priority range, and protected from os_task_pause/os_task_delete.
+ * @return os_err_t   Status code.
+ */
+static os_err_t os_task_create_any(os_task_t *task, const os_task_config_t *config,
+                                   bool system_task)
 {
     os_err_t  status = OS_ERR_INVALID_ARG;
     uint32_t  index;
@@ -2256,7 +2475,6 @@ static void os_task_stack_guard_check(const os_task_tcb_t *tcb, const uint32_t *
         }
     }
 }
-
 #endif /* OS_CONFIG_STACK_CHECK_ENABLE */
 
 /******************************************************************************************************/
@@ -2323,11 +2541,12 @@ static void os_task_tcb_clear(os_task_tcb_t *tcb)
      * entry function, which os_arch_task_exit_trap turns into exactly the same deletion.
      *
      * Nothing downstream can repair it. Only the owner may unlock a mutex, and that owner no longer
-     * exists, so the object stays locked forever behind an owner_id that resolves to nothing. Worse,
-     * it is invisible to os_task_mutex_deadlock_check: that walk stops at the first unresolvable
-     * owner, because normally an owner that cannot be resolved means there is NO cycle. So every
-     * task queued on that mutex blocks permanently while the one tool built to explain this class of
-     * hang stays silent. It is the only way this kernel stops without saying why.
+     * exists, so the object stays locked forever behind an owner_id that resolves to nothing.
+     * Worse, it is invisible to os_task_mutex_deadlock_check: that walk stops at the first
+     * unresolvable owner, because normally an owner that cannot be resolved means there is NO
+     * cycle. So every task queued on that mutex blocks permanently while the one tool built to
+     * explain this class of hang stays silent. It is the only way this kernel stops without saying
+     * why.
      *
      * An assertion rather than a status, for the usual reason: it is a static mistake in the
      * application - code that took a lock and left without giving it back - not a runtime condition
@@ -2364,23 +2583,13 @@ static void os_task_tcb_clear(os_task_tcb_t *tcb)
 
 /******************************************************************************************************/
 /**
- * @brief Find a live task by its ID.
- *
- * A slot only counts as live while its state is not INACTIVE, so a recycled or never-created
- * slot can never be matched by a stale id.
- *
- * @param[in] id  Task ID.
- * @return os_task_tcb_t*  Pointer to the task control block, or NULL if not found.
- */
-/******************************************************************************************************/
-/**
  * @brief The TCB that a NULL public handle stands for: the calling task.
  *
  * NULL means "this task" across the task API, which needs a calling task to mean. An ISR has none:
  * os_task_current there is merely whichever task the interrupt happened to preempt, so acting on it
- * would hit a plausible but wrong target - silently deleting, pausing or re-prioritising a task that
- * simply had the bad luck to be running. NULL therefore resolves to nothing in interrupt context,
- * and every caller already turns a NULL TCB into OS_ERR_INVALID_ARG.
+ * would hit a plausible but wrong target - silently deleting, pausing or re-prioritising a task
+ * that simply had the bad luck to be running. NULL therefore resolves to nothing in interrupt
+ * context, and every caller already turns a NULL TCB into OS_ERR_INVALID_ARG.
  *
  * Also NULL before the scheduler dispatches a first task, which lands on the same status.
  *
@@ -2389,31 +2598,6 @@ static void os_task_tcb_clear(os_task_tcb_t *tcb)
 static os_task_tcb_t* os_task_self_tcb(void)
 {
     return os_arch_in_isr() ? NULL : os_task_current[os_arch_core_id_get()];
-}
-
-/******************************************************************************************************/
-os_task_tcb_t* os_task_find_by_id(uint32_t id)
-{
-    os_task_tcb_t *found = NULL;
-
-    /* Id 0 names nothing, and its slot field would underflow the subtraction below. */
-    if (id != 0U)
-    {
-        uint32_t slot = OS_TASK_ID_SLOT(id);
-
-        /* The slot comes from the id, so a corrupt or forged one has to be bounds-checked before it
-         * indexes anything. Then the full id is compared, not just the slot: that is what makes a
-         * stale handle to a recycled slot resolve to nothing, exactly as the old search did by
-         * failing to find it. A slot only counts as live while its state is not INACTIVE. */
-        if ((slot < OS_TASK_TABLE_SIZE) &&
-            (os_task_table[slot].state != OS_TASK_STATE_INACTIVE) &&
-            (os_task_table[slot].id == id))
-        {
-            found = &os_task_table[slot];
-        }
-    }
-
-    return found;
 }
 
 /******************************************************************************************************/
@@ -2473,8 +2657,8 @@ static void os_task_unlink(os_task_tcb_t *tcb)
         os_list_remove(tcb->wait_list, &tcb->wait_node);
         tcb->wait_list = NULL;
 #if (OS_CONFIG_MUTEX_ENABLE == 1U)
-        /* Revoke inheritance at the actual departure, including timeouts and forced wakes.
-         * Waiting until the task is dispatched leaves owners boosted by a waiter no longer queued. */
+        /* Revoke inheritance at the actual departure, including timeouts and forced wakes. Waiting
+         * until the task is dispatched leaves owners boosted by a waiter no longer queued. */
         os_task_mutex_waiter_depart_tcb(tcb);
 #endif
     }
@@ -2704,90 +2888,4 @@ static uint32_t os_task_running_core(const os_task_tcb_t *tcb)
     }
 
     return found;
-}
-
-/******************************************************************************************************/
-/**
- * @brief Change a task's effective (scheduled) priority, moving it between ready-list buckets,
- *        re-sorting it in any waiter list it is queued on, and requesting a reschedule wherever
- *        needed - the only correct way to mutate tcb->priority once a task may already be
- *        READY/RUNNING or blocked on an object. Caller holds a critical section (mutex
- *        lock/unlock's own).
- *
- * @param[in,out] tcb           Task to reprioritize.
- * @param[in]     new_priority  New effective priority.
- * @return None.
- */
-void os_task_effective_priority_set(os_task_tcb_t *tcb, uint32_t new_priority)
-{
-    /* Four mutually exclusive cases over the task's state, so one chain rather than four
-     * blocks that each returned for themselves. Order is unchanged. */
-    if (new_priority == tcb->priority)
-    {
-        /* Already there: nothing to move and nothing to request. */
-    }
-    else if (tcb->state == OS_TASK_STATE_READY)
-    {
-        bool increasing = (new_priority > tcb->priority);
-
-        os_task_unlink(tcb);     /* leaves the OLD priority's bucket  */
-        tcb->priority = new_priority;
-        os_task_make_ready(tcb); /* rejoins at the NEW priority's bucket */
-
-        if (increasing && os_kernel_is_running())
-        {
-            os_task_preempt_request(tcb);
-        }
-    }
-    else if ((tcb->state == OS_TASK_STATE_RUNNING) && (new_priority < tcb->priority) &&
-             os_kernel_is_running())
-    {
-        /* Lowering the priority of a task that is currently executing may
-         * unmask a ready task that now outranks it - nothing else triggers
-         * this check (unlike the READY/boost case, no os_task_preempt_request
-         * call is naturally in the caller's path). */
-        uint32_t core = os_task_running_core(tcb);
-
-        tcb->priority = new_priority;
-
-        if ((core < OS_CONFIG_CORE_COUNT) && (new_priority < OS_TASK_PRIO_MAX))
-        {
-            uint32_t above_mask = ~((1UL << (new_priority + 1U)) - 1U);
-
-            if ((os_task_ready_bitmap & above_mask) != 0U)
-            {
-#if (OS_CONFIG_CORE_COUNT > 1U)
-                if (core == os_arch_core_id_get())
-                {
-                    os_task_switch_request();
-                }
-                else
-                {
-                    os_arch_core_ipi_request_cb(core);
-                }
-#else
-                os_task_switch_request();
-#endif
-            }
-        }
-    }
-    else
-    {
-        /* BLOCKED/SUSPENDED, or RUNNING with an unchanged-relevance change: no
-         * state list to move and no reschedule to request yet - that part takes
-         * effect the next time this task is made ready. */
-        tcb->priority = new_priority;
-
-        /* A waiter list is priority-sorted at insert time, so a task boosted while
-         * it is queued on some other object still sits where its OLD priority put
-         * it: it would be woken after waiters it now outranks, and (since the head
-         * is read as the highest-priority waiter) it would also feed a wrong
-         * recomputed priority back into os_task_mutex_owner_unlink_and_reprioritize.
-         * Re-sorting is a remove and a re-insert at the new position. */
-        if (tcb->wait_list != NULL)
-        {
-            os_list_remove(tcb->wait_list, &tcb->wait_node);
-            os_task_wait_node_insert(tcb->wait_list, tcb);
-        }
-    }
 }

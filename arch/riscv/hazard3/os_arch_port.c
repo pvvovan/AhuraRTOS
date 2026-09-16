@@ -14,6 +14,12 @@
  *            See LICENSE in the project root for the full license text.
  */
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #if !defined(__riscv) || (__riscv_xlen != 32)
 #error "arch/riscv/hazard3 is an RV32 port: build it with a 32-bit RISC-V toolchain (-march=rv32...)."
 #endif

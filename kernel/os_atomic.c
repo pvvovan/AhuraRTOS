@@ -32,8 +32,12 @@
 
 /*
  * ***********************************************************************************************************
- * Ordering
+ * Macros
  * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/* Ordering.
  *
  * Atomicity and ORDER are different guarantees, and this file used to give only the first. The
  * asm's "memory" clobber is a COMPILER barrier; the hardware stays free to let another core see
@@ -57,7 +61,7 @@
  *
  * Single-core builds pay nothing: both macros compile away, which matters in a layer this thin.
  */
-#if (OS_CONFIG_CORE_COUNT > 1U)
+
 #define OS_ATOMIC_ORDER_BEFORE()   OS_ARCH_DMB()
 #define OS_ATOMIC_ORDER_AFTER()    OS_ARCH_DMB()
 #else
@@ -66,20 +70,22 @@
 #endif
 
 #if (OS_CONFIG_ATOMIC_ENABLE == 1U)
+/* Number of bits in an os_atomic_t, and so the exclusive upper bound for every bit index. */
+#define OS_ATOMIC_BITS  32U
+#endif /* OS_CONFIG_ATOMIC_ENABLE */
 
 /*
  * ***********************************************************************************************************
- * Macros
+ * Constants
  * ***********************************************************************************************************
 */
 
-/* Number of bits in an os_atomic_t, and so the exclusive upper bound for every bit index. */
-#define OS_ATOMIC_BITS  32U
-
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
 /* The operations below index bits and swap whole words, both of which assume this width, and the
  * port's atomics are declared over a 32-bit word. */
 OS_STATIC_ASSERT(sizeof(os_atomic_t) == 4U,
                  "the atomic operations assume a 32-bit word");
+#endif /* OS_CONFIG_ATOMIC_ENABLE */
 
 /*
  * ***********************************************************************************************************
@@ -87,6 +93,7 @@ OS_STATIC_ASSERT(sizeof(os_atomic_t) == 4U,
  * ***********************************************************************************************************
 */
 
+#if (OS_CONFIG_ATOMIC_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Read the current value.
@@ -539,5 +546,4 @@ void os_atomic_set_bit_to(os_atomic_t *target, uint32_t bit, bool value)
         OS_ATOMIC_ORDER_AFTER();
     }
 }
-
 #endif /* OS_CONFIG_ATOMIC_ENABLE */

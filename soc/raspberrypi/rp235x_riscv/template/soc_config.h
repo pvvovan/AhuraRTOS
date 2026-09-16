@@ -19,8 +19,25 @@
 #ifndef SOC_CONFIG_H
 #define SOC_CONFIG_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 /* The tickless guard must work even when this header is included first. */
 #include "os_config.h"
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
 
 /**
  * Which hardware lock id the kernel takes for its critical sections.
@@ -44,5 +61,9 @@
  * Ignored entirely on a single-core build (OS_CONFIG_CORE_COUNT == 1), where no such core exists.
  */
 #define SOC_CONFIG_HANDLER_STACK_SIZE       1024U
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SOC_CONFIG_H */

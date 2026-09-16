@@ -13,6 +13,12 @@
 #ifndef OS_MEM_H
 #define OS_MEM_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "os_types.h"
 
 #ifdef __cplusplus
@@ -22,12 +28,11 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Kernel heap        - OS_CONFIG_ALLOC_ENABLE
+ * Public function prototypes
  * ***********************************************************************************************************
 */
 
 #if (OS_CONFIG_ALLOC_ENABLE == 1U)
-
 /******************************************************************************************************/
 /**
  * @brief Allocate memory from the kernel heap (8-byte aligned; NULL when exhausted).
@@ -51,7 +56,6 @@ size_t os_mem_free_get(void);
  * @brief Get the smallest amount of free heap ever observed (worst case since boot).
  */
 size_t os_mem_watermark_get(void);
-
 #endif /* OS_CONFIG_ALLOC_ENABLE */
 
 #ifdef __cplusplus

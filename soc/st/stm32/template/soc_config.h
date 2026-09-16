@@ -21,9 +21,14 @@
 #ifndef SOC_CONFIG_H
 #define SOC_CONFIG_H
 
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
 /*
  * ***********************************************************************************************************
- * Tick vector
+ * Macros
  * ***********************************************************************************************************
 */
 
@@ -51,12 +56,6 @@
  */
 #define SOC_CONFIG_SYSTICK_VECTOR           1U
 
-/*
- * ***********************************************************************************************************
- * CPU clock
- * ***********************************************************************************************************
-*/
-
 /**
  * Whether os_arch_soc_init_cb() calls SystemCoreClockUpdate() before the kernel starts
  * (1 = yes, the default).
@@ -71,10 +70,8 @@
  */
 #define SOC_CONFIG_CLOCK_AUTO_UPDATE        1U
 
-/*
- * ***********************************************************************************************************
- * Tickless idle
- * ***********************************************************************************************************
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/* Tickless idle.
  *
  * Everything from here to the end of the file belongs to tickless idle, so it exists only when
  * tickless does: a build with OS_CONFIG_TICKLESS_ENABLE at 0 needs none of it, and is not asked
@@ -82,8 +79,7 @@
  *
  * Testing another config file's option works here because soc_cb.c includes ahura.h before it
  * includes this file.
-*/
-#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+ */
 
 /**
  * Whether the tickless sleep hooks suspend and resume the HAL timebase (1 = yes, the default).
@@ -107,10 +103,7 @@
  */
 #define SOC_CONFIG_TICKLESS_HAL_TICK        1U
 
-/*
- * ***********************************************************************************************************
- * Tickless wake source
- * ***********************************************************************************************************
+/* Tickless wake source.
  *
  * There is nothing to pick: what ends a suppressed window follows from how deep the core sleeps,
  * which is OS_CONFIG_TICKLESS_DEEP_ENABLE in os_config.h.
@@ -134,7 +127,7 @@
  * An RTC wake-up timer is the one thing that would break the tie - it survives Stop as the LPTIM
  * does, and exists on the F series that have no LPTIM at all. It is not implemented here, and it
  * is not listed as an option that would quietly do nothing.
-*/
+ */
 
 /* Which LPTIM, what its NVIC entry and vector are called, and what its source clock runs at. Only
  * read when OS_CONFIG_TICKLESS_DEEP_ENABLE is 1U.
@@ -166,12 +159,6 @@
  * of a folded constant.
  * Values: 0U trust the declared rate, 1U measure it. */
 #define SOC_CONFIG_TICKLESS_LPTIM_CALIBRATE 0U
-
-/*
- * ***********************************************************************************************************
- * Deep sleep entry (OS_CONFIG_TICKLESS_DEEP_ENABLE == 1U only)
- * ***********************************************************************************************************
-*/
 
 /* The Stop entry for this series - the HAL call itself, because ST has no single one across the
  * range and any enum would only be translated back into exactly this. Everything the mode costs
@@ -217,7 +204,10 @@
  * Values: one HAL call with its arguments, no trailing semicolon. Left at the H5's - correct for
  * exactly one series, not for yours. */
 #define SOC_CONFIG_DEEP_SLEEP()             HAL_PWR_EnterSTOPMode(PWR_MAINREGULATOR_ON, PWR_STOPENTRY_WFI)
-
 #endif /* OS_CONFIG_TICKLESS_ENABLE */
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif /* SOC_CONFIG_H */

@@ -24,15 +24,15 @@
 
 #include <stdio.h>
 
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
+
 #if !(OS_CONFIG_MUTEX_ENABLE == 1U)
 #error "os_main_mutex.c needs OS_CONFIG_MUTEX_ENABLE=1 in os_config.h"
 #endif
-
-/*
- * ***********************************************************************************************************
- * Private objects
- * ***********************************************************************************************************
-*/
 
 /* Every task states its core affinity on a multi-core build: the kernel asks for that argument
  * rather than defaulting it, so the decision is made on purpose at each creation site. These
@@ -44,6 +44,12 @@
     OS_TASK_CONFIG((entry), (context), (priority), OS_TASK_CORE_ANY)
 #endif
 
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
 OS_TASK_DEFINE(worker, 512U);
 
 static os_mutex_t        os_main_mutex;
@@ -52,38 +58,16 @@ static __IO bool     os_main_worker_done  = false;
 
 /*
  * ***********************************************************************************************************
- * Private function implementations
+ * Private function prototypes
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
-static void worker_entry(void *context)
-{
-    uint32_t i;
-
-    (void)context;
-
-    for (i = 0U; i < 5U; i++)
-    {
-        if (os_mutex_lock(&os_main_mutex, OS_WAIT_FOREVER) == OS_ERR_NONE)
-        {
-            uint32_t value = os_main_shared_value;
-
-            printf("[mutex] worker  read=%lu\r\n", (unsigned long)value);
-            os_delay_ms(10U); /* widen the window: a broken mutex would let os_main interleave here */
-            os_main_shared_value = value + 1U;
-            (void)os_mutex_unlock(&os_main_mutex);
-        }
-        os_delay_ms(5U);
-    }
-
-    os_main_worker_done = true;
-
-    while (1)
-    {
-        os_task_yield();
-    }
-}
+/**
+ * @brief Worker entry: runs at a HIGHER priority than os_main, so the only thing that can keep it
+ *        off the CPU is the scheduler lock.
+ */
+static void worker_entry(void *context);
 
 /*
  * ***********************************************************************************************************
@@ -134,5 +118,46 @@ void os_main(void)
     while (1)
     {
         os_delay_ms(1000U);
+    }
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Worker entry: runs at a HIGHER priority than os_main, so the only thing that can keep it
+ *        off the CPU is the scheduler lock.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
+static void worker_entry(void *context)
+{
+    uint32_t i;
+
+    (void)context;
+
+    for (i = 0U; i < 5U; i++)
+    {
+        if (os_mutex_lock(&os_main_mutex, OS_WAIT_FOREVER) == OS_ERR_NONE)
+        {
+            uint32_t value = os_main_shared_value;
+
+            printf("[mutex] worker  read=%lu\r\n", (unsigned long)value);
+            os_delay_ms(10U); /* widen the window: a broken mutex would let os_main interleave here */
+            os_main_shared_value = value + 1U;
+            (void)os_mutex_unlock(&os_main_mutex);
+        }
+        os_delay_ms(5U);
+    }
+
+    os_main_worker_done = true;
+
+    while (1)
+    {
+        os_task_yield();
     }
 }

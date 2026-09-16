@@ -757,7 +757,7 @@ is for.
 | `No os_config.h found` | Step 2 missed, or `OS_CONFIG_DIR` does not point at it |
 | `soc_config.h: No such file` | The package's `soc_config.h` was not copied - it is required |
 | `multiple definition of 'os_arch_core_id_get_cb'` (or another SoC callback) | `template/soc_cb.c` was copied as well. Delete it: the package is that file |
-| Every core reports id 0 on SMP | The same thing, but with a *weak* stub, so it linked silently. Delete `soc_cb.c` |
+| Every core reports id 0 on SMP | A copy of `template/soc_cb.c` from before its callbacks were strong, which linked silently. Delete `soc_cb.c` |
 | `undefined reference to 'os_main'` | `os_main.c` is not in the application build (step 3) |
 | Runs, but the tick never fires | `SOC_CONFIG_SYSTICK_VECTOR` is `0` and nothing defines `isr_systick` |
 

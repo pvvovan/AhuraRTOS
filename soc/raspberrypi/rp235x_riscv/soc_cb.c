@@ -10,14 +10,24 @@
  * different bit, and both callbacks are one line. The datasheet settles the race too: set beats
  * clear on the same cycle, so a request arriving while the handler acknowledges is never lost.
  *
- * The tick comes in as external IRQ 29, not mip.MTIP, and that is not a preference: os_arch_in_isr()
- * reads Hazard3's meicontext, which knows about external IRQs and nothing about MTIP. A tick on
- * cause 7 would run with the kernel believing it was in task context.
+ * The tick comes in as external IRQ 29, not mip.MTIP, and that is not a preference:
+ * os_arch_in_isr() reads Hazard3's meicontext, which knows about external IRQs and nothing about
+ * MTIP. A tick on cause 7 would run with the kernel believing it was in task context.
+ *
+ * Tickless idle has no wake source to choose: LIGHT pushes mtimecmp out, and DEEP stops the PLL
+ * mtime counts from, so the window moves to the POWMAN timer in the always-on domain - the source
+ * the Arm package uses at either depth, shared from ../common.
  *
  * @copyright (c) 2026 Ahura Project Contributors
  *            SPDX-License-Identifier: GPL-3.0-or-later
  *            See LICENSE in the project root for the full license text.
  */
+
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
 
 #include "ahura.h"
 #include "os_arch_port.h"
@@ -28,22 +38,81 @@
 
 #include "hardware/clocks.h"
 #include "hardware/irq.h"
+#include "hardware/riscv_platform_timer.h"
 #include "hardware/structs/clocks.h"
 #include "hardware/structs/pll.h"
-#include "hardware/riscv_platform_timer.h"
 #include "hardware/structs/sio.h"
 #include "hardware/sync.h"
 #include "pico/multicore.h"
 #include "pico/time.h"
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+#if (OS_CONFIG_TICKLESS_DEEP_ENABLE == 1U)
+/* Only the deep path needs these: the POWMAN wake source, and the walk that checks nothing else
+ * is mid-transfer before the shared clocks stop. Both are shared with the Arm package and included
+ * rather than compiled, so a LIGHT build carries neither. */
+#include "soc_powman.h"
+#include "soc_sleep.h"
+#endif
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Macros
+ * ***********************************************************************************************************
+*/
 
 /* SIO_RISCV_SOFTIRQ bit positions, from the RP2350 datasheet. Named here rather than taken from the
  * SDK's regs header so the intent is readable at the point of use. */
 #define SOC_SOFTIRQ_SET(core)   (1UL << (core))
 #define SOC_SOFTIRQ_CLR(core)   (1UL << ((core) + 8U))
 
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+#if (OS_CONFIG_TICKLESS_DEEP_ENABLE == 1U)
 #if (OS_CONFIG_CORE_COUNT > 1U)
-static void soc_core1_entry(void);
+/* An idle peer normally acknowledges in a few microseconds. Never wait indefinitely for a preempted
+ * idle callback or a core which is busy. Nothing has been slowed yet at this point. */
+#define SOC_SLEEP_RENDEZVOUS_US     100U
+#endif
 
+/** The scheduler's own request: mip.MSIP, bit 3. */
+#define SOC_SLEEP_MIP_SWI           (1UL << 3)
+
+/** Bound on soc_sleep_swi_retire()'s loop: the bit clears in a handful of cycles, and a bound only
+ *  stops a core that cannot clear it at all from holding the idle path forever. */
+#define SOC_SLEEP_SWI_POLLS         64U
+#endif /* OS_CONFIG_TICKLESS_DEEP_ENABLE */
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Constants
+ * ***********************************************************************************************************
+*/
+
+/** Referenced by nothing, and that is its entire job.
+ *
+ *  A static archive gives up an object only while the link still has an undefined symbol it
+ *  defines. Nothing here qualifies: every callback this package supplies has a weak default in the
+ *  kernel or the port, so the linker has no reason to extract the object and the whole package
+ *  loses to those defaults - silently. On this part that costs the mtimecmp tick and the tickless
+ *  wake source together.
+ *
+ *  It stayed hidden here for the same reason it did in soc/st/stm32: os_tick.c references
+ *  os_tickless_pre_sleep_cb, the kernel ships no default for it, and that one undefined symbol
+ *  dragged the object in by accident on every build that happened to enable tickless.
+ *
+ *  soc.cmake names this in a -u link option, which is what forces the extraction. Unconditional on
+ *  purpose: a symbol behind the same #if as the things it rescues would disappear with them. */
+const uint32_t soc_rp235x_riscv_anchor = 0U;
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
 /* Set by core 1 as its first act, read by os_arch_soc_diagnose_cb() on core 0. A flag rather than
  * a printf: the SDK's stdio takes a mutex that core 0 holds almost continuously while producing
  * output, so printing from core 1 would not report progress - it would block the core being
@@ -51,9 +120,149 @@ static void soc_core1_entry(void);
 static __IO uint8_t soc_core_reached = 0xFFU;
 #endif
 
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/* One trap stack per secondary core. Core 0 keeps the stack the linker script gave it; every other
+ * core needs one the port can point at, because nothing in the SDK reserves one for a core the
+ * kernel started itself. */
+static uint8_t soc_handler_stack[OS_CONFIG_CORE_COUNT - 1U][SOC_CONFIG_HANDLER_STACK_SIZE]
+    __attribute__((aligned(16)));
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+/* Counts of mtime per kernel tick, computed once when the tick is programmed. */
+static uint32_t soc_tick_interval;
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+#if (OS_CONFIG_TICKLESS_DEEP_ENABLE == 0U)
+/* Tickless idle.
+ *
+ * mtime free-runs at clk_sys and mtimecmp is an absolute deadline, so a suppressed window is one
+ * write: put the next interrupt N tick periods out instead of one. The port cannot do it because
+ * the privileged spec never says where these registers live; this package can.
+ */
+
+/** Deadline of the tick that would have fired next, captured when the window opened. */
+static uint64_t soc_tickless_base;
+
+/** Ticks the kernel asked to skip, so the report can be clamped to what was actually promised. */
+static uint32_t soc_tickless_planned;
+#else /* OS_CONFIG_TICKLESS_DEEP_ENABLE == 1U */
+/* Deep sleep.
+ *
+ * The mechanism is the Arm package's, because it is the chip's rather than the core's: clk_sys is
+ * dropped back onto clk_ref, PLL_SYS is powered down, and POWMAN wakes the core. Three things had
+ * to be said differently here, and none of them is the sleep itself.
+ *
+ * PRIMASK becomes mstatus.MIE, through the kernel's own mask API - RISC-V has no priority threshold
+ * to leave alone, so there is nothing for a raw register write to protect.
+ *
+ * The pending-work test becomes mip & mie. On the Arm side that is ICSR for the scheduler
+ * exceptions plus NVIC pending-and-enabled; here the scheduler's own request IS an interrupt
+ * (MSIP, from SIO's per-core softirq), so one masked read covers both.
+ *
+ * SEVONPEND and SLEEPDEEP map onto Hazard3's xh3pwr extension rather than onto nothing. SLEEPDEEP
+ * only told the Arm core what to do on WFI - the clocks are stopped by writing the clock
+ * registers, which is architecture-neutral - and the event register the Arm package uses for the
+ * core-1 rendezvous has an exact counterpart here: h3.block / h3.unblock, the OS_ARCH_WFE() /
+ * OS_ARCH_SEV() the port supplies. A block wakes on an unblock event, and an unblock received
+ * since the last block is latched, closing the same release-versus-block race SEV/WFE closes.
+ *
+ * What the rendezvous must NOT do on this core is use MSIP for the park or its release. Here the
+ * context-switch request and the cross-core doorbell are the same level-sensitive interrupt, so
+ * a release sent that way arrives on core 1 indistinguishable from a reschedule - its parked
+ * work test sees "work", aborts with an IPI of its own back to core 0, and core 0's MSIP then
+ * stands for the whole masked window, where nothing can take the trap that would clear it. Every
+ * subsequent WFI returns on the spot, every window measures zero, and the collapsed windows keep
+ * the two cores in that phase against each other. h3.unblock carries no interrupt state at all,
+ * which is why the park, the request and the release below all go through it, and MSIP is left
+ * with its one real job.
+ */
+
+/* The owner alone writes these. The kernel pairs prepare/finish outside its global lock and holds
+ * its scheduling mask across the pair. */
+static uint32_t soc_sleep_owner_mask = 0U;
+static bool     soc_sleep_owner_held = false;
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/* Each shared word has exactly one writer, ordered with a fence; no kernel API, SDK lock or
+ * hardware spinlock is used while either core is parked. Generation zero means released, and a new
+ * request is never issued until the old acknowledgement is cleared, so even a wrap cannot let a
+ * late acknowledgement authorize another sleep. */
+static __IO uint32_t soc_sleep_request    = 0U;   /* core 0 writes */
+static __IO uint32_t soc_sleep_ack        = 0U;   /* core 1 writes */
+static __IO uint32_t soc_sleep_abort      = 0U;   /* core 1 writes */
+static __IO uint32_t soc_sleep_peer_idle  = 0U;   /* core 1 writes, advisory only */
+static uint32_t      soc_sleep_generation = 0U;
+#endif
+#endif /* OS_CONFIG_TICKLESS_DEEP_ENABLE */
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
+
 /*
  * ***********************************************************************************************************
- * The context-switch request
+ * Private function prototypes
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/******************************************************************************************************/
+/**
+ * @brief Check that mhartid really is this core's index, once, at boot.
+ */
+static void soc_core_id_verify(void);
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+/******************************************************************************************************/
+/**
+ * @brief Tick vector: advance the kernel clock and re-arm the comparator.
+ */
+static void soc_tick_isr(void);
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+#if (OS_CONFIG_TICKLESS_DEEP_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Pending work on this core. Never clears a source.
+ */
+static bool soc_sleep_work_pending_ex(bool swi_matters);
+
+/******************************************************************************************************/
+/**
+ * @brief Retire a scheduler request that has already been overtaken, just before sleeping.
+ */
+static void soc_sleep_swi_retire(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Pending work, a standing scheduler request included.
+ */
+static bool soc_sleep_work_pending(void);
+
+/******************************************************************************************************/
+/**
+ * @brief Cancel or release the peer, then return the owner's saved interrupt state.
+ */
+static void soc_sleep_release(void);
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/******************************************************************************************************/
+/**
+ * @brief Cooperatively park core 1 from idle, so clk_sys may be stopped under both cores.
+ */
+static void soc_sleep_peer_park(void);
+#endif
+#endif /* OS_CONFIG_TICKLESS_DEEP_ENABLE */
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/******************************************************************************************************/
+/**
+ * @brief Core 1's entry point: clear this core's software-interrupt bit, then enter the scheduler.
+ */
+static void soc_core1_entry(void);
+#endif
+
+/*
+ * ***********************************************************************************************************
+ * Public function implementations
  * ***********************************************************************************************************
 */
 
@@ -79,7 +288,6 @@ void os_arch_swi_clear_cb(void)
 }
 
 #if (OS_CONFIG_CORE_COUNT > 1U)
-
 /******************************************************************************************************/
 /**
  * @brief Interrupt another core so it re-evaluates scheduling.
@@ -98,37 +306,13 @@ void os_arch_core_ipi_request_cb(uint32_t core_id)
 /******************************************************************************************************/
 /**
  * @brief This core's index, from SIO's CPUID.
+ *
+ * @return uint32_t  The calling core's index.
  */
 uint32_t os_arch_core_id_get_cb(void)
 {
     return (uint32_t)get_core_num();
 }
-
-#if (OS_CONFIG_CORE_COUNT > 1U)
-/******************************************************************************************************/
-/**
- * @brief Check that mhartid really is this core's index, once, at boot.
- *
- * soc.cmake tells the port that it is (OS_CONFIG_ARCH_CORE_ID_MHARTID), which turns every core-id
- * read in the kernel into a single inline CSR instruction. That claim is worth one compare per core
- * to stand behind: were it ever wrong, every per-core structure the kernel owns - the critical
- * nesting counts, the saved masks, os_task_current[], the idle tasks - would be indexed with the
- * wrong core's number, and nothing downstream could notice. It is the same bargain
- * OS_CONFIG_ARCH_VECTOR_CHECK makes, and it gets the same answer: park where a debugger lands on
- * the cause instead of running on wrong.
- *
- * Unconditional rather than an OS_ASSERT. A build with assertions compiled out is exactly the one
- * that can least afford to be quietly wrong about which core it is running on, and the cost is a
- * CSR read, a load and a branch that happen once.
- */
-static void soc_core_id_verify(void)
-{
-    if (OS_ARCH_CSR_READ(mhartid) != (uint32_t)get_core_num())
-    {
-        os_arch_config_fault_trap();
-    }
-}
-#endif
 
 /******************************************************************************************************/
 /**
@@ -148,15 +332,12 @@ void os_arch_core_launch_cb(uint32_t core_id)
 #endif
 }
 
-/* One trap stack per secondary core. Core 0 keeps the stack the linker script gave it; every other
- * core needs one the port can point at, because nothing in the SDK reserves one for a core the
- * kernel started itself. */
-static uint8_t soc_handler_stack[OS_CONFIG_CORE_COUNT - 1U][SOC_CONFIG_HANDLER_STACK_SIZE]
-    __attribute__((aligned(16)));
-
 /******************************************************************************************************/
 /**
  * @brief Top of the trap stack for the given core.
+ *
+ * @param[in] core_id  Core whose trap stack is asked for; core 0 keeps the linker's stack.
+ * @return uint32_t  One past the highest byte of that core's trap stack, or 0 for core 0.
  */
 uint32_t os_arch_handler_stack_top_cb(uint32_t core_id)
 {
@@ -173,6 +354,9 @@ uint32_t os_arch_handler_stack_top_cb(uint32_t core_id)
 /******************************************************************************************************/
 /**
  * @brief Limit of the trap stack for the given core.
+ *
+ * @param[in] core_id  Core whose trap stack is asked for; core 0 keeps the linker's stack.
+ * @return uint32_t  Lowest address of that core's trap stack, or 0 for core 0.
  */
 uint32_t os_arch_handler_stack_limit_cb(uint32_t core_id)
 {
@@ -185,12 +369,6 @@ uint32_t os_arch_handler_stack_limit_cb(uint32_t core_id)
 
     return limit;
 }
-
-/*
- * ***********************************************************************************************************
- * Spinlock
- * ***********************************************************************************************************
-*/
 
 /******************************************************************************************************/
 /**
@@ -212,6 +390,9 @@ void os_arch_spinlock_acquire_cb(os_arch_spinlock_t *lock)
 /******************************************************************************************************/
 /**
  * @brief Release the kernel's cross-core lock.
+ *
+ * @param[in,out] lock  Unused; the hardware lock is the one named by SOC_CONFIG_SPINLOCK_ID.
+ * @return None.
  */
 void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock)
 {
@@ -219,14 +400,7 @@ void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock)
 
     spin_unlock_unsafe(spin_lock_instance(SOC_CONFIG_SPINLOCK_ID));
 }
-
 #endif /* OS_CONFIG_CORE_COUNT > 1U */
-
-/*
- * ***********************************************************************************************************
- * Clock
- * ***********************************************************************************************************
-*/
 
 /******************************************************************************************************/
 /**
@@ -234,102 +408,16 @@ void os_arch_spinlock_release_cb(os_arch_spinlock_t *lock)
  *
  * Read live rather than cached, so a set_sys_clock_khz() before os_init() comes out right without
  * the application having to tell the kernel about it.
+ *
+ * @return uint32_t  clk_sys in Hz.
  */
 uint32_t os_arch_clock_hz_get(void)
 {
     return (uint32_t)clock_get_hz(clk_sys);
 }
 
-/*
- * ***********************************************************************************************************
- * Tick
- * ***********************************************************************************************************
-*/
-
-/* Counts of mtime per kernel tick, computed once when the tick is programmed. */
-static uint32_t soc_tick_interval;
-
-/******************************************************************************************************/
-/**
- * @brief Tick vector: advance the kernel clock and re-arm the comparator.
- *
- * mtimecmp is a comparator, not a reload register - the interrupt stays asserted while
- * mtime >= mtimecmp - so pushing it forward is what acknowledges the interrupt. Advancing it by a
- * fixed interval from its PREVIOUS value rather than from the current mtime keeps the tick free of
- * drift: any latency in reaching this handler is absorbed rather than added to the next period.
- */
-static void soc_tick_isr(void)
-{
-    riscv_timer_set_mtimecmp(riscv_timer_get_mtimecmp() + (uint64_t)soc_tick_interval);
-
-    os_tick_handler();
-}
-
-/** Referenced by nothing, and that is its entire job.
- *
- *  A static archive gives up an object only while the link still has an undefined symbol it
- *  defines. Nothing here qualifies: every callback this package supplies has a weak default in the
- *  kernel or the port, so the linker has no reason to extract the object and the whole package
- *  loses to those defaults - silently. On this part that costs the mtimecmp tick and the tickless
- *  wake source together.
- *
- *  It stayed hidden here for the same reason it did in soc/st/stm32: os_tick.c references
- *  os_tickless_pre_sleep_cb, the kernel ships no default for it, and that one undefined symbol
- *  dragged the object in by accident on every build that happened to enable tickless.
- *
- *  soc.cmake names this in a -u link option, which is what forces the extraction. Unconditional on
- *  purpose: a symbol behind the same #if as the things it rescues would disappear with them. */
-const uint32_t soc_rp235x_riscv_anchor = 0U;
-
 #if (OS_CONFIG_TICKLESS_ENABLE == 1U)
-
-/*
- * ***********************************************************************************************************
- * Configuration rules
- * ***********************************************************************************************************
- *
- * Build failures rather than run-time zeros. Every way this can be set wrong fails SILENTLY on the
- * board - a window that never suppresses, a core that never wakes - and a silent fault here is
- * expensive to find. A refused build naming the settings that disagree costs nothing to read.
-*/
-
-/* No wake source to choose: the depth decides it. LIGHT keeps the clocks running, so mtime is
- * still counting and takes the window; DEEP gates them, and only POWMAN would survive that.
- *
- * It used to be five flags plus the mode, with an arithmetic rule saying exactly one flag had to
- * be 1, another naming the sources this chip does not physically have, and a third refusing deep
- * sleep against a source that stops with the clocks. None of those states can be expressed any
- * more, so none of those rules exists.
- *
- * DEEP therefore changes the wake source as well as the depth: it stops the PLL, mtime counts
- * clk_sys and stops with it, so the window is taken by the POWMAN timer in the always-on domain
- * instead - the same source the Arm package uses at either depth, shared from ../common. */
-#if (OS_CONFIG_TICKLESS_DEEP_ENABLE == 1U)
-/* Only the deep path needs these: the POWMAN wake source, and the walk that checks nothing else
- * is mid-transfer before the shared clocks stop. Both are shared with the Arm package and included
- * rather than compiled, so a LIGHT build carries neither. */
-#include "soc_powman.h"
-#include "soc_sleep.h"
-#endif
-
-/*
- * ***********************************************************************************************************
- * Tickless idle
- * ***********************************************************************************************************
- *
- * mtime free-runs at clk_sys and mtimecmp is an absolute deadline, so a suppressed window is one
- * write: put the next interrupt N tick periods out instead of one. The port cannot do it because
- * the privileged spec never says where these registers live; this package can.
-*/
-
 #if (OS_CONFIG_TICKLESS_DEEP_ENABLE == 0U)
-
-/** Deadline of the tick that would have fired next, captured when the window opened. */
-static uint64_t soc_tickless_base;
-
-/** Ticks the kernel asked to skip, so the report can be clamped to what was actually promised. */
-static uint32_t soc_tickless_planned;
-
 /******************************************************************************************************/
 /**
  * @brief How many ticks this chip can skip in one window.
@@ -432,9 +520,7 @@ uint32_t os_arch_tick_resume_cb(void)
 
     return elapsed;
 }
-
 #else /* OS_CONFIG_TICKLESS_DEEP_ENABLE == 1U */
-
 /******************************************************************************************************/
 /**
  * @brief How many ticks one window may skip.
@@ -503,62 +589,6 @@ uint32_t os_arch_tick_resume_cb(void)
     return elapsed;
 }
 
-
-/*
- * ***********************************************************************************************************
- * Deep sleep
- * ***********************************************************************************************************
- *
- * The mechanism is the Arm package's, because it is the chip's rather than the core's: clk_sys is
- * dropped back onto clk_ref, PLL_SYS is powered down, and POWMAN wakes the core. Three things had
- * to be said differently here, and none of them is the sleep itself.
- *
- * PRIMASK becomes mstatus.MIE, through the kernel's own mask API - RISC-V has no priority threshold
- * to leave alone, so there is nothing for a raw register write to protect.
- *
- * The pending-work test becomes mip & mie. On the Arm side that is ICSR for the scheduler
- * exceptions plus NVIC pending-and-enabled; here the scheduler's own request IS an interrupt
- * (MSIP, from SIO's per-core softirq), so one masked read covers both.
- *
- * SEVONPEND and SLEEPDEEP map onto Hazard3's xh3pwr extension rather than onto nothing. SLEEPDEEP
- * only told the Arm core what to do on WFI - the clocks are stopped by writing the clock
- * registers, which is architecture-neutral - and the event register the Arm package uses for the
- * core-1 rendezvous has an exact counterpart here: h3.block / h3.unblock, the OS_ARCH_WFE() /
- * OS_ARCH_SEV() the port supplies. A block wakes on an unblock event, and an unblock received
- * since the last block is latched, closing the same release-versus-block race SEV/WFE closes.
- *
- * What the rendezvous must NOT do on this core is use MSIP for the park or its release. Here the
- * context-switch request and the cross-core doorbell are the same level-sensitive interrupt, so
- * a release sent that way arrives on core 1 indistinguishable from a reschedule - its parked
- * work test sees "work", aborts with an IPI of its own back to core 0, and core 0's MSIP then
- * stands for the whole masked window, where nothing can take the trap that would clear it. Every
- * subsequent WFI returns on the spot, every window measures zero, and the collapsed windows keep
- * the two cores in that phase against each other. h3.unblock carries no interrupt state at all,
- * which is why the park, the request and the release below all go through it, and MSIP is left
- * with its one real job.
-*/
-
-/* The owner alone writes these. The kernel pairs prepare/finish outside its global lock and holds
- * its scheduling mask across the pair. */
-static uint32_t soc_sleep_owner_mask = 0U;
-static bool     soc_sleep_owner_held = false;
-
-#if (OS_CONFIG_CORE_COUNT > 1U)
-/* Each shared word has exactly one writer, ordered with a fence; no kernel API, SDK lock or
- * hardware spinlock is used while either core is parked. Generation zero means released, and a new
- * request is never issued until the old acknowledgement is cleared, so even a wrap cannot let a
- * late acknowledgement authorize another sleep. */
-static __IO uint32_t soc_sleep_request = 0U;       /* core 0 writes */
-static __IO uint32_t soc_sleep_ack = 0U;           /* core 1 writes */
-static __IO uint32_t soc_sleep_abort = 0U;         /* core 1 writes */
-static __IO uint32_t soc_sleep_peer_idle = 0U;     /* core 1 writes, advisory only */
-static uint32_t soc_sleep_generation = 0U;
-
-/* An idle peer normally acknowledges in a few microseconds. Never wait indefinitely for a preempted
- * idle callback or a core which is busy. Nothing has been slowed yet at this point. */
-#define SOC_SLEEP_RENDEZVOUS_US 100U
-#endif
-
 /******************************************************************************************************/
 /**
  * @brief Additional board veto for protocols whose clock requirements registers cannot reveal.
@@ -573,13 +603,449 @@ OS_WEAK bool soc_deep_sleep_allowed_cb(void)
     return true;
 }
 
-/** The scheduler's own request: mip.MSIP, bit 3. */
-#define SOC_SLEEP_MIP_SWI           (1UL << 3)
+/******************************************************************************************************/
+/**
+ * @brief Freeze both cores before the kernel freezes its shared time base.
+ *
+ * A secondary core must be allowed to finish an earlier kernel operation and reach idle before
+ * acknowledging. Waiting after the kernel opens its time window would instead prevent that
+ * operation from completing.
+ *
+ * @return bool  Whether the ordinary tickless pass may go ahead.
+ */
+bool os_arch_soc_sleep_prepare_cb(void)
+{
+    bool ready = false;
+    bool proceed;
 
-/** Bound on the retire loop above: the bit clears in a handful of cycles, and a bound only stops a
- *  core that cannot clear it at all from holding the idle path forever. */
-#define SOC_SLEEP_SWI_POLLS         64U
+    soc_sleep_owner_mask = os_arch_kernel_mask_save();
+    OS_ARCH_DSB();
 
+    proceed = !soc_sleep_work_pending();
+    if (proceed)
+    {
+#if (OS_CONFIG_CORE_COUNT > 1U)
+        /* The hint avoids polling on every tick while the other core is busy. It is never proof of
+         * idleness: the generation-matched acknowledgement below is the only permission. */
+        OS_ARCH_DMB();
+        if ((soc_sleep_peer_idle != 0U) && (soc_sleep_ack == 0U))
+        {
+            uint64_t started = time_us_64();
+            uint32_t generation = soc_sleep_generation + 1U;
+
+            if (generation == 0U)
+            {
+                generation = 1U;
+            }
+            soc_sleep_generation = generation;
+            OS_ARCH_DMB();
+            soc_sleep_request = generation;
+            OS_ARCH_DSB();
+            /* Core 1 sits in h3.block between its two park checks, so an unblock event is all it
+             * takes to notice the request - no MSIP, so nothing on either core mistakes the
+             * request for a reschedule. The event latch covers the race with the request word:
+             * an unblock arriving before the block falls straight through it. */
+            OS_ARCH_SEV();
+
+            while ((soc_sleep_ack != generation) &&
+                   (soc_sleep_abort != generation) &&
+                   !soc_sleep_work_pending() &&
+                   ((time_us_64() - started) < SOC_SLEEP_RENDEZVOUS_US))
+            {
+                OS_ARCH_DMB();
+            }
+
+            OS_ARCH_DMB();
+            ready = (soc_sleep_ack == generation) && (soc_sleep_abort != generation) &&
+                    !soc_sleep_work_pending();
+        }
+#else
+        ready = true;
+#endif
+    }
+
+    if (ready)
+    {
+        /* Interrupt handlers on either core cannot start new peripheral work after this check.
+         * Autonomous and external protocols still require the board veto above. */
+        ready = soc_deep_peripherals_ready() && soc_deep_sleep_allowed_cb();
+    }
+
+    if (ready)
+    {
+        soc_sleep_owner_held = true;
+    }
+    else
+    {
+        soc_sleep_release();
+    }
+
+    /* A busy peer or peripheral prevents shared-clock shutdown, not ordinary tickless sleep on
+     * core 0. Pending local work declines this pass instead. */
+    return proceed;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Called only after hardware, elapsed ticks and the kernel window have been restored.
+ *
+ * @return None.
+ */
+void os_arch_soc_sleep_finish_cb(void)
+{
+    if (soc_sleep_owner_held)
+    {
+        soc_sleep_release();
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief The sleep itself: drop off the PLL, stop it, and halt the core until POWMAN wakes it.
+ *
+ * Register for register the Arm package's sequence, and deliberately so - what stops the clocks on
+ * this chip is the clock tree, not the core. The one line that is missing is SCR.SLEEPDEEP, which
+ * has no counterpart and needs none: it told a Cortex-M what to do on WFI, and by the time this
+ * WFI runs there is no PLL left to gate.
+ *
+ * It stops short of the deepest route - moving clk_ref onto LPOSC and stopping the crystal - for
+ * the reason the Arm package gives: that is the variant where a mistake leaves the core with no
+ * clock to execute the restore from, recoverable only through BOOTSEL.
+ *
+ * @return None.
+ */
+void os_arch_soc_sleep_cb(void)
+{
+    /* The kernel's pre-sleep board callback ran since prepare. Recheck autonomous peripheral
+     * activity and incoming work immediately before touching a shared clock. */
+    bool ready = soc_sleep_owner_held && !soc_sleep_work_pending_ex(false);
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    OS_ARCH_DMB();
+    ready = ready && (soc_sleep_ack == soc_sleep_request) && (soc_sleep_request != 0U) &&
+            (soc_sleep_abort != soc_sleep_request);
+#endif
+    ready = ready && soc_deep_peripherals_ready() && soc_deep_sleep_allowed_cb();
+
+    /* MISRA C:2012 Rule 15.5 - the declined path takes the else arm rather than returning from the
+     * middle, so this function still has its single exit at the end. */
+    if (!ready)
+    {
+        soc_sleep_swi_retire();
+        OS_ARCH_DSB();
+        OS_ARCH_IDLE();
+    }
+    else
+    {
+        uint32_t pll_cs   = pll_sys_hw->cs;
+        uint32_t pll_fb   = pll_sys_hw->fbdiv_int;
+        uint32_t pll_prim = pll_sys_hw->prim;
+        uint32_t pll_pwr  = pll_sys_hw->pwr;
+        uint32_t sys_ctrl = clocks_hw->clk[clk_sys].ctrl;
+        uint32_t sys_div  = clocks_hw->clk[clk_sys].div;
+        uint32_t sys_selected = clocks_hw->clk[clk_sys].selected;
+
+        /* Off the PLL first, and glitchlessly: clk_sys back to clk_ref, which is still running from
+         * whatever the application put it on. Only once nothing is fed from the PLL may it be
+         * stopped - pulling it out from under a running clk_sys stops the core where it stands. */
+        clocks_hw->clk[clk_sys].ctrl = sys_ctrl & ~CLOCKS_CLK_SYS_CTRL_SRC_BITS;
+
+        while ((clocks_hw->clk[clk_sys].selected & 1U) == 0U)
+        {
+        }
+
+        pll_sys_hw->pwr = PLL_PWR_BITS;   /* every block powered down */
+
+#if (OS_CONFIG_TEST_ENABLE == 1U)
+        /* The suite reports this: a deep build that always falls back to LIGHT is otherwise
+         * indistinguishable from one that works. See os_test_deep_sleep_entries in ahura.h. */
+        os_test_deep_sleep_entries++;
+#endif
+        /* Retire a scheduler request that may have been overtaken before halting, then sleep with
+         * MSIE left open. With the rendezvous on h3.block/h3.unblock nothing manufactures MSIP
+         * any more, so the retire is belt and braces rather than the load-bearing part it used to
+         * be. Masking MSIE here instead would close the one channel a genuine cross-core wake
+         * uses - the parked peer's abort and any remote kernel entry both arrive as MSIP - and a
+         * real request then waits out the whole window, which is how an earlier revision hung the
+         * suite. A request that arrives after the retire still cuts the sleep short, exactly as
+         * the kernel documents. */
+        soc_sleep_swi_retire();
+        OS_ARCH_DSB();
+        OS_ARCH_IDLE();
+        OS_ARCH_ISB();
+
+        /* Back up in the order it came down: the PLL has to be locked before anything is fed from
+         * it. Restored from its own saved registers rather than recomputed, so it cannot disagree
+         * with the clock tree the application configured. */
+        pll_sys_hw->cs        = pll_cs;
+        pll_sys_hw->fbdiv_int = pll_fb;
+        pll_sys_hw->prim      = pll_prim;
+        pll_sys_hw->pwr       = pll_pwr | PLL_PWR_POSTDIVPD_BITS;
+
+        while ((pll_sys_hw->cs & PLL_CS_LOCK_BITS) == 0U)
+        {
+        }
+
+        pll_sys_hw->pwr = pll_pwr;
+
+        clocks_hw->clk[clk_sys].div  = sys_div;
+        clocks_hw->clk[clk_sys].ctrl = sys_ctrl;
+        while (clocks_hw->clk[clk_sys].selected != sys_selected)
+        {
+        }
+        OS_ARCH_DSB();
+        OS_ARCH_ISB();
+    }
+}
+#endif /* OS_CONFIG_TICKLESS_DEEP_ENABLE */
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
+
+/******************************************************************************************************/
+/**
+ * @brief Start the periodic tick.
+ *
+ * Called by the port from os_arch_tick_init(), on each core. The timer itself is shared by both
+ * cores and only wants configuring once, but mtimecmp is core-local - the datasheet is explicit
+ * that "each core gets a copy of this register, with the comparison result routed to its own
+ * interrupt line" - so the comparator and the IRQ are armed per core.
+ */
+void os_arch_tick_init_cb(void)
+{
+    uint32_t clock_hz = os_arch_clock_hz_get();
+
+    if ((clock_hz != 0U) && (OS_CONFIG_TICK_HZ != 0U))
+    {
+        if (get_core_num() == 0U)
+        {
+            /* Count clk_sys rather than the `ticks` block's 1 MHz reference. That makes the tick
+             * period derive from the same number os_arch_clock_hz_get() reports and the kernel
+             * already uses for its microsecond waits, instead of depending on how the ticks block
+             * happens to be set up - and it is what SysTick does on the Arm side of this chip. */
+            riscv_timer_set_fullspeed(true);
+            riscv_timer_set_enabled(true);
+        }
+
+        soc_tick_interval = clock_hz / OS_CONFIG_TICK_HZ;
+
+        /* A zero interval means a tick faster than the clock: nothing sane to program, so the
+         * comparator and the enable below are skipped along with it. */
+        if (soc_tick_interval != 0U)
+        {
+            riscv_timer_set_mtimecmp(riscv_timer_get_mtime() + (uint64_t)soc_tick_interval);
+
+            /* The HANDLER is registered once; the comparator above and the enable below are per
+             * core. mtimecmp lives in SIO and the interrupt enable is a core CSR, so both belong
+             * to whichever core is running. The handler CHAIN does not: unless
+             * PICO_VTABLE_PER_CORE is set - and it defaults to 0 - multicore_launch_core1() hands
+             * core 1 core 0's own mtvec, so the two cores share one table. Registering from both
+             * would put soc_tick_isr in that chain TWICE, and every timer interrupt would then
+             * push mtimecmp forward by two intervals, halving the real tick rate on both cores.
+             *
+             * Shared rather than exclusive so a handler the application already installed on this
+             * line is not silently displaced. */
+            if (get_core_num() == 0U)
+            {
+                irq_add_shared_handler(SIO_IRQ_MTIMECMP, soc_tick_isr,
+                                       PICO_SHARED_IRQ_HANDLER_LOWEST_ORDER_PRIORITY);
+            }
+
+            irq_set_enabled(SIO_IRQ_MTIMECMP, true);
+        }
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Per-core SoC start-up, called from inside os_init().
+ *
+ * Nothing to arm for the context-switch interrupt: SIO_RISCV_SOFTIRQ needs no claiming, and the
+ * port enables mie.MSIE itself in os_arch_init(). The Arm package has to claim a doorbell and route
+ * its IRQ here; this one genuinely has nothing to do.
+ */
+void os_arch_soc_init_cb(void)
+{
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    soc_core_id_verify();
+#endif
+
+    sio_hw->riscv_softirq = SOC_SOFTIRQ_CLR(get_core_num());
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Idle the core until an interrupt arrives.
+ *
+ * WFI on core 0, and deliberately so: mtime keeps running through WFI because it lives in SIO
+ * rather than in the core, so the reason the Arm package uses WFE everywhere - a gated clock would
+ * stop that core's own tick - does not arise here.
+ *
+ * Core 1, under DEEP, waits in h3.block between its two park checks instead. A block wakes on
+ * pending-and-enabled interrupts exactly as a WFI does, so the tick and every reschedule reach it
+ * unchanged; what it adds is the unblock event, the channel core 0 uses for the park request and
+ * the release - a wake that carries no interrupt state and so cannot be mistaken for a scheduler
+ * request on either side.
+ *
+ * @return None.
+ */
+void os_arch_soc_idle_cb(void)
+{
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U) && \
+    (OS_CONFIG_TICKLESS_DEEP_ENABLE == 1U) && (OS_CONFIG_CORE_COUNT > 1U)
+    if ((get_core_num() == 1U) && os_task_current_is_idle())
+    {
+        soc_sleep_peer_idle = 1U;
+        OS_ARCH_DMB();
+        soc_sleep_peer_park();
+        OS_ARCH_WFE();
+        soc_sleep_peer_park();
+        soc_sleep_peer_idle = 0U;
+        OS_ARCH_DMB();
+    }
+    else
+#endif
+    {
+        OS_ARCH_IDLE();
+    }
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Report what this package knows about core 1's bring-up.
+ *
+ * Called by the kernel only after something has already gone wrong, and deliberately not at launch
+ * time: os_arch_core_launch_cb() runs inside os_start(), where a USB console has not been opened by
+ * the host yet and anything written is dropped unseen.
+ *
+ * The two answers split the search in half. Never reached means the launch itself failed - the
+ * entry point, the stack or the vector table core 1 was handed. Reached means the launch, the trap
+ * table and this package are fine, and the fault is in what follows: os_core_start(), the tick this
+ * core arms for itself, or mie.MSIE.
+ */
+void os_arch_soc_diagnose_cb(void)
+{
+#if (OS_CONFIG_CORE_COUNT > 1U)
+    if (soc_core_reached == 0xFFU)
+    {
+        printf("         [soc] core 1 NEVER reached its entry point - "
+               "the launch itself failed.\r\n");
+    }
+    else
+    {
+        printf("         [soc] core %u DID reach its entry point, so the launch and the trap\r\n",
+               (unsigned)soc_core_reached);
+        printf("               table are fine; look at os_core_start() and this core's tick.\r\n");
+    }
+
+    (void)fflush(stdout);
+#endif
+}
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+/******************************************************************************************************/
+/**
+ * @brief Called right before a suppressed idle window, with interrupts masked.
+ *
+ * Left empty, which selects a plain WFI: the core stalls and every clock keeps running, so nothing
+ * needs saving here and the post-sleep hook has nothing to restore. That is also what makes the
+ * window measurable, since mtimecmp keeps counting through it.
+ *
+ * The deeper modes on this chip stop the timers the kernel measures against, which is a different
+ * feature and not one this package claims - see the tickless section of doc/porting.md.
+ *
+ * Weak, so an application that must quiesce something of its own - a UART with bytes still in its
+ * FIFO, a sensor mid-conversion - replaces this one hook and leaves the rest alone.
+ *
+ * @return None.
+ */
+OS_WEAK void os_tickless_pre_sleep_cb(void)
+{
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Called right after the window closes, still masked and before the sleep is announced.
+ *
+ * @return None.
+ */
+OS_WEAK void os_tickless_post_sleep_cb(void)
+{
+}
+#endif /* OS_CONFIG_TICKLESS_ENABLE */
+
+/******************************************************************************************************/
+/**
+ * @brief Rate of the reference clock windows are re-measured against.
+ *
+ * The SDK's TIMER, which both cores share, unlike the per-hart mcycle epochs.
+ *
+ * @return uint32_t  1000000: the TIMER counts microseconds.
+ */
+uint32_t os_arch_reference_clock_hz_cb(void)
+{
+    return 1000000U;
+}
+
+/******************************************************************************************************/
+/**
+ * @brief Read the reference clock.
+ *
+ * @return uint64_t  Microseconds since boot, from the SDK's TIMER.
+ */
+uint64_t os_arch_reference_clock_get_cb(void)
+{
+    return time_us_64();
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+#if (OS_CONFIG_CORE_COUNT > 1U)
+/******************************************************************************************************/
+/**
+ * @brief Check that mhartid really is this core's index, once, at boot.
+ *
+ * soc.cmake tells the port that it is (OS_CONFIG_ARCH_CORE_ID_MHARTID), which turns every core-id
+ * read in the kernel into a single inline CSR instruction. That claim is worth one compare per core
+ * to stand behind: were it ever wrong, every per-core structure the kernel owns - the critical
+ * nesting counts, the saved masks, os_task_current[], the idle tasks - would be indexed with the
+ * wrong core's number, and nothing downstream could notice. It is the same bargain
+ * OS_CONFIG_ARCH_VECTOR_CHECK makes, and it gets the same answer: park where a debugger lands on
+ * the cause instead of running on wrong.
+ *
+ * Unconditional rather than an OS_ASSERT. A build with assertions compiled out is exactly the one
+ * that can least afford to be quietly wrong about which core it is running on, and the cost is a
+ * CSR read, a load and a branch that happen once.
+ */
+static void soc_core_id_verify(void)
+{
+    if (OS_ARCH_CSR_READ(mhartid) != (uint32_t)get_core_num())
+    {
+        os_arch_config_fault_trap();
+    }
+}
+#endif /* OS_CONFIG_CORE_COUNT > 1U */
+
+/******************************************************************************************************/
+/**
+ * @brief Tick vector: advance the kernel clock and re-arm the comparator.
+ *
+ * mtimecmp is a comparator, not a reload register - the interrupt stays asserted while
+ * mtime >= mtimecmp - so pushing it forward is what acknowledges the interrupt. Advancing it by a
+ * fixed interval from its PREVIOUS value rather than from the current mtime keeps the tick free of
+ * drift: any latency in reaching this handler is absorbed rather than added to the next period.
+ */
+static void soc_tick_isr(void)
+{
+    riscv_timer_set_mtimecmp(riscv_timer_get_mtimecmp() + (uint64_t)soc_tick_interval);
+
+    os_tick_handler();
+}
+
+#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
+#if (OS_CONFIG_TICKLESS_DEEP_ENABLE == 1U)
 /******************************************************************************************************/
 /**
  * @brief Pending work on this core. Never clears a source.
@@ -686,102 +1152,6 @@ static void soc_sleep_release(void)
     os_arch_kernel_mask_restore(soc_sleep_owner_mask);
 }
 
-/******************************************************************************************************/
-/**
- * @brief Freeze both cores before the kernel freezes its shared time base.
- *
- * A secondary core must be allowed to finish an earlier kernel operation and reach idle before
- * acknowledging. Waiting after the kernel opens its time window would instead prevent that
- * operation from completing.
- *
- * @return bool  Whether the ordinary tickless pass may go ahead.
- */
-bool os_arch_soc_sleep_prepare_cb(void)
-{
-    bool ready = false;
-    bool proceed;
-
-    soc_sleep_owner_mask = os_arch_kernel_mask_save();
-    OS_ARCH_DSB();
-
-    proceed = !soc_sleep_work_pending();
-    if (proceed)
-    {
-#if (OS_CONFIG_CORE_COUNT > 1U)
-        /* The hint avoids polling on every tick while the other core is busy. It is never proof of
-         * idleness: the generation-matched acknowledgement below is the only permission. */
-        OS_ARCH_DMB();
-        if ((soc_sleep_peer_idle != 0U) && (soc_sleep_ack == 0U))
-        {
-            uint64_t started = time_us_64();
-            uint32_t generation = soc_sleep_generation + 1U;
-
-            if (generation == 0U)
-            {
-                generation = 1U;
-            }
-            soc_sleep_generation = generation;
-            OS_ARCH_DMB();
-            soc_sleep_request = generation;
-            OS_ARCH_DSB();
-            /* Core 1 sits in h3.block between its two park checks, so an unblock event is all it
-             * takes to notice the request - no MSIP, so nothing on either core mistakes the
-             * request for a reschedule. The event latch covers the race with the request word:
-             * an unblock arriving before the block falls straight through it. */
-            OS_ARCH_SEV();
-
-            while ((soc_sleep_ack != generation) &&
-                   (soc_sleep_abort != generation) &&
-                   !soc_sleep_work_pending() &&
-                   ((time_us_64() - started) < SOC_SLEEP_RENDEZVOUS_US))
-            {
-                OS_ARCH_DMB();
-            }
-
-            OS_ARCH_DMB();
-            ready = (soc_sleep_ack == generation) && (soc_sleep_abort != generation) &&
-                    !soc_sleep_work_pending();
-        }
-#else
-        ready = true;
-#endif
-    }
-
-    if (ready)
-    {
-        /* Interrupt handlers on either core cannot start new peripheral work after this check.
-         * Autonomous and external protocols still require the board veto above. */
-        ready = soc_deep_peripherals_ready() && soc_deep_sleep_allowed_cb();
-    }
-
-    if (ready)
-    {
-        soc_sleep_owner_held = true;
-    }
-    else
-    {
-        soc_sleep_release();
-    }
-
-    /* A busy peer or peripheral prevents shared-clock shutdown, not ordinary tickless sleep on
-     * core 0. Pending local work declines this pass instead. */
-    return proceed;
-}
-
-/******************************************************************************************************/
-/**
- * @brief Called only after hardware, elapsed ticks and the kernel window have been restored.
- *
- * @return None.
- */
-void os_arch_soc_sleep_finish_cb(void)
-{
-    if (soc_sleep_owner_held)
-    {
-        soc_sleep_release();
-    }
-}
-
 #if (OS_CONFIG_CORE_COUNT > 1U)
 /******************************************************************************************************/
 /**
@@ -872,255 +1242,8 @@ static void soc_sleep_peer_park(void)
     os_arch_kernel_mask_restore(mask);
 }
 #endif
-
-/******************************************************************************************************/
-/**
- * @brief The sleep itself: drop off the PLL, stop it, and halt the core until POWMAN wakes it.
- *
- * Register for register the Arm package's sequence, and deliberately so - what stops the clocks on
- * this chip is the clock tree, not the core. The one line that is missing is SCR.SLEEPDEEP, which
- * has no counterpart and needs none: it told a Cortex-M what to do on WFI, and by the time this
- * WFI runs there is no PLL left to gate.
- *
- * It stops short of the deepest route - moving clk_ref onto LPOSC and stopping the crystal - for
- * the reason the Arm package gives: that is the variant where a mistake leaves the core with no
- * clock to execute the restore from, recoverable only through BOOTSEL.
- *
- * @return None.
- */
-void os_arch_soc_sleep_cb(void)
-{
-    /* The kernel's pre-sleep board callback ran since prepare. Recheck autonomous peripheral
-     * activity and incoming work immediately before touching a shared clock. */
-    bool ready = soc_sleep_owner_held && !soc_sleep_work_pending_ex(false);
-
-#if (OS_CONFIG_CORE_COUNT > 1U)
-    OS_ARCH_DMB();
-    ready = ready && (soc_sleep_ack == soc_sleep_request) && (soc_sleep_request != 0U) &&
-            (soc_sleep_abort != soc_sleep_request);
-#endif
-    ready = ready && soc_deep_peripherals_ready() && soc_deep_sleep_allowed_cb();
-
-    /* MISRA C:2012 Rule 15.5 - the declined path takes the else arm rather than returning from the
-     * middle, so this function still has its single exit at the end. */
-    if (!ready)
-    {
-        soc_sleep_swi_retire();
-        OS_ARCH_DSB();
-        OS_ARCH_IDLE();
-    }
-    else
-    {
-        uint32_t pll_cs   = pll_sys_hw->cs;
-        uint32_t pll_fb   = pll_sys_hw->fbdiv_int;
-        uint32_t pll_prim = pll_sys_hw->prim;
-        uint32_t pll_pwr  = pll_sys_hw->pwr;
-        uint32_t sys_ctrl = clocks_hw->clk[clk_sys].ctrl;
-        uint32_t sys_div  = clocks_hw->clk[clk_sys].div;
-        uint32_t sys_selected = clocks_hw->clk[clk_sys].selected;
-
-        /* Off the PLL first, and glitchlessly: clk_sys back to clk_ref, which is still running from
-         * whatever the application put it on. Only once nothing is fed from the PLL may it be
-         * stopped - pulling it out from under a running clk_sys stops the core where it stands. */
-        clocks_hw->clk[clk_sys].ctrl = sys_ctrl & ~CLOCKS_CLK_SYS_CTRL_SRC_BITS;
-
-        while ((clocks_hw->clk[clk_sys].selected & 1U) == 0U)
-        {
-        }
-
-        pll_sys_hw->pwr = PLL_PWR_BITS;   /* every block powered down */
-
-#if (OS_CONFIG_TEST_ENABLE == 1U)
-        /* The suite reports this: a deep build that always falls back to LIGHT is otherwise
-         * indistinguishable from one that works. See os_test_deep_sleep_entries in ahura.h. */
-        os_test_deep_sleep_entries++;
-#endif
-        /* Retire a scheduler request that may have been overtaken before halting, then sleep with
-         * MSIE left open. With the rendezvous on h3.block/h3.unblock nothing manufactures MSIP
-         * any more, so the retire is belt and braces rather than the load-bearing part it used to
-         * be. Masking MSIE here instead would close the one channel a genuine cross-core wake
-         * uses - the parked peer's abort and any remote kernel entry both arrive as MSIP - and a
-         * real request then waits out the whole window, which is how an earlier revision hung the
-         * suite. A request that arrives after the retire still cuts the sleep short, exactly as
-         * the kernel documents. */
-        soc_sleep_swi_retire();
-        OS_ARCH_DSB();
-        OS_ARCH_IDLE();
-        OS_ARCH_ISB();
-
-        /* Back up in the order it came down: the PLL has to be locked before anything is fed from
-         * it. Restored from its own saved registers rather than recomputed, so it cannot disagree
-         * with the clock tree the application configured. */
-        pll_sys_hw->cs        = pll_cs;
-        pll_sys_hw->fbdiv_int = pll_fb;
-        pll_sys_hw->prim      = pll_prim;
-        pll_sys_hw->pwr       = pll_pwr | PLL_PWR_POSTDIVPD_BITS;
-
-        while ((pll_sys_hw->cs & PLL_CS_LOCK_BITS) == 0U)
-        {
-        }
-
-        pll_sys_hw->pwr = pll_pwr;
-
-        clocks_hw->clk[clk_sys].div  = sys_div;
-        clocks_hw->clk[clk_sys].ctrl = sys_ctrl;
-        while (clocks_hw->clk[clk_sys].selected != sys_selected)
-        {
-        }
-        OS_ARCH_DSB();
-        OS_ARCH_ISB();
-    }
-}
-
 #endif /* OS_CONFIG_TICKLESS_DEEP_ENABLE */
-
 #endif /* OS_CONFIG_TICKLESS_ENABLE */
-
-/******************************************************************************************************/
-/**
- * @brief Start the periodic tick.
- *
- * Called by the port from os_arch_tick_init(), on each core. The timer itself is shared by both
- * cores and only wants configuring once, but mtimecmp is core-local - the datasheet is explicit
- * that "each core gets a copy of this register, with the comparison result routed to its own
- * interrupt line" - so the comparator and the IRQ are armed per core.
- */
-void os_arch_tick_init_cb(void)
-{
-    uint32_t clock_hz = os_arch_clock_hz_get();
-
-    if ((clock_hz != 0U) && (OS_CONFIG_TICK_HZ != 0U))
-    {
-    if (get_core_num() == 0U)
-    {
-        /* Count clk_sys rather than the `ticks` block's 1 MHz reference. That makes the tick period
-         * derive from the same number os_arch_clock_hz_get() reports and the kernel already uses for
-         * its microsecond waits, instead of depending on how the ticks block happens to be set up -
-         * and it is what SysTick does on the Arm side of this chip. */
-        riscv_timer_set_fullspeed(true);
-        riscv_timer_set_enabled(true);
-    }
-
-    soc_tick_interval = clock_hz / OS_CONFIG_TICK_HZ;
-
-    /* A zero interval means a tick faster than the clock: nothing sane to program, so the
-     * comparator and the enable below are skipped along with it. */
-    if (soc_tick_interval != 0U)
-    {
-    riscv_timer_set_mtimecmp(riscv_timer_get_mtime() + (uint64_t)soc_tick_interval);
-
-    /* The HANDLER is registered once; the comparator above and the enable below are per core.
-     *
-     * Those are not the same scope, and the difference is easy to miss because everything else in
-     * this function is core-local. mtimecmp lives in SIO and the interrupt enable is a core CSR,
-     * so both belong to whichever core is running. The handler CHAIN does not: unless
-     * PICO_VTABLE_PER_CORE is set - and it defaults to 0 - multicore_launch_core1() hands core 1
-     * core 0's own mtvec, so the two cores share one table. Registering from both would put
-     * soc_tick_isr in that chain TWICE, and every timer interrupt would then push mtimecmp forward
-     * by two intervals and count two ticks, halving the real tick rate on both cores.
-     *
-     * Shared rather than exclusive so a handler the application already installed on this line is
-     * not silently displaced. */
-    if (get_core_num() == 0U)
-    {
-        irq_add_shared_handler(SIO_IRQ_MTIMECMP, soc_tick_isr,
-                               PICO_SHARED_IRQ_HANDLER_LOWEST_ORDER_PRIORITY);
-    }
-
-    irq_set_enabled(SIO_IRQ_MTIMECMP, true);
-    }
-    }
-}
-
-/*
- * ***********************************************************************************************************
- * Start-up and idle
- * ***********************************************************************************************************
-*/
-
-/******************************************************************************************************/
-/**
- * @brief Per-core SoC start-up, called from inside os_init().
- *
- * Nothing to arm for the context-switch interrupt: SIO_RISCV_SOFTIRQ needs no claiming, and the
- * port enables mie.MSIE itself in os_arch_init(). The Arm package has to claim a doorbell and route
- * its IRQ here; this one genuinely has nothing to do.
- */
-void os_arch_soc_init_cb(void)
-{
-#if (OS_CONFIG_CORE_COUNT > 1U)
-    soc_core_id_verify();
-#endif
-
-    sio_hw->riscv_softirq = SOC_SOFTIRQ_CLR(get_core_num());
-}
-
-/******************************************************************************************************/
-/**
- * @brief Idle the core until an interrupt arrives.
- *
- * WFI on core 0, and deliberately so: mtime keeps running through WFI because it lives in SIO
- * rather than in the core, so the reason the Arm package uses WFE everywhere - a gated clock would
- * stop that core's own tick - does not arise here.
- *
- * Core 1, under DEEP, waits in h3.block between its two park checks instead. A block wakes on
- * pending-and-enabled interrupts exactly as a WFI does, so the tick and every reschedule reach it
- * unchanged; what it adds is the unblock event, the channel core 0 uses for the park request and
- * the release - a wake that carries no interrupt state and so cannot be mistaken for a scheduler
- * request on either side.
- *
- * @return None.
- */
-void os_arch_soc_idle_cb(void)
-{
-#if (OS_CONFIG_TICKLESS_ENABLE == 1U) &&     (OS_CONFIG_TICKLESS_DEEP_ENABLE == 1U) && (OS_CONFIG_CORE_COUNT > 1U)
-    if ((get_core_num() == 1U) && os_task_current_is_idle())
-    {
-        soc_sleep_peer_idle = 1U;
-        OS_ARCH_DMB();
-        soc_sleep_peer_park();
-        OS_ARCH_WFE();
-        soc_sleep_peer_park();
-        soc_sleep_peer_idle = 0U;
-        OS_ARCH_DMB();
-    }
-    else
-#endif
-    {
-        OS_ARCH_IDLE();
-    }
-}
-
-/******************************************************************************************************/
-/**
- * @brief Report what this package knows about core 1's bring-up.
- *
- * Called by the kernel only after something has already gone wrong, and deliberately not at launch
- * time: os_arch_core_launch_cb() runs inside os_start(), where a USB console has not been opened by
- * the host yet and anything written is dropped unseen.
- *
- * The two answers split the search in half. Never reached means the launch itself failed - the
- * entry point, the stack or the vector table core 1 was handed. Reached means the launch, the trap
- * table and this package are fine, and the fault is in what follows: os_core_start(), the tick this
- * core arms for itself, or mie.MSIE.
- */
-void os_arch_soc_diagnose_cb(void)
-{
-#if (OS_CONFIG_CORE_COUNT > 1U)
-    if (soc_core_reached == 0xFFU)
-    {
-        printf("         [soc] core 1 NEVER reached its entry point - the launch itself failed.\r\n");
-    }
-    else
-    {
-        printf("         [soc] core %u DID reach its entry point, so the launch and the trap\r\n",
-               (unsigned)soc_core_reached);
-        printf("               table are fine; look at os_core_start() and this core's tick.\r\n");
-    }
-
-    (void)fflush(stdout);
-#endif
-}
 
 #if (OS_CONFIG_CORE_COUNT > 1U)
 /******************************************************************************************************/
@@ -1149,48 +1272,3 @@ static void soc_core1_entry(void)
     os_core_start();
 }
 #endif
-
-#if (OS_CONFIG_TICKLESS_ENABLE == 1U)
-
-/******************************************************************************************************/
-/**
- * @brief Called right before a suppressed idle window, with interrupts masked.
- *
- * Left empty, which selects a plain WFI: the core stalls and every clock keeps running, so nothing
- * needs saving here and the post-sleep hook has nothing to restore. That is also what makes the
- * window measurable, since mtimecmp keeps counting through it.
- *
- * The deeper modes on this chip stop the timers the kernel measures against, which is a different
- * feature and not one this package claims - see the tickless section of doc/porting.md.
- *
- * Weak, so an application that must quiesce something of its own - a UART with bytes still in its
- * FIFO, a sensor mid-conversion - replaces this one hook and leaves the rest alone.
- *
- * @return None.
- */
-OS_WEAK void os_tickless_pre_sleep_cb(void)
-{
-}
-
-/******************************************************************************************************/
-/**
- * @brief Called right after the window closes, still masked and before the sleep is announced.
- *
- * @return None.
- */
-OS_WEAK void os_tickless_post_sleep_cb(void)
-{
-}
-
-#endif /* OS_CONFIG_TICKLESS_ENABLE */
-
-/* SDK TIMER is shared, unlike the per-hart mcycle epochs. */
-uint32_t os_arch_reference_clock_hz_cb(void)
-{
-    return 1000000U;
-}
-
-uint64_t os_arch_reference_clock_get_cb(void)
-{
-    return time_us_64();
-}

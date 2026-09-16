@@ -13,6 +13,12 @@
 #ifndef OS_KERNEL_H
 #define OS_KERNEL_H
 
+/*
+ * ***********************************************************************************************************
+ * Includes
+ * ***********************************************************************************************************
+*/
+
 #include "os_types.h"
 
 #ifdef __cplusplus
@@ -22,7 +28,32 @@ extern "C"
 
 /*
  * ***********************************************************************************************************
- * Kernel lifecycle
+ * Macros
+ * ***********************************************************************************************************
+*/
+
+/** OS_ASSERT(expr) checks a condition that must hold if the program is correct, and halts where it
+ *  does not. Assertions only ADD checks: the kernel returns the same status codes either way. Use
+ *  them for programming errors, never for conditions that can legitimately happen at runtime.
+ *
+ *  The expression is not evaluated when assertions are compiled out, so it must be side-effect
+ *  free. */
+#if (OS_CONFIG_ASSERT_ENABLE == 1U)
+
+#define OS_ASSERT(expr)                                                       \
+    do {                                                                      \
+        if (!(expr))                                                          \
+        {                                                                     \
+            os_assert_failed(__FILE__, (uint32_t)__LINE__);                   \
+        }                                                                     \
+    } while (0)
+#else /* OS_CONFIG_ASSERT_ENABLE == 0U */
+#define OS_ASSERT(expr)         ((void)0)
+#endif /* OS_CONFIG_ASSERT_ENABLE */
+
+/*
+ * ***********************************************************************************************************
+ * Public function prototypes
  * ***********************************************************************************************************
 */
 
@@ -56,11 +87,7 @@ bool os_kernel_is_running(void);
  */
 void os_main(void);
 
-
-/*
- * ***********************************************************************************************************
- * Scheduler lock
- * ***********************************************************************************************************
+/* Scheduler lock.
  *
  * The other preemption barrier, and the cheaper one when what you are guarding against is another
  * TASK. Pick by what shares the data:
@@ -69,7 +96,7 @@ void os_main(void);
  *   core <-> core   os_critical_enter, whose outermost level takes the cross-core spinlock.
  *
  * Both nest, and neither may be held across a blocking call.
-*/
+ */
 
 /******************************************************************************************************/
 /**
@@ -90,29 +117,7 @@ void os_kernel_unlock(void);
  */
 bool os_kernel_is_locked(void);
 
-
-/*
- * ***********************************************************************************************************
- * Assertions         - OS_CONFIG_ASSERT_ENABLE
- * ***********************************************************************************************************
-*/
-
-/** OS_ASSERT(expr) checks a condition that must hold if the program is correct, and halts where it
- *  does not. Assertions only ADD checks: the kernel returns the same status codes either way. Use
- *  them for programming errors, never for conditions that can legitimately happen at runtime.
- *
- *  The expression is not evaluated when assertions are compiled out, so it must be side-effect
- *  free. */
 #if (OS_CONFIG_ASSERT_ENABLE == 1U)
-
-#define OS_ASSERT(expr)                                                       \
-    do {                                                                      \
-        if (!(expr))                                                          \
-        {                                                                     \
-            os_assert_failed(__FILE__, (uint32_t)__LINE__);                   \
-        }                                                                     \
-    } while (0)
-
 /******************************************************************************************************/
 /**
  * @brief Report a failed OS_ASSERT and halt. Calls os_assert_failed_cb, then parks the core
@@ -129,24 +134,15 @@ void os_assert_failed(const char *file, uint32_t line);
  *        to return from the assertion.
  */
 void os_assert_failed_cb(const char *file, uint32_t line);
-
-#else /* OS_CONFIG_ASSERT_ENABLE == 0U */
-
-#define OS_ASSERT(expr)         ((void)0)
-
 #endif /* OS_CONFIG_ASSERT_ENABLE */
 
-
-/*
- * ***********************************************************************************************************
- * TrustZone          - OS_CONFIG_TRUSTZONE
- * ***********************************************************************************************************
+#if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
+/* TrustZone          - OS_CONFIG_TRUSTZONE.
  *
  * Also declared by the arch port (os_arch_port_common.h), which calls them from
  * the context-switch path; repeated here because they are application-provided.
-*/
+ */
 
-#if (OS_CONFIG_TRUSTZONE == OS_CONFIG_TRUSTZONE_NON_SECURE)
 /******************************************************************************************************/
 /**
  * @brief TrustZone callback: bank the secure-side context of the task being switched out

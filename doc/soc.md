@@ -127,11 +127,16 @@ core reporting id 0, which corrupts shared state rather than failing to build.
 Hence:
 
 - A package defines the group. An application using a package does **not** copy
-  `template/soc_cb.c`.
-- A package's definitions are `OS_WEAK`, so an application may still override
-  any single one with a normal (strong) definition in its own sources. A strong
-  definition in a directly linked object beats a weak one in an archive,
-  reliably.
+  `template/soc_cb.c` - and cannot do so by accident: every SoC-owned callback in
+  the template is strong, so a copy next to a package fails to link with a
+  `multiple definition` error naming the callback.
+- A package's SoC-owned callbacks are strong too, wherever the kernel, the port
+  or a startup file already holds a weak default: between two weak definitions
+  the linker keeps whichever it reaches first. Code shared by sibling packages
+  under `../common` may give a weak default that one package replaces.
+- The hooks an application is meant to replace - `os_tickless_pre_sleep_cb()`,
+  `os_tickless_post_sleep_cb()`, and `soc_deep_sleep_allowed_cb()` on the RP2350
+  - are `OS_WEAK`, so a normal definition in the application's own sources wins.
 - A package's sources are compiled into `ahura_kernel` rather than into an
   archive of their own, which is what keeps the guarantee above simple.
 

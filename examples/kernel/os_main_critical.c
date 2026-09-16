@@ -27,7 +27,7 @@
 
 /*
  * ***********************************************************************************************************
- * Private objects
+ * Macros
  * ***********************************************************************************************************
 */
 
@@ -41,40 +41,31 @@
     OS_TASK_CONFIG((entry), (context), (priority), OS_TASK_CORE_ANY)
 #endif
 
-OS_TASK_DEFINE(worker, 512U);
-
 #define ITERATIONS 100000UL
+
+/*
+ * ***********************************************************************************************************
+ * Global variables
+ * ***********************************************************************************************************
+*/
+
+OS_TASK_DEFINE(worker, 512U);
 
 static __IO uint32_t os_main_shared_counter = 0U;
 static __IO bool     os_main_worker_done    = false;
 
 /*
  * ***********************************************************************************************************
- * Private function implementations
+ * Private function prototypes
  * ***********************************************************************************************************
 */
 
 /******************************************************************************************************/
-static void worker_entry(void *context)
-{
-    uint32_t i;
-
-    (void)context;
-
-    for (i = 0U; i < ITERATIONS; i++)
-    {
-        os_critical_enter();
-        os_main_shared_counter++;
-        os_critical_exit();
-    }
-
-    os_main_worker_done = true;
-
-    while (1)
-    {
-        os_task_yield();
-    }
-}
+/**
+ * @brief Worker entry: runs at a HIGHER priority than os_main, so the only thing that can keep it
+ *        off the CPU is the scheduler lock.
+ */
+static void worker_entry(void *context);
 
 /*
  * ***********************************************************************************************************
@@ -113,5 +104,39 @@ void os_main(void)
     while (1)
     {
         os_delay_ms(1000U);
+    }
+}
+
+/*
+ * ***********************************************************************************************************
+ * Private function implementations
+ * ***********************************************************************************************************
+*/
+
+/******************************************************************************************************/
+/**
+ * @brief Worker entry: runs at a HIGHER priority than os_main, so the only thing that can keep it
+ *        off the CPU is the scheduler lock.
+ *
+ * @param[in] context      The caller's context pointer.
+ */
+static void worker_entry(void *context)
+{
+    uint32_t i;
+
+    (void)context;
+
+    for (i = 0U; i < ITERATIONS; i++)
+    {
+        os_critical_enter();
+        os_main_shared_counter++;
+        os_critical_exit();
+    }
+
+    os_main_worker_done = true;
+
+    while (1)
+    {
+        os_task_yield();
     }
 }
